@@ -1,0 +1,69 @@
+# CI for the linkedparticles-core public repository.
+#
+# This repo is a per-release scrubbed export of a private development upstream
+# (see CONTRIBUTING.md). These workflows are authored in that upstream under
+# publish/overlays/ and laid into the exported tree by the release export —
+# edit them there, not on the public repo (a direct edit here is overwritten by
+# the next export).
+#
+# Supply-chain convention (matches the upstream): every `uses:` is pinned to a
+# full 40-char commit SHA, never a mutable `@vN` tag; the trailing `# vN`
+# comment is the human-readable tag that SHA resolves to. Bump a SHA only
+# deliberately.
+#
+# Scope note — DCO and pytest run; ruff is still deferred. The split-package
+# build made this tree independently installable (it is a whole distribution,
+# not a partial package: it owns `particles/__init__.py` and extends the
+# package path so the engine's modules resolve when that distribution is also
+# present), and it carries the shared fixture body its conftest re-exports, so
+# the suite is honest here. Remaining blocker:
+#   * ruff — the export's citation-strip rewrite still joins a citation wrapped
+#     across a line boundary into an over-length line, a lint + format issue in
+#     the exported copy only. The import-grouping half is fixed (the pyproject
+#     declares isort known-first-party = ["particles"]); the ruff job lands
+#     once the reflow is too.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  dco:
+    name: DCO sign-off
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Check Signed-off-by on every PR commit
+        run: >-
+          python .github/dco_check.py --range
+          "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+
+  pytest:
+    name: pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          # The floor interpreter — pyproject says requires-python = ">=3.11",
+          # so testing there is what makes that claim true.
+          python-version: "3.11"
+          enable-cache: false
+
+      - name: Install
+        run: uv sync
+
+      # `not integration` is the tier that needs no API key. The integration
+      # tier makes real Anthropic calls and is a developer-key concern.
+      - name: Run the suite
+        run: uv run pytest tests/ -m "not integration" -q

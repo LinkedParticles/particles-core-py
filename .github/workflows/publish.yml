@@ -1,0 +1,88 @@
+# Publish the linkedparticles-core distribution to PyPI.
+#
+# This repo is a per-release scrubbed export of a private development upstream
+# (see CONTRIBUTING.md). These workflows are authored in that upstream under
+# publish/overlays/ and laid into the exported tree by the release export —
+# edit them there, not on the public repo (a direct edit here is overwritten by
+# the next export).
+#
+# Supply-chain convention (matches the upstream): every `uses:` is pinned to a
+# full 40-char commit SHA, never a mutable `@vN` tag; the trailing `# vN`
+# comment is the human-readable tag that SHA resolves to. Bump a SHA only
+# deliberately.
+#
+# Authentication is PyPI Trusted Publishing (OIDC): no API token is stored in
+# this repo. A short-lived, upload-scoped credential is minted from the job's
+# id-token and is bound on PyPI to exactly this repository + this workflow
+# filename + the `pypi` environment — so the trusted-publisher entry on PyPI
+# must name `publish.yml` and the `pypi` environment. The environment is also
+# the manual-approval seam: require a reviewer on it to make every upload a
+# deliberate click.
+#
+# Trigger: publishing a GitHub Release (which also cuts the tag). The
+# workflow_dispatch path is a manual re-run or a TestPyPI rehearsal.
+#
+# This is the CORE distribution — the dependency of the engine distribution. It
+# must reach the index BEFORE the engine is published, or a
+# `pip install linkedparticles` cannot resolve its exactly-pinned core. The
+# engine repo's publish workflow refuses to upload until this core version is
+# resolvable from the index.
+name: Publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "Index to publish to"
+        type: choice
+        options: [pypi, testpypi]
+        default: pypi
+
+permissions:
+  contents: read
+
+# Never let two publishes of the same ref race; queue rather than cancel, so a
+# cancelled run can never abandon a half-built upload.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: build and publish
+    runs-on: ubuntu-latest
+    # The environment binds the trusted-publisher identity and is the
+    # manual-approval gate.
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write # mint the OIDC token for Trusted Publishing
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: "3.11"
+          enable-cache: false
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      # skip-existing makes a re-run idempotent: PyPI is immutable, so a
+      # filename that already landed is a no-op rather than a hard error — which
+      # is what makes recovering from a partial failure a plain re-run.
+      - name: Publish to PyPI (Trusted Publishing)
+        if: ${{ github.event_name == 'release' || inputs.repository == 'pypi' }}
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          skip-existing: true
+
+      - name: Publish to TestPyPI (rehearsal)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.repository == 'testpypi' }}
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true

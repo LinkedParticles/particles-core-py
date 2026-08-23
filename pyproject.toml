@@ -19,7 +19,7 @@
 # version and advance together.
 [project]
 name = "linkedparticles-core"
-version = "1.131.0"
+version = "1.132.1"
 description = "Client layer of the Particles reference implementation — store-free schema, extraction, and interchange"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """The ``CompletionProvider`` port and per-purpose provider selection.
 
 Every chat/completion call in the SDK goes through this port rather than
@@ -54,6 +58,25 @@ class CompletionError(RuntimeError):
     contradiction check returns ``False``, query concatenates particle
     contents, and so on. The port never decides the fallback; it only reports
     that no usable text came back.
+    """
+
+
+class EmptyCompletionError(CompletionError):
+    """The provider replied, but the reply carried no usable text.
+
+    The narrow, *deterministic* half of :class:`CompletionError`: the call
+    reached the model and came back HTTP-200, yet there is no text to return —
+    an extended-thinking model that spent its whole ``max_tokens`` budget
+    before emitting an answer block, a refusal, or an endpoint whose
+    ``finish_reason: length`` truncated the reply to nothing. It is a subclass,
+    so every existing ``except CompletionError`` still catches it unchanged.
+
+    Why it is worth naming apart from a transport failure: retrying an
+    identical call at an identical budget reproduces it, so a call site that
+    retries transient errors must *not* retry this one — the fix is a bigger
+    budget, and the operator has to be told which of the two they are looking
+    at. The memory benchmark's excluded-call disclosure splits its two counts
+    on exactly this distinction.
     """
 
 

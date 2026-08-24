@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Locate the normative schema artifacts at runtime.
 
 The JSON Schema, JSON-LD context, and SHACL shapes live in ``artifacts/schemas/``

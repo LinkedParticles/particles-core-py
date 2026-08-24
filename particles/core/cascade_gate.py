@@ -1,9 +1,13 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Pure §15.1 cascade-gating decisions (Extension B).
 
 The trust cascade auto-resolves open INCONSISTENCY particles when a new
 :class:`~particles.core.schema.SourceTrustStatement` lands. Two deterministic
-gates bound it, and the Conformance Profile names both as
-L2-normative:
+gates bound it, and the Conformance Profile names both as L2-normative
+(its §5):
 
   - the **policy gate** — ``OPERATOR_DIRECT`` / ``REGISTRY_ENDORSED`` always
     cascade; ``REVIEWER_DERIVED`` only once N distinct reviewer confirmations
@@ -14,7 +18,8 @@ L2-normative:
 Both are pure functions of already-resolved inputs, so they live here rather
 than in :mod:`particles.operations.cascade`, which owns the I/O half (the
 confirmation count query, the status writes). Same split as
-:mod:`particles.core.conflict_resolution`: decision here, effect there. The runner is Client-layer and recomputes its published vectors through
+:mod:`particles.core.conflict_resolution`: decision here, effect there. The
+conformance runner is Client-layer and recomputes its published vectors through
 these functions.
 """
 

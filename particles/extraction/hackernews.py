@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Hacker News thread extractor and importer (importer naming).
 
 HackerNewsImporter — accepts ``news.ycombinator.com/item?id=N`` and the raw

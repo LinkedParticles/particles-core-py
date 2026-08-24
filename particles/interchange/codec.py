@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Particle interchange codec.
 
 Pure (no I/O) translation between a :class:`Particle` and a self-contained

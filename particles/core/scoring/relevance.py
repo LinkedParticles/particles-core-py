@@ -1,48 +1,61 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Owner-relevance (aboutness) math for recall ranking.
+
+Unlike its two siblings this axis is **implementation-defined**: the technical
+specification pins the truth axis (§6.3) and the usefulness axis (§6.4), but
+names no ``ω`` term. Nothing here is normative for a second implementation of
+the standard; it is this SDK's own read-time lens, and the properties asserted
+below are its design contract rather than a spec requirement.
 
 The third read-time axis of the trust vocabulary, and the one that asks a
 question the other two cannot:
 
-- **truth** — *is it believable?* (:mod:`~particles.core.scoring.confidence`, composed with trust and :mod:`~particles.core.scoring.decay`)
-- **use** — *has it earned its place?* (:mod:`~particles.core.scoring.utility`)
+- **truth** — *is it believable?* (:mod:`~particles.core.scoring.confidence`,
+  §6.3, composed with trust and :mod:`~particles.core.scoring.decay`)
+- **use** — *has it earned its place?* (:mod:`~particles.core.scoring.utility`,
+  §6.4)
 - **aboutness** — *is it about me?* (this module)
 
 The three are orthogonal by construction, which is the point: a belief about the
 viewer may never be acted on, and the most heavily-used belief on a store is
 typically not about anyone. Utility credits *use*; this credits *aboutness of
 the viewer*. They are separate addends with separate coefficients so that
-neither can mask the other, and so the most-skeptical-wins lens
-composition cannot clamp both with one ``min()``.
+neither can mask the other, and so the most-skeptical-wins lens composition
+(§6.4) cannot clamp both with one ``min()``.
 
 This module is **pure** (no I/O). The Engine half — resolving *who the viewer
 is* against the Subject store and deciding which beliefs are about them — lives
 in ``operations/query/owner_policy.py`` (pure math stays Client, the
 store-reading composition stays Engine).
 
-Why the term is **additive rather than multiplicative**, inheriting an earlier decision
-verbatim: on a store where the uncalibrated cap ties the whole head at
-one effective-confidence value, a multiplier on a near-constant base is a
-near-constant rescale and separates nothing. An additive lift also gives the
-same *absolute* promotion to a low-confidence belief as to a high-confidence
-one, which is what a relevance signal wants — being about the viewer says
-nothing about how true a claim is, so it must not be worth more to claims that
-are already believed.
+Why the term is **additive rather than multiplicative**, inheriting an earlier
+decision verbatim: on a store where the uncalibrated cap ties the
+whole head at one effective-confidence value, a multiplier on a near-constant
+base is a near-constant rescale and separates nothing. An additive lift also
+gives the same *absolute* promotion to a low-confidence belief as to a
+high-confidence one, which is what a relevance signal wants — being about the
+viewer says nothing about how true a claim is, so it must not be worth more to
+claims that are already believed.
 
 **Promotion-only** by construction (``ω ≥ 0`` and ``A ≥ 0`` ⇒ bonus ``≥ 0``): the
 lens ranks the viewer's beliefs *up* and can never rank a domain claim *down*.
-That is what makes "solve this at read time, not by dropping domain
-claims" a structural property of the composition rather than a policy someone
-has to remember to honour.
+That is what makes "solve this at read time, not by dropping domain claims" a
+structural property of the composition rather than a policy someone has to
+remember to honour.
 
 The bonus enters the **recall ranking score only** — the projection, the digest,
-and (as a node-selection term, never as a rendered confidence) the graph view. It never enters the semantic-search ``query`` path, which already
+and (as a node-selection term, never as a rendered confidence) the graph view
+. It never enters the semantic-search ``query`` path, which already
 has ``QueryRequest.subject_id`` for the caller who wants the viewer's beliefs
 specifically; the lens exists to fix the *unqueried* surfaces. It is never
 folded into the stored ``confidence.value`` or the read-time
-``effective_confidence``, and it is never stored. The resulting
+``effective_confidence`` (§6.3), and it is never stored. The resulting
 ``rank_score`` is an *ordering* key, not a probability — it may exceed ``1.0``.
 
-**Locality of rank contribution.** ``ω`` is *static policy*: it
+**Locality of rank contribution**. ``ω`` is *static policy*: it
 never varies with the store's composition. A cohort-normalised ``ω`` — scaling
 the lift by the viewer cohort's share of the store so one value behaves the same
 everywhere — is deliberately **not** implemented, because a belief's rank
@@ -87,8 +100,8 @@ def owner_rank_bonus(is_owner_relevant: bool, omega: float) -> float:
     among the belief's subjects or is not — and there is no defensible way to
     grade that without additional evidence. The consequence is that ``ω``
     behaves as a *threshold* over the whole viewer cohort rather than a graded
-    lift, which is why it is calibrated against the cohort's **share of
-    the rendered head** rather than against a single belief's rank.
+    lift, which is why it is calibrated against the cohort's **share of the
+    rendered head** rather than against a single belief's rank.
 
     Args:
         is_owner_relevant: ``A(p)`` — whether the belief is about the viewer.
@@ -114,7 +127,7 @@ def owner_rank_bonus(is_owner_relevant: bool, omega: float) -> float:
 #
 # ``λ·ln(1+R)`` is graded per belief, so raising it re-orders a cohort
 # internally and the failure mode is one runaway belief taking the head — which
-# is why the sweep bounds the largest duplicate cluster.
+# is why the ``λ`` sweep bounds the largest duplicate cluster.
 #
 # ``ω·A`` is a **flat step over a whole cohort**. Every belief about the viewer
 # gets exactly the same lift, so ``ω`` behaves as a *threshold*: below it nothing
@@ -141,8 +154,8 @@ class OwnerHeadOutcome:
             occupy (criterion 2 — it must not *take* the head).
         target_ranks: ``(particle_id, rank)`` for beliefs that must **stay** in
             the head, ranked over the whole population (1-based; ``0`` = absent
-            from the scored set). Criterion 3 — typically the utility
-            targets, checked for non-regression under the new term.
+            from the scored set). Criterion 3 — typically the utility targets
+            , checked for non-regression under the new term.
         baseline_targets_in_head: the subset of ``target_ranks`` ids that were
             already inside this head at ``ω = 0``. Criterion 3 is evaluated
             **against this baseline**, not against absolute head membership: the
@@ -280,7 +293,8 @@ def sweep_owner_rank_lift(
             confidence).
         head_sizes: Each rendered surface's ``N``.
         lambda_: The configured ``utility.default.rank_lift``, held fixed.
-        target_ids: Beliefs that must **stay** in the head — the utility targets. Criterion 3 is the non-regression check.
+        target_ids: Beliefs that must **stay** in the head — the utility targets
+            . Criterion 3 is the non-regression check.
         min_owner_in_head: Criterion 1's floor.
         max_owner_share: Criterion 2's ceiling, as a fraction of head slots.
         configured_rank_lift: The store's configured ``ω``, carried through for

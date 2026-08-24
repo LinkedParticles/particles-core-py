@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """GitHub repo extractor.
 
 Reads ``GITHUB_REPO`` blobs — single files fetched via the contents API and

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """LLM completion port + Anthropic adapter.
 
 The public surface:
@@ -37,6 +41,7 @@ from particles.llm.registry import (
     CompletionError,
     CompletionProvider,
     CompletionRequest,
+    EmptyCompletionError,
     LLMPurpose,
     VisionImage,
     complete,
@@ -54,6 +59,7 @@ __all__ = [
     "CompletionPool",
     "CompletionProvider",
     "CompletionRequest",
+    "EmptyCompletionError",
     "LLMPurpose",
     "LocalProvider",
     "OpenAICompatProvider",

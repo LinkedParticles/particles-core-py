@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Document-scope classification contract.
 
 The general extractor classifies each candidate particle's *scope* — whether

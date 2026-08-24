@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Back-compat re-export — :func:`schemas_dir` now lives in ``particles.core``.
 
 It moved there so ``extraction`` could reach it too: ``extraction``

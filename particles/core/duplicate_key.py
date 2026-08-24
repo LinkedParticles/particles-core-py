@@ -1,4 +1,14 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Exact-duplicate identity key — the shared predicate.
+
+Both rungs are the standard's: §9.2 step 6a suppresses an exact duplicate at
+extract time against the §6.10 re-observation rule, and §6.10 creation
+path 4 folds one that was already written. Both are defined over the same
+§6.10 *normalized key*, which is what this module computes — the single
+"same claim, twice" test they share.
 
 One notion of "the same claim, twice" for the whole SDK:
 
@@ -6,29 +16,32 @@ One notion of "the same claim, twice" for the whole SDK:
   collapse and sentence-final punctuation is trimmed; **case and wording are
   preserved**. This is *exact*-content identity, not near-duplicate merging.
 * :func:`content_hash` — SHA-256 over the normalized key, stored on
-  ``particles.content_norm_hash`` so the suppression lookup is one
-  indexed probe instead of a scan.
+  ``particles.content_norm_hash`` so the extract-time suppression lookup
+   is one indexed probe instead of a scan.
 * :func:`duplicate_key` — the full comparison tuple: normalized content,
   subject-id set, and ``stance:holder``.
 
 **Why normalized rather than raw bytes.** The extract path already normalizes
 for its intra-pass fold (:mod:`particles.ingest.candidate_dedup`), so
 keying the cross-pass rung on raw bytes would mean two strings that dedupe
-*within* one pass fail to dedupe *across* two. The measured cost is small: activation-day census found 328 normalized groups against 322 raw
+*within* one pass fail to dedupe *across* two. The measured cost is small: the
+auto-merge activation-day census found 328 normalized groups against 322 raw
 (+1.9 %).
 
-An asymmetry was recorded here — its suppression rung normalized while
-Tier-A merge still keyed on raw ``content`` — which left *prevention
-strictly wider than cleanup*: a trailing-period twin could never be minted
+An asymmetry was recorded here: the suppression rung normalized
+while the Tier-A merge still keyed on raw ``content``, which left *prevention
+strictly wider than cleanup* — a trailing-period twin could never be minted
 twice, yet an already-minted one was permanently unreachable by
-``links dedup``. That was closed: the mop
+``links dedup``. That asymmetry was closed: the mop
 (:func:`particles.operations.links_suggest._content_hash`) now keys on this
 function, so both rungs reach exactly the same pairs and the mop's "0 groups"
 means what an operator reads it to mean.
 
 **Why this lives in Core.** Both the Engine-side intra-pass fold
 (``ingest/``) and the ORM row (``store/``) need the same function, and
-``store`` may not import ``ingest`` (that edge would add a subpackage cycle the ``acyclic_siblings`` contract rejects). Core is the shared substrate
+``store`` may not import ``ingest`` — that edge would add a subpackage cycle
+the ``acyclic_siblings`` import contract rejects. Core is the shared
+substrate
 both already depend on. Pure — no I/O, no logging, per ``core/AGENTS.md``.
 """
 
@@ -46,9 +59,10 @@ def normalize_content(content: str) -> str:
     """Conservative exact-content key: collapse whitespace, trim trailing marks.
 
     Case and word order are intentionally preserved — this is *exact*-content
-    identity, not near-duplicate merging (measured that cosine does not
-    order duplicate-likelihood below identity, so there is no safe similarity
-    tier below this one). Two strings collapse only when they differ by nothing
+    identity, not near-duplicate merging: cosine was measured not to order
+    duplicate-likelihood below identity, so there is no safe
+    similarity tier below this one. Two strings collapse only when they differ
+    by nothing
     more than whitespace runs or a sentence-final punctuation mark.
     """
     collapsed = " ".join(content.split())
@@ -70,7 +84,7 @@ def duplicate_key(
     subject_ids: Iterable[str],
     stance_holder: str | None,
 ) -> tuple[str, frozenset[str], str | None]:
-    """The full identity tuple two claims must share to be one claim.
+    """The full identity tuple two claims must share to be one claim (§6.10).
 
     Three components, each carrying its own reason:
 

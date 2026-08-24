@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Normative-artifact test for the interchange-envelope JSON Schema.
 
 `artifacts/schemas/interchange.schema.json` is the normative JSON Schema for the

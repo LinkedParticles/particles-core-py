@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for ``particles/embeddings.py`` — the progress-bar config wiring.
 
 The encoder singleton + load path are exercised across the suite (and the

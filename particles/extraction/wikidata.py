@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Wikidata-specific extractor.
 
 Reads the Wikibase REST API JSON blob stored at deposit time and converts

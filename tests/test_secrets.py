@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for ``particles.secrets`` — the single seam for secret env-var reads.
 
 The contract is small but easy to break in a future refactor: each helper

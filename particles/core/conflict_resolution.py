@@ -1,9 +1,15 @@
-"""Pure §6.6 conflict-resolution decision logic.
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
 
-This module owns the *decision* half of the §6.6 ladder: given two particles
-(an existing ACTIVE particle and a newly extracted candidate) and any trust
-inputs already resolved by the caller, return a ``ConflictVerdict`` saying
-what should happen. It also owns the constructor that builds an
+"""Pure §6.4 conflict-resolution decision logic.
+
+This module owns the *decision* half of the §6.4 ladder — the one the
+specification declares normative under "Conflict resolution with source trust",
+applied at §9.2 step 7 and yielding §6.6 status transitions. Given two
+particles (an existing ACTIVE particle and a newly extracted candidate) and any
+trust inputs already resolved by the caller, return a ``ConflictVerdict``
+saying what should happen. It also owns the constructor that builds an
 ``INCONSISTENCY`` ``Particle`` from a conflicting pair.
 
 The *effect* half of the ladder — DB writes, trust-rank lookups, embedding
@@ -11,52 +17,56 @@ similarity computation, the LLM contradiction-signal call — stays in
 ``particles/extraction/pipeline.py`` because it touches I/O. Core code must
 remain pure (see ``particles/core/AGENTS.md``).
 
-Ladder (normative, applied in order):
+Ladder (normative, applied in order — §6.4, rung for rung):
 
-  1. **ALEATORY exclusion** (lifted to the top) — if either particle
-     has ``UncertaintyNature.ALEATORY`` the pair is irreducibly inconsistent:
-     skip *both* the supersession prior and trust resolution and fall through to
-     INCONSISTENCY. An irreducible disagreement is never retired by an editorial
-     relation or a trust differential.
-  1.5. **Document-supersession prior** (cap. 2, re-ordered)
-     — caller passes ``new_supersedes_existing`` / ``existing_supersedes_new``,
-     resolved from the corpus supersession relation (a document's authored
-     ``supersedes:`` edge, followed transitively). When exactly one direction
-     holds **and** the modality-appropriate conflict signal confirms a
+  1. **ALEATORY exclusion** (§6.4 rung 1, lifted to the top) — if
+     either particle has ``UncertaintyNature.ALEATORY`` the pair is irreducibly
+     inconsistent: skip *both* the supersession prior and trust resolution and
+     fall through to INCONSISTENCY. An irreducible disagreement is never retired
+     by an editorial relation or a trust differential.
+  1.5. **Document-supersession prior** — §6.4 rung 1.5 (cap. 2,
+     re-ordered). The caller passes ``new_supersedes_existing`` /
+     ``existing_supersedes_new``, resolved from the corpus supersession
+     relation (a document's authored ``supersedes:`` edge, followed
+     transitively). When exactly one direction holds **and** the
+     modality-appropriate conflict signal confirms a
      replacement (``has_contradiction_signal``), the superseding document's claim
      wins: the loser is demoted PROVENANCE_STALE / DOCUMENT_SUPERSEDED and **no**
      INCONSISTENCY is surfaced. **This branch moves ABOVE the truth-apt
-     gate and makes it modality-independent**: an authored "this document
-     replaces that one" is an *editorial* fact that does not depend on either
-     claim's truth-aptness, so it must reach a superseded ``CONSTITUTIVE``
-     definition that the truth engine cannot see. It sits *above* the truth-apt
-     gate and the trust rung but *below* the ALEATORY exclusion (step 1).
-     Single-trust-order stores only in v1 (matching rung 2). The
+     gate and makes it modality-independent**: an authored "this
+     document replaces that one" is an *editorial* fact that does not depend on
+     either claim's truth-aptness, so it must reach a superseded
+     ``CONSTITUTIVE`` definition that the truth engine cannot see. It sits
+     *above* the truth-apt gate and the trust rung but *below* the ALEATORY
+     exclusion (step 1). Single-trust-order stores only in v1 (matching
+     rung 2). The
      ``has_contradiction_signal`` flag is **reframed** on this path as a
      *replacement signal* — "does the superseding claim replace, not merely
      restate, the superseded one?" — and a ``False`` signal keeps both claims
      (the default-safe direction), preserving the
-     never-blanket-demote invariant (cap. 2(c)).
-  1.7. **Truth-apt gate** (keeps it *below* supersession) —
-     if either side is non-truth-apt, the **truth engine** (the contradiction
-     probe, trust arbitration, INCONSISTENCY manufacture) has nothing to
-     adjudicate; return CORROBORATES. This gate's *scope* is narrowed: it no
-     longer blocks the editorial supersession prior above it, only the
-     truth-engine rungs below.
-  2. **Source trust check** — caller passes pre-resolved trust scores. When
-     ``|score_new - score_existing| >= trust_differential_threshold``, the
-     higher-trust side wins:
+     never-blanket-demote invariant (cap. 2(c)) — the same
+     demotion-only rule §6.4 states normatively.
+  1.7. **Truth-apt gate** — §6.4 rung 1.7, kept *below* supersession
+     . If either side is non-truth-apt, the **truth engine** (the
+     contradiction probe, trust arbitration, INCONSISTENCY manufacture) has
+     nothing to adjudicate; return CORROBORATES. This gate's *scope* is narrowed
+     : it no longer blocks the editorial supersession prior above it,
+     only the truth-engine rungs below.
+  2. **Source trust check** (§6.4 rung 2, Extension B) — caller passes
+     pre-resolved trust scores. When ``|score_new - score_existing| >=
+     trust_differential_threshold``, the higher-trust side wins:
        - new wins  → ``SUPERSEDES`` (caller inserts ``new`` as ACTIVE and
          demotes ``existing`` to PROVENANCE_STALE / LOWER_TRUST_SOURCE).
        - existing wins → ``SUPERSEDED_BY_EXISTING`` (caller drops ``new``).
      This rung fires **only in a single-trust-order store**.
-     When the caller passes ``single_trust_order=False`` (a multi-contributor
-     / consensus store — no global trust order), rung 2 is
+     When the caller passes ``single_trust_order=False`` — a multi-contributor
+     / consensus store, with no global trust order — rung 2 is
      skipped and the pair falls through to rung 3: a contributor's claim is
      never silently dropped by another contributor's trust.
-  3. **Default** → ``INCONSISTENT`` (caller persists the losing candidate
-     quarantined — born ``PROVENANCE_STALE`` / ``CONFLICT_PENDING`` —
-     and writes the INCONSISTENCY particle produced by
+  3. **Default** → ``INCONSISTENT`` (§6.4 rung 3; caller persists the losing
+     candidate quarantined — born ``PROVENANCE_STALE`` / ``CONFLICT_PENDING``
+     per §9.2 step 7 — and writes the INCONSISTENCY particle
+     produced by
      :func:`build_inconsistency_particle`).
 
 Two extra verdicts are emitted by the pre-ladder gate the caller may apply:
@@ -89,7 +99,7 @@ from particles.core.status import Status
 
 
 class ConflictVerdict(StrEnum):
-    """Outcome of the §6.6 ladder for a single (existing, new) pair."""
+    """Outcome of the §6.4 ladder for a single (existing, new) pair."""
 
     CORROBORATES = "CORROBORATES"
     """High similarity but no contradiction signal — keep both ACTIVE."""
@@ -101,17 +111,20 @@ class ConflictVerdict(StrEnum):
     """Trust resolution: ``existing`` wins; ``new`` should be dropped."""
 
     DOCUMENT_SUPERSEDES = "DOCUMENT_SUPERSEDES"
-    """Rung 1.5 (cap. 2, modality-independent): ``new``'s
+    """Rung 1.5 of §6.4 (cap. 2, modality-independent):
+    ``new``'s
     provenance document (transitively) supersedes ``existing``'s. Caller inserts
     ``new`` ACTIVE (or, in the cross-entry sweep, leaves it ACTIVE) and demotes
     ``existing`` to PROVENANCE_STALE / DOCUMENT_SUPERSEDED (winner ``new``).
     Emitted regardless of either claim's truth-aptness."""
 
     DOCUMENT_SUPERSEDED_BY_EXISTING = "DOCUMENT_SUPERSEDED_BY_EXISTING"
-    """Rung 1.5 (cap. 2, modality-independent): ``existing``'s
+    """Rung 1.5 of §6.4 (cap. 2, modality-independent):
+    ``existing``'s
     provenance document supersedes ``new``'s. ``existing`` stays ACTIVE; the
     caller stores ``new`` but demotes it to PROVENANCE_STALE / DOCUMENT_SUPERSEDED
-    (the loser stays auditable — demotion-only, never a silent drop).
+    (the loser stays auditable — never a silent drop, under the §6.4
+    demotion-only rule).
     Emitted regardless of either claim's truth-aptness."""
 
     INCONSISTENT = "INCONSISTENT"
@@ -133,7 +146,7 @@ def resolve_conflict(
     trust_differential_threshold: float = 0.15,
     single_trust_order: bool = True,
 ) -> ConflictVerdict:
-    """Apply the §6.6 ladder and return the verdict for one (existing, new) pair.
+    """Apply the §6.4 ladder and return the verdict for one (existing, new) pair.
 
     Pure function — no I/O. The caller is responsible for:
 
@@ -158,11 +171,12 @@ def resolve_conflict(
             *replacement signal* — for a non-truth-apt pair it answers "does the
             superseding claim replace, not merely restate, the superseded one?" —
             and ``False`` keeps both claims (the default-safe direction).
-        new_supersedes_existing: Step 1.5 input (cap. 2). ``True`` when
+        new_supersedes_existing: Step 1.5 input — §6.4, cap. 2.
+            ``True`` when
             ``new``'s provenance corpus entry (transitively) supersedes
             ``existing``'s — an authored editorial "this document replaces that
             one". The caller resolves it from the corpus supersession relation.
-            this branch runs **above the truth-apt gate** and is
+            This branch runs **above the truth-apt gate** and is
             **modality-independent**, so it retires a superseded ``CONSTITUTIVE``
             definition the truth engine would otherwise never see — but only when
             ``has_contradiction_signal`` (the replacement signal) is ``True`` and
@@ -182,7 +196,7 @@ def resolve_conflict(
         single_trust_order: Whether the store has a single global trust order
             . ``True`` (default) is today's behavior — rung 2
             auto-supersede may fire. ``False`` is a multi-contributor /
-            consensus store: there is no global trust order, so
+            consensus store, which has no global trust order, so
             rung 2 is **skipped entirely** and a confirmed contradiction falls
             through to ``INCONSISTENT`` (both claims stay ACTIVE, ranked
             per-viewer at query time) — a contributor's claim is never dropped
@@ -243,8 +257,8 @@ def resolve_conflict(
 
     # Step 3: trust resolution (single-trust-order stores only).
     # In a multi-contributor / consensus store there is no global trust order
-    #, so auto-supersede is suppressed and the pair falls through
-    # to INCONSISTENT: disagreement is surfaced, never resolved away.
+    # at all, so auto-supersede is suppressed and the pair falls
+    # through to INCONSISTENT: disagreement is surfaced, never resolved away.
     if (
         single_trust_order
         and not aleatory
@@ -277,7 +291,7 @@ def build_inconsistency_particle(
     particle via the store layer (typically with a ``domain_hint`` for the
     Extension B cascade).
 
-    Field choices (all are normative and §6.6):
+    Field choices (all are normative — §6.4 rung 3 and §9.2 step 7):
 
       - ``content``: a fixed template summarising both claims, with the
         existing particle's ID quoted so the audit trail survives even if
@@ -295,7 +309,7 @@ def build_inconsistency_particle(
         conflicting candidate has no corpus provenance at all (a derived
         particle, whose refs are all PARTICLE-typed premise links —
         the caller then passes a particle id as ``corpus_entry_id`` per the
-        §3 field-reuse convention).
+        field-reuse convention).
       - ``subject_ids``: **inherited from the existing (ACTIVE) particle**.
         Bug fix from the prior pipeline implementation, which left this empty
         and broke subject-filtered queries that should have surfaced the

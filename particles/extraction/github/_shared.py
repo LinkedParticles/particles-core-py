@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Shared helpers for the GitHub extractors and importer.
 
 Cross-cutting code lives here:

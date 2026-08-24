@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """GitHub Pages extractor.
 
 Reads ``GITHUB_PAGES`` blobs — posts hosted at ``{username}.github.io``,

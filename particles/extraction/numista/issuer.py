@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Numista issuer-level extractor.
 
 Reads ``NUMISTA_API_ISSUER`` blobs — a combined paginated

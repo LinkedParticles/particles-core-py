@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Temperature scaling calibration utility (§6.3, §C.4).
 
 Temperature scaling maps extractor raw confidence values to empirical probabilities.

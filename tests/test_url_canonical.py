@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for syntactic URL canonicalization + harvesting.
 
 Pure functions, no network — :func:`canonicalize_url` and

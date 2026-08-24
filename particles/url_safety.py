@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """SSRF protection for outbound URL fetches.
 
 Defends against an attacker handing the system a URL that resolves to

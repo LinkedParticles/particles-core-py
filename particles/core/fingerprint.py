@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """The §16.1 context-fingerprint digest — pure, store-free.
 
 Spec §16.1 states the procedure in three steps:
@@ -10,7 +14,8 @@ Step 1 is a store query; steps 2–3 are the deterministic digest this module
 owns. Splitting them here is what lets both the store
 (:func:`particles.store.particle_store.compute_context_fingerprint`, which
 supplies step 1 in SQL) and the Client-layer Conformance Profile runner
-(L2, which supplies it from a test vector) run the *same* code —
+(the L2 conformance runner, which supplies it from a test vector)
+run the *same* code —
 the procedure "MUST be followed exactly to ensure cross-agent fingerprint
 compatibility", so it must exist once.
 """

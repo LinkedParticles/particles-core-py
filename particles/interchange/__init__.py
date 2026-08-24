@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Particle interchange + store-export format.
 
 Standard-tier wire format for federation exchange and store portability. The

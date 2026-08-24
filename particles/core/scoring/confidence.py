@@ -1,4 +1,14 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Two-quantity confidence separation (§6.3).
+
+The separation is **normative** — §6.3 of the technical specification says an
+implementation that conflates the two quantities produces inconsistent
+behaviour across extraction, query, and trust evaluation. The exact formulas,
+the constants they consume, and worked test vectors an implementation
+reproduces bit-for-bit are pinned in the Conformance Profile §4.
 
 confidence.value   — stored immutably at creation, as calibrated at creation
                      time (raw EXTRACTOR_DIRECT value, or temperature-scaled
@@ -22,6 +32,18 @@ class CalibrationSource(StrEnum):
     CALIBRATED_BENCHMARK = "CALIBRATED_BENCHMARK"  # post-hoc calibrated; medium trust
     HUMAN_REVIEW = "HUMAN_REVIEW"  # assigned by human reviewer; highest trust
     DERIVED = "DERIVED"  # machine-derived from premise particles; min-of-premises
+    # Migrated in from another memory store (§6.3, the IMPORTED row).
+    # The number is *ours* — a flat configured import floor — never the
+    # incumbent's own score, which is preserved as a tag and structurally kept
+    # out of the ranking arithmetic. §6.3 states that half normatively: an
+    # implementation MUST NOT map a source system's own score onto
+    # ``confidence.value``, because that field is stored immutably and
+    # multiplies into effective_confidence. Distinct from AGENT_ASSERTED on
+    # purpose: no agent asserted a migrated record, and merging the two
+    # populations would destroy the "what I brought with me" vs "what I have
+    # learned since" distinction, and would deny operators a separate
+    # read-side cap on the imported population.
+    IMPORTED = "IMPORTED"
 
 
 def compute_effective_confidence(
@@ -44,7 +66,7 @@ def compute_effective_confidence(
     in the configured ``sources``, ``value`` is first clamped down to
     ``cap_value`` via ``min`` before the multiply (``capped_value =
     min(value, cap_value)``). The cap is purely **read-side**: it never mutates
-    the stored, immutable ``confidence.value``. It is default-OFF,
+    the stored, immutable ``confidence.value`` (§6.3). It is default-OFF,
     and ``calibration_source=None`` (the default) never triggers it, so existing
     callers are unaffected. The cap composes with the trust-weight cap:
     a particle may have both its value clamped here and its extractor trust
@@ -128,15 +150,16 @@ def merge_co_evidential_confidence(
 
 
 def derive_abstraction_confidence(premise_values: list[float]) -> float:
-    """Stored ``confidence.value`` for a derived particle.
+    """Stored ``confidence.value`` for a derived particle (§6.3).
 
     An abstraction is entailed by the *conjunction* of its premises, so its
     credence must not exceed its weakest premise: the rule is **min over the
     premises' stored values**, clamped to [0, 1]. Anything cleverer
-    (corroboration-aware combining across premises) is scope and
-    deliberately not implemented here. Stored once, immutably;
-    everything reactive (the stale-support discount) lives in
-    effective confidence at read time.
+    (corroboration-aware combining across premises) is deferred work and is
+    deliberately not implemented here. The result is stored once and
+    immutably, like every other ``confidence.value`` (§6.3); everything reactive
+    — the stale-support discount — lives in effective confidence
+    at read time.
 
     Args:
         premise_values: The premises' stored ``confidence.value``s. Must be

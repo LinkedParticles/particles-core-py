@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Consolidated configuration.
 
 Precedence: env var > config.yaml > compiled default.
@@ -904,6 +908,29 @@ class ImportProjectConfig(BaseModel):
     )
 
 
+class MigrationConfig(BaseModel):
+    """Inbound migration from another memory store.
+
+    ``particles import mcp-memory <path>`` deposits an incumbent store's export
+    verbatim and a structured, no-LLM extractor turns each record into a
+    particle. Every such particle carries ``CalibrationSource.IMPORTED`` and the
+    single ``import_confidence`` below — **never** the incumbent's own score,
+    which is preserved as a tag and structurally kept out of the ranking
+    arithmetic (§5). One number, one meaning: *this was believed by a system we
+    cannot interrogate.*
+
+    Raising the floor here is not how you come to trust a migrated store. The
+    lever for that is ``particles trust set`` against the export's source type,
+    which is revisable, auditable, and demotion-safe — where ``confidence.value``
+    is immutable at creation. Read via ``get_config()`` inside the
+    extractor, never at import.
+    """
+
+    # Deliberately low. A migrated belief is second-hand: this store never saw
+    # the claim made, cannot check it, and did not calibrate the number.
+    import_confidence: float = Field(default=0.35, ge=0.0, le=1.0)
+
+
 class WebClipperConfig(BaseModel):
     """Frontmatter-Markdown captures intake.
 
@@ -1345,14 +1372,20 @@ class SubjectsConfig(BaseModel):
     # as candidate duplicates when the max cosine similarity across their
     # {canonical_name} ∪ aliases embeddings is at or above this threshold.
     find_duplicates_similarity_threshold: float = 0.88
-    # Source types whose subject names are private referents by construction
-    # (chat-transcript harvests, personal journals): skip live-ontology
-    # authorities (Wikidata) during resolution for these, since ~none of the
-    # names resolve and the fruitless, rate-limited calls serialise the whole
-    # process. Exact-identifier authorities (Numista / ISBN / DOI) are
-    # recognize-only and unaffected. Override to widen or narrow the set.
+    # Source types that skip live-ontology authorities (Wikidata) during
+    # resolution. Two reasons, both ending in the same treatment:
+    #   - private referents by construction (chat-transcript harvests, personal
+    #     journals — "the user's hamster", "Luna"): ~none of the names resolve,
+    #     and the fruitless, rate-limited calls serialise the whole process;
+    #   - bulk migration intake: a per-entity live lookup over a
+    #     multi-thousand-entity export is slow and network-dependent, and — the
+    #     decisive part — can rewrite ``canonical_name`` into something the
+    #     migrating user never chose. Enrichment stays available through every
+    #     other surface afterwards; it is deferred, not skipped.
+    # Exact-identifier authorities (Numista / ISBN / DOI) are recognize-only and
+    # unaffected. Override to widen or narrow the set.
     skip_live_authorities_source_types: list[str] = Field(
-        default_factory=lambda: ["CONVERSATION", "JOURNAL"]
+        default_factory=lambda: ["CONVERSATION", "JOURNAL", "MCP_MEMORY_EXPORT"]
     )
 
     @model_validator(mode="after")
@@ -2440,6 +2473,21 @@ class MemoryBenchmarkConfig(BaseModel):
     # (mirrors audit.confirm_call_threshold; --yes pre-confirms,
     # non-interactive runs without it abort with the estimate printed).
     confirm_call_threshold: int = Field(default=50, ge=0)
+    # Retries for a *transient* answer/judge call failure before the call is
+    # reported as an infra failure and excluded from the accuracy denominator
+    #. A no-text-block reply is never retried — it is deterministic
+    # at a fixed budget — and is excluded under the separate budget count.
+    call_retries: int = Field(default=2, ge=0)
+    # Backoff before each retry, multiplied by the attempt number. 0 disables
+    # the wait (what the unit tier sets).
+    call_retry_backoff_seconds: float = Field(default=2.0, ge=0.0)
+    # The answering model's context window, in tokens — the budget the
+    # pre-flight check holds the qa_full_context baseline's prompt against
+    # before any LLM call. The default is the Claude window; set it
+    # to match whatever llm.benchmark_answer resolves to when routing
+    # elsewhere. The check is what makes the ~500-session ``m`` variant refuse
+    # up front instead of silently crushing the baseline via overflow.
+    answer_context_window_tokens: int = Field(default=200_000, ge=1)
 
 
 class BenchmarkConfig(BaseModel):
@@ -2506,6 +2554,7 @@ class ParticlesConfig(BaseModel):
     journal_extractor: JournalExtractorConfig = Field(default_factory=JournalExtractorConfig)
     import_project: ImportProjectConfig = Field(default_factory=ImportProjectConfig)
     web_clipper: WebClipperConfig = Field(default_factory=WebClipperConfig)
+    migration: MigrationConfig = Field(default_factory=MigrationConfig)
     trust: TrustConfig = Field(default_factory=TrustConfig)
     reconciliation: ReconciliationConfig = Field(default_factory=ReconciliationConfig)
     content_age_decay: ContentAgeDecayConfig = Field(default_factory=ContentAgeDecayConfig)
@@ -2593,6 +2642,62 @@ class ParticlesConfig(BaseModel):
                 )
         return self
 
+
+# ---------------------------------------------------------------------------
+# Layer declaration
+# ---------------------------------------------------------------------------
+
+#: Top-level :class:`ParticlesConfig` sections that a **Client-layer** module
+#: reads.
+#:
+#: Both distributions ship one config model, because they share one import
+#: package — `particles/config.py` rides the Client distribution and
+#: the Engine has none of its own. The consequence is that a
+#: ``linkedparticles-core``-only install carries every section, including the
+#: two-thirds of them nothing in that install can act on. This frozenset is how
+#: that surface is made legible instead of carved: it names the sections a
+#: core-alone consumer can actually set to effect, and it is what tags each
+#: section in ``config.yaml.sample`` ``[client]`` or ``[engine]``.
+#:
+#: It is **documentation with a test behind it, not a runtime gate.** Nothing
+#: filters, rejects, or warns on an Engine section at load time; a core-alone
+#: install still validates and holds all 64. Two checks in
+#: ``tests/test_config_client_sections.py`` keep it honest — the sections a
+#: Client module actually reads must be a **subset** of this set (an undeclared
+#: read fails; a section that stops being read does not churn it), and the
+#: sample's tags must agree with it.
+#:
+#: It is also the seam a future Client/Engine config carve would cut along, kept
+#: measured so that carve discovers nothing new about where the line is. The
+#: carve itself is reserved, not taken.
+CLIENT_SECTIONS: frozenset[str] = frozenset(
+    {
+        "confidence",
+        "content_age_decay",
+        "contestedness",
+        "embeddings",
+        "extraction",
+        "extraction_modality",
+        "extraction_polarity",
+        "extraction_scope",
+        "extraction_stance",
+        "extraction_validity",
+        "extraction_vision",
+        "github",
+        "hackernews",
+        "http",
+        "journal_extractor",
+        "llm",
+        "mastodon",
+        "migration",
+        "rdf",
+        "reddit",
+        "storage",
+        "structured_claim",
+        "trust",
+        "wikidata",
+    }
+)
 
 # ---------------------------------------------------------------------------
 # Env var overrides (backward-compatible names)

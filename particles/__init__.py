@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Particles — Python SDK for the Particles epistemic knowledge standard."""
 
 from importlib.metadata import PackageNotFoundError, version

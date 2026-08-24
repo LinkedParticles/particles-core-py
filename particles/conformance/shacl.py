@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """SHACL conformance validation using pyshacl (§C.5, §10.1).
 
 Validates JSON-LD serialised records against the five normative SHACL shapes:

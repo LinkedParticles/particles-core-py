@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Client-layer rendering utilities.
 
 Pure, store-free rendering of particles / lint reports / digests into Markdown,

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Extractor plugin registry (Client layer).
 
 To add a new domain-specific extractor:
@@ -92,6 +96,7 @@ def _make_extractors() -> list[ExtractorPlugin]:
     from particles.extraction.hackernews import HackerNewsExtractor
     from particles.extraction.journal import JournalExtractor
     from particles.extraction.mastodon import MastodonExtractor
+    from particles.extraction.mcp_memory import McpMemoryExtractor
     from particles.extraction.nomisma import NomismaExtractor
     from particles.extraction.numista import (
         NumistaCoinExtractor,
@@ -113,6 +118,7 @@ def _make_extractors() -> list[ExtractorPlugin]:
         WikidataExtractor(),
         NomismaExtractor(),
         RdfExtractor(),  # RDF_GRAPH structured extractor
+        McpMemoryExtractor(),  # MCP_MEMORY_EXPORT migration extractor
         RedditExtractor(),
         HackerNewsExtractor(),
         MastodonExtractor(),

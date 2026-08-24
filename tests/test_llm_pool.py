@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for the ``CompletionPool`` (quiescence-dispatched fan-in).
 
 The pool is pure asyncio coordination over

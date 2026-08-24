@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Datatypes for the extractor conformance validator.
 
 These types describe the conformance *contract* (what fields are expected of

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Shared pytest fixtures for the store-free Client distribution.
 
 Every fixture lives in ``tests/_client_fixtures.py``, which the development

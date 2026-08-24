@@ -1,15 +1,29 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Structural claim filters — pure term normalization + claim matching.
 
-The Client-layer seam of the structural-claim read surface (§2.3): a pure,
+``StructuredClaim`` and ``ClaimTerm`` are the §6.2 derived-annotation fields;
+the filter grammar and normalization rules below are this SDK's own read
+surface and are not part of the standard, so the numbered section marks in this
+module cite the governing decision record and not the
+specification.
+
+The Client-layer seam of the structural-claim read surface: a
+pure,
 store-free, I/O-free normalizer for :class:`~particles.core.schema.ClaimTerm`
-object values, and the matcher that applies the §2.2 filter grammar to one
+object values, and the matcher that applies the filter grammar to
+one
 :class:`~particles.core.schema.StructuredClaim`. The Engine composition
 (scan, aggregates, coverage footer) lives in ``operations/query/structural.py``;
-deterministic contradiction pre-pass reuses this module's equality
-semantics rather than growing a parallel second implementation.
+the deferred deterministic contradiction pre-pass reuses this
+module's equality semantics rather than growing a parallel second
+implementation.
 
-Normalization is read-time only — nothing here is ever stored (§2.3: no
-sidecar column, so nothing can drift against the JSON it summarizes). No unit
+Normalization is read-time only — nothing here is ever stored: no sidecar
+column, so nothing can drift against the JSON it summarizes.
+No unit
 parsing: ``"3 grams"`` as an untyped literal does not compare to ``3.0``; the
 honest behaviour is the §2.2 disclosure (``NOT_COMPARABLE``), not a guess.
 """

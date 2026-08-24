@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Shared sentence-transformer embedding singleton.
 
 The embedding model is a cross-cutting concern: extraction near-dup

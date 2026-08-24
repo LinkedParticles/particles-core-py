@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Shared Anthropic SDK client (the ``anthropic`` adapter's transport).
 
 The ``AnthropicProvider`` adapter (``particles/llm/adapters/anthropic.py``) is

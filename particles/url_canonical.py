@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Syntactic URL canonicalization + harvesting.
 
 Pure, **no-network** normalization of URLs found in source text, so that "the

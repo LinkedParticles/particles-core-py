@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Subject-scope contract — which claims are *expected* to carry a subject.
 
 Two things live here, and the second is the load-bearing one:

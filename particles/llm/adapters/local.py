@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Back-compat shim: the adapter moved to ``openai_compat.py``.
 
 ``LocalProvider`` was the single-endpoint ancestor of the generic

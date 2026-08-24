@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """RDF parsing extractor — structure-canonical particles.
 
 Turns a deposited RDF document (Turtle / N-Triples / TriG / N-Quads / JSON-LD /

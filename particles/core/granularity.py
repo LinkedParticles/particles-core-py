@@ -1,4 +1,13 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Claim-granularity soft-gate predicate.
+
+The rule it proxies is the standard's, not this SDK's: §6.2 defines ``content``
+as *a single falsifiable natural-language assertion* and defers the granularity
+guidance to the whitepaper's §3.4, and §9.4's ``COMPOUND_ASSERTION`` lint
+(L-STR-10) reports the beliefs that breach it.
 
 A particle should express one atomic, separately-falsifiable claim. These are
 pure, deterministic helpers — no LLM, no I/O, no config read — shared by the
@@ -32,14 +41,14 @@ def count_sentences(content: str) -> int:
 def granularity_violation(content: str, *, max_chars: int, max_sentences: int) -> str | None:
     """Return a human-readable reason ``content`` breaches the soft-gate, else ``None``.
 
-    A particle should be one atomic, separately-falsifiable claim.
+    A particle should be one atomic, separately-falsifiable claim (§6.2).
     Either threshold ``<= 0`` disables that check (the "off" sentinel).
     """
     n_chars = len(content)
     if max_chars > 0 and n_chars > max_chars:
         return (
             f"content is {n_chars} chars (max {max_chars}) — a particle should be "
-            "one atomic, separately-falsifiable claim (§3.3)"
+            "one atomic, separately-falsifiable claim (whitepaper §3.4)"
         )
     if max_sentences > 0:
         n_sentences = count_sentences(content)
@@ -47,6 +56,6 @@ def granularity_violation(content: str, *, max_chars: int, max_sentences: int) -
             return (
                 f"content spans {n_sentences} sentences (max {max_sentences}) — a "
                 "particle should be one atomic, separately-falsifiable claim "
-                "(§3.3)"
+                "(whitepaper §3.4)"
             )
     return None

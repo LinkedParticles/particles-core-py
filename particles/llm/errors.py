@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Account-level LLM failure classification — the shared predicate.
 
 An *account-level* failure fails **every** call until an operator fixes the

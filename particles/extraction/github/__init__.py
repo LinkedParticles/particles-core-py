@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """GitHub extractors and importer (importer naming).
 
 This package handles three content surfaces under a shared ``github:{login}``

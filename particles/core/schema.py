@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Pydantic v2 models for all Core particle and corpus types.
 
 Core fields are required for v0.2 conformance.
@@ -92,7 +96,7 @@ class AssertionModality(StrEnum):
 
     Orthogonal to ``uncertainty_nature`` (which presupposes a fact of the
     matter) and to scope (which lives in ``properties``). The Core
-    engine applies truth-semantics — §6.6 contradiction resolution, L-SEM-01,
+    engine applies truth-semantics — the §6.4 conflict ladder, L-SEM-01,
     L-IDX-01 — only to ``FALSIFIABLE`` particles (see :func:`is_truth_apt`);
     the other modalities co-exist and are never contradiction-checked or
     trust-arbitrated. Default ``FALSIFIABLE`` keeps every existing particle
@@ -148,6 +152,14 @@ class SourceType(StrEnum):
 
 
 class Mutability(StrEnum):
+    """How a source's content may change, per the §7.4 class table.
+
+    Declared by the operator at deposit; it is what drives extraction behaviour
+    when a new snapshot lands (delta-only, full re-extract with a demotion pass,
+    no re-fetch, or no archive at all). §7.4 is normative on the ordering of the
+    ``MUTABLE`` demotion.
+    """
+
     APPEND_ONLY = "APPEND_ONLY"
     MUTABLE = "MUTABLE"
     STABLE = "STABLE"
@@ -390,6 +402,8 @@ class Confidence(BaseModel):
     extractor's confidence as calibrated at creation time;
     calibration_source/calibration_method/calibration_ref record how.
     effective_confidence is computed at query time only and never stored.
+    §6.3 makes the separation of the two quantities normative, and the
+    Conformance Profile §4 pins the formula and its test vectors.
     """
 
     model_config = {"frozen": True}
@@ -531,12 +545,17 @@ class Particle(BaseModel):
     extractors (e.g. Numista); it is never used for conflict detection.
 
     Attributes:
-        content: The claim text (min length 1).
-        confidence: Stored, immutable confidence record.
+        content: The claim text (min length 1) — one falsifiable assertion
+            (§6.1).
+        confidence: Stored, immutable confidence record (§6.3); never modified
+            after creation.
         uncertainty_nature: EPISTEMIC (reducible) or ALEATORY (irreducible).
         provenance: Corpus entry / snapshot references.
         asserted_by: Agent or extractor ID that created this particle.
-        status: Lifecycle status (ACTIVE, SUPERSEDED, RETRACTED, …).
+        status: Lifecycle status (ACTIVE, SUPERSEDED, RETRACTED, …). Only the
+            transitions in the normative §6.6 table are legal; go through
+            :func:`particles.core.status.validate_transition`, never a direct
+            assignment.
         subject_ids: UUIDs of subjects this particle is a statement about.
         properties: Nomisma ontology-keyed structured data.
     """
@@ -616,8 +635,9 @@ class Particle(BaseModel):
     # query-time-only "contested" marker — the id of an open
     # INCONSISTENCY particle that references this one, else None. Computed by the
     # read surfaces (query / particles_list); NEVER stored on ParticleRow and
-    # NEVER branched on in Core. Makes the §6/§6b contradiction ledger legible to
-    # the agent at recall time, not only to the operator at Review.
+    # NEVER branched on in Core. Makes the contradiction ledger legible to the
+    # agent at recall time, not only to the operator at Review.
+    # The INCONSISTENCY particle it points at is §6.4 rung 3's output.
     contested: str | None = None
 
     @field_validator("schema_version")
@@ -641,7 +661,7 @@ def is_truth_apt(particle: Particle) -> bool:
     """Whether the engine should apply truth-semantics to this particle.
 
     ``True`` only for ``FALSIFIABLE`` particles — the single, default-safe bit
-    the §6.6 conflict ladder, L-SEM-01 semantic-contradiction lint, and
+    the §6.4 conflict ladder, L-SEM-01 semantic-contradiction lint, and
     L-IDX-01 co-evidential suggestion gate on. Non-truth-apt particles
     (evaluative / experiential / constitutive) co-exist and are never
     contradiction-checked, trust-arbitrated, or co-evidentially clustered.
@@ -650,7 +670,13 @@ def is_truth_apt(particle: Particle) -> bool:
 
 
 class Snapshot(BaseModel):
-    """A timestamped, content-addressed capture of a corpus source (§7.3)."""
+    """A timestamped, content-addressed capture of a corpus source (§7.2).
+
+    Snapshots are only ever appended: the corpus is an append-only archive and
+    the system of record, with the particle store a derived view over it
+    (§7.1), so a re-fetch adds a snapshot rather than rewriting one. Sharing
+    them between stores is §7.3.
+    """
 
     snapshot_id: str = Field(default_factory=_new_uuid)
     captured_at: datetime = Field(default_factory=_utcnow)
@@ -670,7 +696,11 @@ class Snapshot(BaseModel):
 
 
 class CorpusEntry(BaseModel):
-    """Stable record of a source and its relationship to its origin (§7.3)."""
+    """Stable record of a source and its relationship to its origin (§7.2).
+
+    The entry is the append-only unit of the corpus (§7.1); ``mutability``
+    (§7.4) and ``fetch_policy`` (§7.5) declare how its snapshot list may grow.
+    """
 
     entry_id: str = Field(default_factory=_new_uuid)
     uri_r: str | None = None  # Memento URI-R
@@ -1112,11 +1142,12 @@ class QueryRequest(BaseModel):
     # cited). Off by default — it costs per-result edge traversal on a hot path
     # (the projection at scale is deferred).
     include_agreement: bool = False
-    # when True, each result carries its per-claim contestedness
+    # Per-claim contestedness (§6.9): when True, each result
+    # carries its
     # reading — the max−min spread of effective_confidence across the viewer's
     # policy set (local policy + each adopted lens), with the per-policy
     # renderings attributed. Off by default (per-member policy evaluation cost);
-    # absent entirely when the viewer has fewer than two policies (§3).
+    # absent entirely when the viewer has fewer than two policies.
     include_contestedness: bool = False
     # the as-of reference instant — answer "what did the store
     # believe at T". Unset (None) is byte-for-byte today's read behaviour.
@@ -1128,7 +1159,8 @@ class QueryRequest(BaseModel):
     as_of: datetime | None = None
     # structural claim filters over the annotation.
     # With a question they prefilter the semantic candidate set (ranking
-    # untouched, §2.4); without one they select the deterministic listing
+    # untouched); without one they select the deterministic
+    # listing
     # mode (no embedding, no LLM call). ``predicate`` is exact-string,
     # case-insensitive — a CURIE and its expanded IRI are different strings.
     predicate: str | None = Field(default=None, min_length=1)
@@ -1139,7 +1171,7 @@ class QueryRequest(BaseModel):
     # deterministic aggregate modes. ``count`` returns the
     # number of matching claims with the effective-confidence distribution;
     # ``group_by`` buckets them. Both reject a simultaneous question — an LLM
-    # narrating a deterministic count adds nothing but risk (§2.1).
+    # narrating a deterministic count adds nothing but risk.
     count: bool = False
     group_by: StructuralGroupBy | None = None
     # the *explicit* aggregate confidence floor. There is no
@@ -1213,8 +1245,8 @@ class QueryRequest(BaseModel):
             if raw_bound is None:
                 continue
             # Deferred import: claims.py imports ClaimTerm from this module,
-            # so a module-top import here would be a cycle (AGENTS.md
-            # § Deferred imports, case 1).
+            # so a module-top import here would be a cycle — the cycle-break
+            # case of the deferred-import rule.
             from particles.core.claims import parse_bound
 
             if parse_bound(raw_bound) is None:
@@ -1264,7 +1296,7 @@ class StancePosition(BaseModel):
     target's CO_EVIDENTIAL group; never stored (substrate-plus-lens).
     ``effective_confidence`` is the *stance particle's own* believability
     (how sure we are the holder holds the attitude) — it is surfaced alongside,
-    and never folded into, the target claim's confidence (the §4 MUST).
+    and never folded into, the target claim's confidence.
     """
 
     kind: RelationType  # ENDORSES or DISPUTES
@@ -1295,10 +1327,11 @@ class ContestednessReading(BaseModel):
     ``spread`` is max − min of ``effective_confidence`` evaluated separately
     under each policy in the viewer's policy set (the local policy plus each
     adopted lens). It is **disclosure, not discount**: it MUST NOT
-    feed ``effective_confidence``, ranking, ``min_confidence`` filtering, or
-    §6.6 conflict resolution. Computed at read time, never stored. Present only
-    when the viewer has two or more policies (§3) — a one-policy store mints no
-    contestedness, since absence of measurement is not measured invariance.
+    feed ``effective_confidence``, ranking, ``min_confidence`` filtering, or the
+    §6.4 conflict ladder. Computed at read time, never stored. Present only
+    when the viewer has two or more policies — a one-policy store
+    mints no contestedness, since absence of measurement is not measured
+    invariance.
     """
 
     spread: float  # max − min across the policy set, [0, 1]
@@ -1306,28 +1339,29 @@ class ContestednessReading(BaseModel):
 
 
 class ContestedBadge(BaseModel):
-    """The composed per-claim contested badge.
+    """The composed per-claim contested badge (§6.9).
 
     A claim renders *contested* iff at least one of three named bases fires;
     the badge is a basis-carrying disjunction — a set of fired basis labels,
     never a blended scalar — so every badge names which instrument(s) produced
-    it (§1). The three gates (§2): ``stance`` — ≥1 ``DISPUTES`` position in the
+    it. The three gates: ``stance`` — ≥1
+    ``DISPUTES`` position in the
     claim's query-time stance distribution; ``divergence`` — the
     claim's :class:`ContestednessReading` spread is at least
     ``contestedness.callout_threshold``; ``inconsistency`` — an open
     INCONSISTENCY particle references the claim (subsumed as a
     basis). A claim with no available basis fired carries **no** badge (None in
-    the parallel list), never an explicit "uncontested" (§3).
+    the parallel list), never an explicit "uncontested".
 
-    Invariants (§4): computed at read time, never stored; MUST NOT feed
-    ``effective_confidence``, ranking, ``min_confidence`` filtering, or §6.6
-    conflict resolution — disclosure, not discount. The divergence reading and
+    Invariants: computed at read time, never stored; MUST NOT feed
+    ``effective_confidence``, ranking, ``min_confidence`` filtering, or the §6.4
+    conflict ladder — disclosure, not discount. The divergence reading and
     stance distribution are not duplicated here; they remain the existing
     envelope blocks (the drill-downs).
     """
 
     # Fired basis labels, non-empty (a bare "contested" with no basis is
-    # non-conforming, §4). Ordered stance, divergence, inconsistency.
+    # non-conforming). Ordered stance, divergence, inconsistency.
     bases: list[Literal["stance", "divergence", "inconsistency"]] = Field(min_length=1)
     # Drill-down when the "inconsistency" basis fired: the open INCONSISTENCY
     # particle's id (exactly the marker this badge subsumes).
@@ -1363,11 +1397,13 @@ class AsOfNote(BaseModel):
     status: Status
     status_reason: StatusReason | None = None
     # The reconstructed transaction-time end of the belief. Always known for a
-    # visible retired hit — a retirement the §2b ladder cannot date is excluded
+    # visible retired hit — a retirement the ladder cannot date is
+    # excluded
     # fail-closed and never surfaces as a hit.
     retired_at: datetime
-    # Which §2b ladder rung answered: the stored ``retired_at`` column, the
-    # successor's ``asserted_at``, an operator event, or ``valid_until``.
+    # Which rung of the retirement-dating ladder answered: the
+    # stored ``retired_at`` column, the successor's ``asserted_at``, an operator
+    # event, or ``valid_until``.
     basis: Literal["stored", "successor", "event", "valid_until"]
     successor: AsOfSuccessor | None = None
 
@@ -1405,8 +1441,8 @@ class ClaimCoverage(BaseModel):
     Rendered as the footer line "matched against the N of M ACTIVE particles
     carrying a structured claim (store coverage P%)" — absence of a hit must
     never be mistaken for absence of a belief. ``not_normalizable_excluded``
-    is the §2.2 disclosure: claims excluded from a gt/lt comparison because
-    their object would not normalize to a comparable type.
+    is the disclosure: claims excluded from a gt/lt comparison
+    because their object would not normalize to a comparable type.
     """
 
     active_total: int
@@ -1474,15 +1510,19 @@ class QueryResponse(BaseModel):
     # per-result contestedness readings, query-time only. Parallel
     # to ``particles`` (``contestedness[i]`` is the reading for ``particles[i]``);
     # empty unless ``QueryRequest.include_contestedness`` AND the viewer has ≥2
-    # policies (§3). The spread MUST NOT feed ``effective_confidences`` — it is
-    # disclosure surfaced beside confidence, never a discount on it (§5).
+    # policies (§6.9). The spread MUST NOT feed
+    # ``effective_confidences``
+    # — it is
+    # disclosure surfaced beside confidence, never a discount.
     contestedness: list[ContestednessReading] = Field(default_factory=list)
     # the composed contested badge, query-time only. Parallel to
     # ``particles`` (``contested[i]`` is the badge on ``particles[i]``; None for
     # a claim with no available basis fired — never an explicit "uncontested",
-    # §3). Populated by default, gated by ``contestedness.badge_enabled`` (§7);
+    # §3). Populated by default, gated by
+    # ``contestedness.badge_enabled``;
     # empty when the badge is disabled. MUST NOT feed ``effective_confidences``
-    # or ranking (§4) — the cheap always-on summary whose drill-downs are the
+    # or ranking — the cheap always-on summary whose drill-downs
+    # are the
     # ``agreement_distributions`` / ``contestedness`` blocks above.
     contested: list[ContestedBadge | None] = Field(default_factory=list)
     # when a NARRATIVE particle is a hit, its SEQUENCE_IN constituents
@@ -1506,7 +1546,7 @@ class QueryResponse(BaseModel):
     as_of_excluded_undatable: int = 0
     # present on every structural-filter result (prefilter,
     # deterministic listing, and aggregate modes); None on a plain semantic
-    # query. Carries the coverage-footer data and the §2.2 gt/lt
+    # query. Carries the coverage-footer data and the gt/lt
     # non-normalizable disclosure count.
     claim_coverage: ClaimCoverage | None = None
     # the deterministic aggregate result; None outside the
@@ -1540,8 +1580,9 @@ class QueryResponse(BaseModel):
     # call by design (structural modes, the below-floor refusal).
     answer_generation_error: str | None = None
     # refusal flag, both flavours: True when ``answer`` is a
-    # no-relevant-knowledge refusal — the §2 deterministic below-floor answer,
-    # or the §4 responder-declared one (the stripped NO_RELEVANT_KNOWLEDGE
+    # no-relevant-knowledge refusal — the deterministic below-floor answer of
+    # §2, or the responder-declared one (the stripped
+    # NO_RELEVANT_KNOWLEDGE
     # marker). Consumers relabel the hit list ("nearest beliefs — likely
     # unrelated") and the truncation warning is suppressed server-side (advice
     # to widen top_k under a refusal is incoherent). Disclosure only — never
@@ -1734,11 +1775,12 @@ class LintFinding(BaseModel):
     detail: str
     recommended_action: str | None = None
     # The claim text (``Particle.content``) of the particle this finding
-    # references — set whenever ``particle_id`` is present, ``None`` otherwise
-    #. Lets a curation client (the Obsidian plugin, the
-    # PWA) show WHAT a flagged particle says without a second
-    # ``particles particle show <id>`` round-trip. A particle's ``content`` is already a
-    # one-sentence atomic claim, so the full text is carried — no excerpt field.
+    # references — set whenever ``particle_id`` is present, else ``None``.
+    # A curation client can then show WHAT a flagged particle says without a
+    # second ``particles particle show <id>`` round-trip — the Obsidian
+    # plugin and the PWA both do. A
+    # particle's ``content`` is already a one-sentence atomic claim, so the
+    # full text is carried — no excerpt field.
     # Server-side enrichment: each finder already holds the ``Particle`` at the
     # point of creation, so this is populated inline with no extra store lookup.
     particle_content: str | None = None

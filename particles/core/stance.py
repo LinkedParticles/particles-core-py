@@ -1,32 +1,39 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Stance-particle helpers.
 
 A *stance* is an ordinary ``FALSIFIABLE`` :class:`~particles.core.schema.Particle`
 asserting an attribution fact — *"agent A endorses / disputes claim B"* — bound
 to its target by an outbound ``ENDORSES`` / ``DISPUTES`` relation. The edge is
 the role marker. Two ``stance:``-prefixed ``properties`` keys
- carry the holder identity and the optional attitude
-magnitude.
+carry the holder identity and the optional attitude magnitude; the ``properties`` map itself is §6.8.
 
 Core stays I/O-free: these are pure helpers over a particle's
 ``properties``. The authoritative edge-based "is this a stance" check (the role
-marker per §1) lives in the store / operations layer where a session is
+marker) lives in the store / operations layer where a session
+is
 available; the property marker below is the cheap, co-stamped signal the
 extractor writes *alongside* the edge, used to keep stances out of factual
-top-k (§6) without an extra edge query per candidate.
+top-k without an extra edge query per candidate.
 """
 
 from __future__ import annotations
 
 from particles.core.schema import Particle, RelationType
 
-#: ``properties`` key carrying the stance holder's ``platform:identifier`` (§3).
+#: ``properties`` key carrying the stance holder's ``platform:identifier``
+#: (§6.8 properties).
 STANCE_HOLDER_KEY = "stance:holder"
 
-#: ``properties`` key carrying the optional attitude strength, float in [0, 1] (§3).
+#: ``properties`` key carrying the optional attitude strength, float in [0, 1]
+#: (§6.8 properties).
 STANCE_MAGNITUDE_KEY = "stance:magnitude"
 
 #: The two relation kinds whose outbound edge marks a particle as a stance
-#:. Both asymmetric (stance → target); neither is in
+#: (§6.10 relation kinds). Both asymmetric (stance → target);
+#: neither is in
 #: ``relation_store._SYMMETRIC_KINDS``.
 STANCE_KINDS: frozenset[RelationType] = frozenset({RelationType.ENDORSES, RelationType.DISPUTES})
 
@@ -71,9 +78,10 @@ def has_stance_marker(particle: Particle) -> bool:
 
     Stance particles are stamped with ``stance:holder`` alongside their outbound
     ``ENDORSES`` / ``DISPUTES`` edge, so this is the co-stamped
-    signal for keeping stances out of factual top-k (§6) and out of §6.6
+    signal for keeping stances out of factual top-k and out of §6.4 ladder
     candidacy without a per-candidate edge query. The authoritative role marker
-    is the edge itself (§1); use the store-level edge check when correctness
+    is the edge itself; use the store-level edge check when
+    correctness
     against hand-edited data matters.
     """
     return stance_holder(particle) is not None

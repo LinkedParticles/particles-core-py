@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Generic ``CompletionProvider`` adapter — OpenAI-compatible endpoints.
 
 Born as the ``LocalProvider``; generalized into the one
@@ -40,7 +44,7 @@ from typing import Any
 import httpx
 from opentelemetry import metrics, trace
 
-from particles.llm.registry import CompletionError, VisionImage
+from particles.llm.registry import CompletionError, EmptyCompletionError, VisionImage
 
 log = logging.getLogger(__name__)
 
@@ -450,9 +454,11 @@ def _extract_text(
     *empty* reply is a budget failure, not a model failure, and its
     :class:`CompletionError` says so.
 
-    Raises :class:`CompletionError` when the response carries no text — the
-    same contract :class:`particles.llm.adapters.anthropic.AnthropicProvider`
-    upholds for an empty Anthropic response.
+    Raises :class:`EmptyCompletionError` — the deterministic
+    ``CompletionError`` subclass — when the response carries no text, the same
+    contract :class:`particles.llm.adapters.anthropic.AnthropicProvider`
+    upholds for an empty Anthropic response. A call site that retries
+    transient failures must not retry this one: the budget is the cause.
     """
     content: str | None = None
     finish_reason: object = None
@@ -486,10 +492,10 @@ def _extract_text(
         return content
 
     if truncated:
-        raise CompletionError(
+        raise EmptyCompletionError(
             f"LLM endpoint {provider_model} returned an empty reply truncated "
             f"at {_budget_phrase(max_tokens)} (finish_reason=length): the whole "
             f"budget was spent before any answer text — {_TRUNCATION_HINT}"
         )
     detail = f" (finish_reason={finish_reason})" if finish_reason is not None else ""
-    raise CompletionError(f"LLM endpoint response carried no text content{detail}")
+    raise EmptyCompletionError(f"LLM endpoint response carried no text content{detail}")

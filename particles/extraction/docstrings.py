@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Symbol-aware docstring extractor.
 
 A deterministic, **LLM-free** Client-layer extractor that turns a

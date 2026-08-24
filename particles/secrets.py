@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Centralised reads for secret environment variables.
 
 Secrets must never appear in ``config.yaml``: they are read from

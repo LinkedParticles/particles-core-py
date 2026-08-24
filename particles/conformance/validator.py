@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """The extractor conformance validator.
 
 ``validate_extractor(extractor_id, ...)`` runs a registered extractor against

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Numista coin-level extractor.
 
 Reads ``NUMISTA_API_COIN`` blobs — a single Numista coin-type API response

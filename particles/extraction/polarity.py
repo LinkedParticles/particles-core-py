@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Claim-polarity classification contract (capability 1).
 
 The general extractor classifies each candidate's *polarity* — how the source

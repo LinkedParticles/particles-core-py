@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for vision / multimodal PDF extraction.
 
 Covers the deterministic seams: the page-modality decision, the rasterizer

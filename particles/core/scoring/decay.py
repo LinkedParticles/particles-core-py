@@ -1,4 +1,13 @@
-"""Content age decay for effective confidence.
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Content age decay for effective confidence (§6.3).
+
+The multiplier is the ``recency_factor`` of the §6.3 effective-confidence
+formula — the technical specification states this exact expression under
+"Recency factor (content age decay)", and the constants are per-``source_type``
+operator configuration rather than part of the standard.
 
 recency_factor() returns a multiplier in [floor, 1.0] based on how many days
 have elapsed since a snapshot's content_published_at timestamp.  Sources with
@@ -9,8 +18,8 @@ Formula: max(floor, 0.5 ** (age_days / half_life_days))
 This module is pure (no I/O beyond the cached config singleton). The
 ``(half_life_days, floor)`` parameters are resolved by the caller — from the
 process-global ``content_age_decay`` config (``recency_factor`` below) or from
-the per-observer, lens-composed ``DecayPolicy`` (
-``particles.operations.query.decay_policy``), which calls
+the per-observer, lens-composed ``DecayPolicy``
+(``particles.operations.query.decay_policy``), which calls
 ``recency_factor_from_params`` with the resolved parameters. The exponential
 math lives here, in exactly one place.
 """
@@ -62,7 +71,7 @@ def recency_factor(
 ) -> float:
     """Recency multiplier from the **process-global** ``content_age_decay`` config.
 
-    The path, unchanged in behaviour: returns 1.0 when
+    The process-global path, unchanged in behaviour: returns 1.0 when
     ``content_published_at`` is None or ``source_type`` has no entry in
     ``config.content_age_decay.sources``. Per-observer (lens-composed) decay
     goes through :class:`particles.operations.query.decay_policy.DecayPolicy`

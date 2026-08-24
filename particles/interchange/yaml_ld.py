@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """YAML-LD container for interchange units.
 
 The human-editable single-document sibling of the canonical JSONL container

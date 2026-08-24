@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Mastodon thread extractor and importer (importer naming).
 
 MastodonImporter — accepts three URL shapes that operators copy from their

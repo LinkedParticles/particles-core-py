@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Trust-lens extractor.
 
 Accepts ``source_type == "TRUST_LENS_DEFINITION"`` corpus entries deposited

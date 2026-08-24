@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """JSON Lines container for interchange units.
 
 One JSON-LD unit per line — the canonical, streamable particle-interchange

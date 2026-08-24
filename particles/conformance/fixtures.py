@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Fixture corpus loader for the extractor conformance validator.
 
 A fixture is a directory under ``tests/conformance/fixtures/`` containing:

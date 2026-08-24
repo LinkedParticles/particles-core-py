@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """General-purpose LLM extractor (§C.4, §9.2).
 
 Implements the ExtractorInterface from §14.3:
@@ -31,6 +35,7 @@ from particles.core.schema import (
     AssertionModality,
     CanonicalForm,
     Confidence,
+    ContributorRef,
     ExternalRef,
     ExtractorCalibration,
     ExtractorRef,
@@ -561,6 +566,27 @@ class CandidateParticle:
     # sets it and its particles are correctly unstamped. Same "written by the
     # machinery, not the extractor" class as ``chunk_hash`` above.
     provider_model: str | None = None
+    # Four fields a *migration* extractor needs and an LLM extractor
+    # never sets, so every existing producer is unaffected by their defaults:
+    #   tags                — Extension C tags to stamp on the particle. The
+    #                         reference-memory migration uses them to carry the
+    #                         store vocabulary, so a migrated record
+    #                         and a façade-written one are the same record.
+    #   contributors        — the attributed act: who imported
+    #                         this, with role ``importer``.
+    #   calibration_source  — declared by the extractor when the confidence is
+    #                         not a model output. Set ⇒ ``candidate_to_particle``
+    #                         uses it verbatim and does **not** apply temperature
+    #                         scaling, which would be meaningless over a value no
+    #                         model produced.
+    #   provenance_location — the record's position inside the deposited blob,
+    #                         carried onto the SOURCE ``ProvenanceRef.location``.
+    #                         This is what makes a migrated claim's provenance
+    #                         checkable rather than merely asserted.
+    tags: list[str] | None = None
+    contributors: list[ContributorRef] | None = None
+    calibration_source: CalibrationSource | None = None
+    provenance_location: str | None = None
 
 
 @dataclass
@@ -2142,22 +2168,38 @@ def candidate_to_particle(
     A supplied record whose ``transform`` this SDK will not apply (
     today, every fit predating it) is treated exactly as no record: the
     particle carries the raw value stamped ``EXTRACTOR_DIRECT``.
+
+    A candidate that declares its own ``calibration_source`` (today,
+    a migration extractor stamping ``IMPORTED``) overrides both branches: the
+    raw value is stored as given and no calibration is applied, because the
+    number is not a model output for a scaler to correct.
     """
     # Local import: TemperatureScaler pulls in numpy + scipy.optimize, and the
     # rest of general.py does not need them. Keeping the import lazy preserves
     # the pre-ADR-0075 import cost of this module for callers that never set a
     # calibration record.
     scaler = None
-    if calibration is not None:
+    if calibration is not None and candidate.calibration_source is None:
         from particles.extraction.calibration import scaler_for_record
 
         scaler = scaler_for_record(calibration)
 
+    # the extractor declared where this number came from, and it is
+    # not a model output — a migration's flat import floor, not a logit.
+    # Temperature scaling a value no model produced would be meaningless, so a
+    # declared source suppresses calibration entirely (the `scaler` guard
+    # above) and the raw value is stored as given. First, because it outranks
+    # both calibration branches below.
+    if candidate.calibration_source is not None:
+        confidence = Confidence(
+            value=candidate.confidence_value,
+            calibration_source=candidate.calibration_source,
+        )
     # `scaler_for_record` returns None for a record whose transform
     # this SDK will not apply (today: every pre-0238 fit). Falling through to
     # the EXTRACTOR_DIRECT branch is the documented fallback for an
     # uncalibrated pairing — the same state as having no record at all.
-    if calibration is not None and scaler is not None:
+    elif calibration is not None and scaler is not None:
         confidence = Confidence(
             value=scaler.calibrate(candidate.confidence_value),
             calibration_source=CalibrationSource.CALIBRATED_BENCHMARK,
@@ -2194,6 +2236,10 @@ def candidate_to_particle(
                 type=ProvenanceRefType.SOURCE,
                 corpus_entry_id=corpus_entry_id,
                 snapshot_id=snapshot_id,
+                # the record's position inside the deposited
+                # blob, so a migrated claim points at bytes the store holds
+                # and hashed rather than at an unverifiable foreign reference.
+                location=candidate.provenance_location,
                 chunk_hash=candidate.chunk_hash,
             )
         ],
@@ -2211,6 +2257,10 @@ def candidate_to_particle(
         # ``None`` for a deterministic extractor — correct, not a gap.
         extraction_provider_model=candidate.provider_model,
         properties=candidate.properties,
+        # the attributed act — who imported this record. ``None``
+        # for every LLM extractor, which attributes through ``extractor_ref``.
+        contributors=candidate.contributors,
+        tags=candidate.tags,
         context_fingerprint=candidate.context_fingerprint,
         # the annotation, with its subject term now bound to the
         # Subject UUID the pipeline just resolved (``subject_ids`` is

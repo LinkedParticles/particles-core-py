@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Structured-claim production — the S-P-O rendering of a prose claim.
 
 Two producers share this module, and they are the **only** two places a

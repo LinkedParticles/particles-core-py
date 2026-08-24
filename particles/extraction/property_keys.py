@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """The `properties`-key shape, as one shared predicate.
 
 The spec requires every ``Particle.properties`` key to use a

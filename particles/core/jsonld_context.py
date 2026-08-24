@@ -1,14 +1,18 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """The published JSON-LD context, read as the one CURIE-prefix authority.
 
 :class:`~particles.core.schema.TermKind` defines a ``URI`` term as "an absolute
-IRI, **or a CURIE in a ``context.jsonld`` prefix**", and the spec requires
-every ``Particle.properties`` key to carry a prefix. Three call sites were
+IRI, **or a CURIE in a ``context.jsonld`` prefix**", and §6.8's prefix registry
+requires every ``Particle.properties`` key to carry a prefix. Three call sites were
 answering "is this prefix published?" from three independently hand-maintained
 tuples, and all three disagreed with the artifact — ``extraction.structure``
 claimed ``wd: wdt: nm: schema: rdfs: owl:``, ``extraction.numista._shared``
 claimed ``schema:``, and the file published none of them. A predicate spelled
 with an unpublished prefix is a ``URI`` term nothing can expand, which is the
-failure that the rule defines, to avoid.
+failure the ``URI``-term rule exists to avoid (§6.8).
 
 So the question is answered once, here, by reading the artifact.
 
@@ -45,8 +49,9 @@ def published_prefixes() -> tuple[str, ...]:
     Sorted, so callers get a stable order. Cached: the artifact is immutable at
     runtime and the readers are on per-candidate paths.
 
-    Note the one prefix the artifact **cannot** carry: the spec registers
-    ``content:`` (generic content metadata — ``content:hasUrl``), but the term
+    Note the one prefix the artifact **cannot** carry: the §6.8
+    prefix registry lists ``content:`` (generic content metadata —
+    ``content:hasUrl``), but the term
     ``content`` is already bound to ``particles:content``, and a term has exactly
     one definition. Publishing it as a prefix would expand ``content:hasUrl`` to
     ``particles:contenthasUrl``. It stays unpublished, so a ``content:`` CURIE is

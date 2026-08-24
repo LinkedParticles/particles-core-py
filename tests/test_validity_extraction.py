@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Event-anchored validity extraction — the deterministic parser gate.
 
 Per tests/AGENTS.md, extractor *parsing* (the deterministic map from a fixed LLM

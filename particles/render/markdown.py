@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Markdown Bridge renderer — renders particles and lint reports as Obsidian-compatible
 callout blocks (§C.5).
 

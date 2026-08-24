@@ -19,8 +19,8 @@
 # version and advance together.
 [project]
 name = "linkedparticles-core"
-version = "1.134.4"
-description = "Client layer of the Particles reference implementation — store-free schema, extraction, and interchange"
+version = "1.138.1"
+description = "Store-free client library for Particles: define, validate, serialize, and extract provenance-tracked belief particles"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
@@ -28,18 +28,23 @@ authors = [{ name = "The Particles authors" }]
 keywords = [
     "epistemic", "knowledge-management", "provenance", "uncertainty", "psum",
     "knowledge-graph", "beliefs", "llm", "agents", "rag", "citations",
+    "agent-memory", "json-ld", "shacl", "jsonschema",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: Apache Software License",
+    "Natural Language :: English",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Topic :: Software Development :: Libraries",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Typing :: Typed",
 ]
@@ -98,10 +103,18 @@ vision = [
     "pypdfium2>=4.30",
 ]
 
+# PyPI renders these beside the description and maps the recognized names
+# (Homepage / Documentation / Repository / Issues / Changelog) to icons. Both
+# sites are live and are the front of this project, so they lead. There is no
+# CHANGELOG.md in a published tree — the per-release notes ride the GitHub
+# Release — so "Changelog" points at the releases page.
 [project.urls]
-Homepage = "https://github.com/LinkedParticles/particles-core-py"
+Homepage = "https://linkedparticles.org"
+Documentation = "https://docs.linkedparticles.org"
+Specification = "https://linkedparticles.org/spec/technical-specification/"
 Repository = "https://github.com/LinkedParticles/particles-core-py"
 Issues = "https://github.com/LinkedParticles/particles-core-py/issues"
+Changelog = "https://github.com/LinkedParticles/particles-core-py/releases"
 
 [build-system]
 requires = ["hatchling"]

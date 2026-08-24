@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """JSON Schema validation for particles (§C.5).
 
 Validates particles against artifacts/schemas/particle.schema.json.

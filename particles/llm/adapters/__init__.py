@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Concrete :class:`~particles.llm.registry.CompletionProvider` adapters.
 
 Two adapters ship: ``AnthropicProvider`` (hosted) and ``LocalProvider`` (an

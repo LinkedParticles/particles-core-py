@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for the two-quantity confidence math (particles/core/confidence.py).
 
 Covers ``compute_effective_confidence`` and the read-side **uncalibrated

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Per-run completion pooling for latency-tolerant fan-in batching.
 
 A :class:`CompletionPool` is the aggregation point that lets *concurrent*

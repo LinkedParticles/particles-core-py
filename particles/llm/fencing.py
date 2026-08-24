@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Prompt-injection hardening for untrusted-content LLM calls (security F3).
 
 Several call sites feed attacker-controllable text — a deposited document, a

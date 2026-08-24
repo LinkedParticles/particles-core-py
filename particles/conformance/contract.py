@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """The conformance contract — which fields are REQUIRED / RECOMMENDED / OPTIONAL.
 
 This is the single source of truth operators consult when asking *"why did my

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Anthropic ``CompletionProvider`` adapter.
 
 Ports today's behaviour verbatim: one ``client.messages.create`` call against
@@ -30,7 +34,12 @@ from typing import TYPE_CHECKING, Any, cast
 from anthropic import Omit, omit
 from opentelemetry import metrics, trace
 
-from particles.llm.registry import CompletionError, CompletionRequest, VisionImage
+from particles.llm.registry import (
+    CompletionError,
+    CompletionRequest,
+    EmptyCompletionError,
+    VisionImage,
+)
 
 if TYPE_CHECKING:
     from anthropic.types import MessageParam
@@ -213,8 +222,15 @@ class AnthropicProvider:
                 )
             text_block = next((b for b in resp.content if hasattr(b, "text")), None)
             if text_block is None:
-                raise CompletionError(
-                    f"Anthropic response carried no text block (stop_reason={stop_reason})"
+                # Deterministic at this budget (an extended-thinking model that
+                # spent max_tokens before answering reproduces it on a retry),
+                # so it is raised as the narrower EmptyCompletionError — a
+                # CompletionError subclass, invisible to every call site that
+                # does not care about the distinction.
+                raise EmptyCompletionError(
+                    f"Anthropic response carried no text block "
+                    f"(stop_reason={stop_reason}, max_tokens={max_tokens}) — "
+                    f"raise the call site's token budget"
                 )
             return str(text_block.text).strip()
 

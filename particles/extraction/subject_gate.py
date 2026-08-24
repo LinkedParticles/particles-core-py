@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Non-entity subject gate.
 
 A pure, lexical classifier recognizing candidate *subject names* that are never

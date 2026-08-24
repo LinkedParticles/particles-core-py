@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Journal-aware extractor.
 
 Selected for ``JOURNAL``-typed corpus entries — the operator-explicit genre

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Taxonomy extractor (Phase A).
 
 Accepts ``source_type == "TAXONOMY_DEFINITION"`` corpus entries deposited

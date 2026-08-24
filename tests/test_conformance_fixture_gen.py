@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for the fixture writer (`conformance.fixtures.write_fixture`).
 
 The store-reading half (resolving an entry → snapshot → blob) lives in the

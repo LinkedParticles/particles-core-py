@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Chunked LLM extraction with content-hash carry-forward.
 
 An extractor renders source content into one or more ``ChunkUnit``s — each

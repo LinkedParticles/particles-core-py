@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Particles authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Nomisma Linked Open Data extractor and importer (importer naming).
 
 Nomisma (nomisma.org) publishes dereferenceable LOD URIs for numismatic

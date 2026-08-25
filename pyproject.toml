@@ -19,7 +19,7 @@
 # version and advance together.
 [project]
 name = "linkedparticles-core"
-version = "1.138.1"
+version = "1.138.3"
 description = "Store-free client library for Particles: define, validate, serialize, and extract provenance-tracked belief particles"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -111,10 +111,7 @@ vision = [
 [project.urls]
 Homepage = "https://linkedparticles.org"
 Documentation = "https://docs.linkedparticles.org"
-Specification = "https://linkedparticles.org/spec/technical-specification/"
 Repository = "https://github.com/LinkedParticles/particles-core-py"
-Issues = "https://github.com/LinkedParticles/particles-core-py/issues"
-Changelog = "https://github.com/LinkedParticles/particles-core-py/releases"
 
 [build-system]
 requires = ["hatchling"]

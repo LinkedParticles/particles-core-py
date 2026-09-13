@@ -1,5 +1,10 @@
 # linkedparticles-core
 
+**[linkedparticles.org](https://linkedparticles.org)** ·
+**[docs.linkedparticles.org](https://docs.linkedparticles.org)** ·
+[PyPI](https://pypi.org/project/linkedparticles-core/) ·
+[Apache-2.0](https://github.com/LinkedParticles/particles-core-py/blob/main/LICENSE)
+
 > **Particles is shared memory for humans and AI agents.** Each particle is one
 > claim, plus what you need to judge it: who said it, where, when, and how
 > confident they were. Facts, opinions, and memories are all claims, recorded
@@ -19,7 +24,10 @@ wire format, and the extraction pipeline. Everything you need to *make* and
 > an MCP server — install
 > **[`linkedparticles`](https://pypi.org/project/linkedparticles/)** instead.
 > It depends on this package and pulls it in automatically. This one is the
-> substrate underneath it.
+> substrate underneath it. Its repository —
+> **[`particles-engine-py`](https://github.com/LinkedParticles/particles-engine-py)** —
+> is the reference implementation's front door: issues, discussion, and
+> documentation live there.
 
 ## Install
 

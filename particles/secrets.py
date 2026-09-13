@@ -112,6 +112,46 @@ def get_particles_api_key() -> str:
     return os.environ.get("PARTICLES_API_KEY", _PARTICLES_API_KEY_DEFAULT)
 
 
+def get_metrics_github_token() -> str:
+    """Return ``PARTICLES_METRICS_GITHUB_TOKEN`` or raise ``ValueError`` if unset.
+
+    The publication-metrics capture reads the **traffic** endpoints
+    (``/traffic/views``, ``/traffic/clones``) of repositories it does not run
+    in. A workflow's ambient ``GITHUB_TOKEN`` is scoped to its own repository
+    and cannot read another's traffic, so this is a separate fine-grained
+    personal access token with read access to those repositories' metrics.
+
+    Deliberately raise-on-missing rather than optional, unlike
+    :func:`get_github_api_key_optional`. The traffic window is 14 days and
+    non-backfillable: a capture that silently skipped it would look exactly
+    like a repository with no traffic, for as long as it took anyone to
+    notice — and by then the data would be gone. Failing loudly is the only
+    safe behaviour.
+    """
+    token = os.environ.get("PARTICLES_METRICS_GITHUB_TOKEN")
+    if not token:
+        raise ValueError(
+            "PARTICLES_METRICS_GITHUB_TOKEN is not set. The publication-metrics "
+            "capture needs a fine-grained personal access token with "
+            "'Repository permissions -> Administration: Read-only' (which is "
+            "what gates the traffic endpoints) on the published repositories. "
+            "A workflow's default GITHUB_TOKEN cannot read another repository's "
+            "traffic. Store it as the repository secret of the same name."
+        )
+    return token
+
+
+def get_metrics_goatcounter_token_optional() -> str | None:
+    """Return ``PARTICLES_METRICS_GOATCOUNTER_TOKEN`` or ``None`` if unset.
+
+    Optional, and the asymmetry with :func:`get_metrics_github_token` is
+    deliberate: GoatCounter keeps full history, so a run that collects nothing
+    from it loses nothing — the figures can be fetched later. The capture
+    records the source as unavailable and carries on.
+    """
+    return os.environ.get("PARTICLES_METRICS_GOATCOUNTER_TOKEN") or None
+
+
 def get_engine_token_optional() -> str | None:
     """Return ``PARTICLES_ENGINE_TOKEN`` or ``None`` if unset.
 

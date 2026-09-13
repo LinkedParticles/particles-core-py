@@ -2511,6 +2511,62 @@ class BenchmarkConfig(BaseModel):
     confirm_call_threshold: int = Field(default=50, ge=0)
 
 
+class MetricsConfig(BaseModel):
+    """Publication-metrics capture and deposit — the two halves of one pipeline.
+
+    The pipeline is deliberately **split in two, and the split is the point**.
+    One of its sources expires: the GitHub traffic endpoints
+    (``/traffic/views``, ``/traffic/clones``) serve a trailing **14-day**
+    window and nothing older, so a figure not captured inside that window is
+    gone permanently. Every other source here is backfillable (pypistats keeps
+    ~180 days; GoatCounter and the ``starred_at`` stargazer stream keep full
+    history). So *capture* runs unattended on a schedule and only writes raw
+    JSON, while *deposit* runs on the operator's laptop whenever it happens to
+    be up and batches whatever has accumulated. Neither half may be made to
+    depend on the other being available.
+
+    The fields below are read by the deposit half (``scripts/deposit_metrics.py``)
+    via ``get_config()``. The capture half (``scripts/capture_metrics.py``) is
+    stdlib-only by design — it must not be able to fail because this SDK's
+    dependency closure did — so it carries its own copy of the identity fields
+    as module constants, and ``tests/test_capture_metrics.py`` asserts the two
+    copies are equal. Change a value here and that test tells you to change it
+    there.
+
+    Nothing in this section is a secret. The GitHub and GoatCounter tokens are
+    read through ``particles.secrets``.
+    """
+
+    # Where snapshots live, relative to the repository root. The scheduled
+    # capture writes here on a dedicated data branch; the deposit half reads
+    # the same layout, whether from that branch or from a local directory.
+    snapshot_dir: str = "metrics/snapshots"
+    # The published repositories whose traffic / stars / forks are captured.
+    repos: list[str] = Field(
+        default_factory=lambda: [
+            "LinkedParticles/particles-standard",
+            "LinkedParticles/particles-engine-py",
+            "LinkedParticles/particles-core-py",
+        ]
+    )
+    # The PyPI distributions whose download counts are captured.
+    pypi_distributions: list[str] = Field(
+        default_factory=lambda: ["linkedparticles", "linkedparticles-core"]
+    )
+    # The GoatCounter site code (``<code>.goatcounter.com``). Until the
+    # analytics tag reaches the published sites this source returns nothing;
+    # it is recorded as unavailable and never fails a capture run.
+    goatcounter_site: str = "linkedparticles"
+    # Tags applied to every corpus entry the deposit half writes, so the
+    # deposited series is addressable as one body of material.
+    deposit_tags: list[str] = Field(default_factory=lambda: ["metrics", "publication"])
+    # Per-request timeout for the capture half's HTTP calls.
+    request_timeout_seconds: float = Field(default=30.0, gt=0)
+    # Hard cap on stargazer pages fetched per repository (100 stars per page).
+    # An abuse-stop, not a tuning knob: the full history is wanted.
+    stargazer_max_pages: int = Field(default=50, ge=1)
+
+
 class CliConfig(BaseModel):
     """Interactive CLI output behaviour.
 
@@ -2528,6 +2584,7 @@ class CliConfig(BaseModel):
 class ParticlesConfig(BaseModel):
     storage: StorageConfig = Field(default_factory=StorageConfig)
     cli: CliConfig = Field(default_factory=CliConfig)
+    metrics: MetricsConfig = Field(default_factory=MetricsConfig)
     http: HttpConfig = Field(default_factory=HttpConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
     build: BuildConfig = Field(default_factory=BuildConfig)

@@ -19,19 +19,30 @@
 # version and advance together.
 [project]
 name = "linkedparticles-core"
-version = "1.139.6"
+version = "1.139.8"
 description = "Store-free client library for Particles: define, validate, serialize, and extract provenance-tracked belief particles"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 authors = [{ name = "The Particles authors" }]
+# Discovery terms, each one true of THIS distribution. Deliberately absent,
+# because the Client layer does not do them: "mcp" (the MCP server is an engine
+# surface), "belief-store" / "store" (this layer is store-free by construction —
+# it produces and validates candidate particles, it never holds them), and
+# "audit" (auditing accumulated state needs the state).
 keywords = [
-    "epistemic", "knowledge-management", "provenance", "uncertainty", "psum",
-    "knowledge-graph", "beliefs", "llm", "agents", "rag", "citations",
-    "agent-memory", "json-ld", "shacl", "jsonschema",
+    "epistemic", "epistemics", "knowledge-management", "knowledge-graph",
+    "provenance", "uncertainty", "psum", "beliefs", "claim-extraction",
+    "agent-memory", "ai-memory", "llm", "agents", "rag", "citations",
+    "json-ld", "shacl", "jsonschema", "conformance", "pydantic",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
+    # The schema models are this distribution's deliverable, so the framework
+    # they are written in is a first-class discovery axis here (the engine
+    # declares FastAPI instead).
+    "Framework :: Pydantic",
+    "Framework :: Pydantic :: 2",
     "Intended Audience :: Developers",
     "Intended Audience :: Information Technology",
     "Intended Audience :: Science/Research",

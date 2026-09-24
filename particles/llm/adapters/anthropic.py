@@ -186,8 +186,7 @@ class AnthropicProvider:
                 )
                 resp = _create(omit)
             # Record prompt-cache usage for verification/observability without
-            # widening the port's return; the widening is deferred
-            #.
+            # widening the port's return; the widening is deferred.
             usage = getattr(resp, "usage", None)
             if usage is not None:
                 cache_usage["read"] = int(getattr(usage, "cache_read_input_tokens", 0) or 0)

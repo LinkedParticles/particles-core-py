@@ -92,12 +92,12 @@ class UncertaintyNature(StrEnum):
 
 
 class AssertionModality(StrEnum):
-    """What *kind* of assertion a particle makes — its truth-aptness.
+    """What *kind* of assertion a particle makes: its truth-aptness.
 
     Orthogonal to ``uncertainty_nature`` (which presupposes a fact of the
     matter) and to scope (which lives in ``properties``). The Core
-    engine applies truth-semantics — the §6.4 conflict ladder, L-SEM-01,
-    L-IDX-01 — only to ``FALSIFIABLE`` particles (see :func:`is_truth_apt`);
+    engine applies truth-semantics (the §6.4 conflict ladder, L-SEM-01,
+    L-IDX-01) only to ``FALSIFIABLE`` particles (see :func:`is_truth_apt`);
     the other modalities co-exist and are never contradiction-checked or
     trust-arbitrated. Default ``FALSIFIABLE`` keeps every existing particle
     unchanged. Closed enum: adding a modality is an additive minor change.
@@ -213,7 +213,7 @@ class RelationType(StrEnum):
 
     The registry of well-known values is documented. Today
     ``CO_EVIDENTIAL`` plus the two narrative kinds (``PART_OF`` /
-    ``SEQUENCE_IN``) are emitted by code paths — the other
+    ``SEQUENCE_IN``) are emitted by code paths; the other
     members are RESERVED names, pre-blessed for future extractor work
     so the kind enum can grow additively without ad-hoc string drift.
     """
@@ -262,6 +262,11 @@ class RelationCreatedBy(StrEnum):
     # misattribute a deterministic merge to a model) and from AUTO_CLUSTER_V1
     # (reserved for the clustering pass).
     EXACT_DUPLICATE = "EXACT_DUPLICATE"
+    # a confirmed contradiction the observer precondition declined
+    # to reconcile — two projects state different values and each keeps its own.
+    # Written on a CONTRADICTS edge; the probe verdict it records was already
+    # paid for on the write path, so lint reports it without a second probe.
+    OBSERVER_DIVERGENCE = "OBSERVER_DIVERGENCE"
 
 
 class SuggestMode(StrEnum):
@@ -307,8 +312,8 @@ class CanonicalForm(StrEnum):
 
     ``PROSE`` is the default and covers everything the LLM prose extractors
     produce: ``content`` is the assertion and any :class:`StructuredClaim` is
-    a derived annotation. ``STRUCTURED`` is the inverse — the source asserts
-    the triple and ``content`` is verbalised from it — and is emitted
+    a derived annotation. ``STRUCTURED`` is the inverse (the source asserts
+    the triple and ``content`` is verbalised from it) and is emitted
     per-candidate by the structure-canonical extractors (RDF, the Numista
     family) under the rule: ``STRUCTURED`` exactly when
     ``content`` is a deterministic rendering of its ``structured_claim`` and
@@ -358,7 +363,7 @@ class StructuredClaim(BaseModel):
     The core invariant generalises: the **asserted** form is immutable,
     the **derived** form is regenerable. This annotation is produced by tooling
     from ``content``, carries its own derivation stamp, and its fidelity is a
-    property of the annotation — never evidence about the claim. Nothing that
+    property of the annotation, never evidence about the claim. Nothing that
     writes it may touch ``content``, ``confidence``, or provenance.
 
     Generated in exactly two places: the extraction pipeline
@@ -442,7 +447,8 @@ CONTRIBUTOR_ROLES: frozenset[str] = frozenset(
     {"author", "extractor", "curator", "reviewer", "importer", "agent"}
 )
 """The canonical registry of **attributed acts on a particle / entry / subject**
-(catalogued). This constant *is* the catalogue — the table is its normative description, and there is no second list.
+(catalogued). This constant *is* the catalogue — the
+table is its normative description, and there is no second list.
 
 | Role | The actor… |
 |---|---|
@@ -487,13 +493,13 @@ class ContributorRef(BaseModel):
     NOT branch on it**. ``id`` shares the AUTHOR-scoped ``SourceRef`` namespace
     (``platform:identifier``, §6.5; e.g. ``github:torvalds``) so a per-viewer
     ``SourceTrustStatement`` lookup joins on it with no extra
-    identity machinery. It is immutable attribution substrate — it carries no
+    identity machinery. It is immutable attribution substrate; it carries no
     confidence / trust / endorsement (those are query-time lenses).
 
     Attributes:
         id: ``platform:identifier`` identity string, canonically normalized (§6.5).
         role: Open vocabulary. :data:`CONTRIBUTOR_ROLES` is the canonical
-            registry of recommended values — a new role is added
+            registry of recommended values; a new role is added
             there before any code emits it.
         at: UTC timestamp of when this contributor performed the act.
     """
@@ -512,14 +518,14 @@ class ExtractorRef(BaseModel):
     weighting and exporter attribution look up, ``version`` is what
     ``reindex --extractor-version`` and the chunk-hash carry-forward scope
     on. Absent only for particles asserted directly by an operator or an
-    authorized agent (§9.1a) — ``Particle.extractor_ref`` is
+    authorized agent (§9.1a); ``Particle.extractor_ref`` is
     ``None`` there, never an empty ref.
 
     Modelled. It was an untyped ``dict[str, Any]`` through 1.109.x
     with the two key names stated only in prose, so nothing checked them at
     any of the three validation layers.
 
-    The **runtime substrate** the extractor invoked is *not* recorded here —
+    The **runtime substrate** the extractor invoked is *not* recorded here;
     that is the sibling ``Particle.extraction_provider_model``.
     This names the code; one extractor version runs under many models.
 
@@ -545,7 +551,7 @@ class Particle(BaseModel):
     extractors (e.g. Numista); it is never used for conflict detection.
 
     Attributes:
-        content: The claim text (min length 1) — one falsifiable assertion
+        content: The claim text (min length 1): one falsifiable assertion
             (§6.1).
         confidence: Stored, immutable confidence record (§6.3); never modified
             after creation.
@@ -572,8 +578,8 @@ class Particle(BaseModel):
     status_reason: StatusReason | None = None
     schema_version: str = Field(default=SCHEMA_VERSION)
     particle_type: ParticleType = ParticleType.CLAIM
-    # Truth-aptness axis. Additive Optional Extension field
-    #: old particles deserialize to the FALSIFIABLE default, so the
+    # Truth-aptness axis. Additive Optional Extension field:
+    # old particles deserialize to the FALSIFIABLE default, so the
     # schema freeze holds and SCHEMA_VERSION stays 1.0.0. The
     # engine applies truth-semantics only to FALSIFIABLE particles — see
     # is_truth_apt(); Core branches on exactly this one default-safe bit.
@@ -797,7 +803,8 @@ class ExtractorCalibration(BaseModel):
 
     Attributes:
         temperature: The fitted T. What it *means* is declared by ``transform``.
-        transform: Which functional form ``temperature`` parameterises. ``"logit"`` — ``sigmoid(logit(raw) / T)``, Guo et al. (2017),
+        transform: Which functional form ``temperature`` parameterises.
+            ``"logit"`` — ``sigmoid(logit(raw) / T)``, Guo et al. (2017),
             the only form this SDK fits or applies. ``None`` is a pre-ADR-0238
             record: its T parameterises the retired ``clamp(raw / T, 0, 1)``
             form *and* was fitted against all-False labels, so it is never
@@ -912,7 +919,7 @@ class TaxonomyDefinition(BaseModel):
 
     Operators publish taxonomies by depositing a JSON file; the
     ``TaxonomyExtractor`` materialises the rows into the ``taxonomies`` and
-    ``tag_nodes`` query-time index. Tags carry no truth value — they are a
+    ``tag_nodes`` query-time index. Tags carry no truth value; they are a
     curation layer over the particle store, orthogonal to the Subject
     knowledge graph.
     """
@@ -1005,8 +1012,8 @@ class TrustLensUtilityRule(BaseModel):
     decay, a ``utility_rule`` is the judgment half of **usefulness**: it sets
     *how far* demonstrated use may reorder the projection / digest head, and
     *how fast* unreinforced utility fades. The per-belief utility *evidence*
-    (the mined reinforcement count) is store-local and lives outside the lens
-     — this rule carries only the tunables.
+    (the mined reinforcement count) is store-local and lives outside the lens—
+    this rule carries only the tunables.
 
     - ``half_life_uses_days`` — days for a single utility event's weight to halve
       (the reinforcement half-life; ``> 0``).
@@ -1016,7 +1023,7 @@ class TrustLensUtilityRule(BaseModel):
       lift rather than demoting.
 
     This single knob replaced the old ``weight`` / ``floor`` / ``cap`` triple
-     when the bounded multiplier was superseded; a lens
+    when the bounded multiplier was superseded; a lens
     published under the old vocabulary carries no ``rank_lift`` and is treated
     as silent about utility (the store's local ``utility`` config applies).
 
@@ -1123,7 +1130,7 @@ class QueryRequest(BaseModel):
     # Tag filter — each requested tag is subtree-expanded across all active
     # taxonomies before the candidate set is filtered (Extension C.2).
     tags: list[str] = Field(default_factory=list)
-    #: when True, the tag filter also walks UP each requested
+    # : when True, the tag filter also walks UP each requested
     # tag's parent chain, so a query for a specific node additionally matches
     # particles tagged only with a broader ancestor term. Off by default — it
     # widens the match set and only the subtree expansion is the documented
@@ -1157,6 +1164,13 @@ class QueryRequest(BaseModel):
     # is rejected by the validator below (HTTP 422; CLI/MCP surface the
     # message).
     as_of: datetime | None = None
+    # read through a project observer — only beliefs that are global
+    # or were observed in this project are candidates. ``None`` (the default) is
+    # the store-wide view, for which the read is byte-identical to before. The
+    # key is opaque here; a harness adapter decides what it names. An SDK
+    # extension parameter, deliberately not part of the specified request shape:
+    # the predicate's inputs (corpus-entry tags) are an SDK convention.
+    observer_project: str | None = Field(default=None, min_length=1)
     # structural claim filters over the annotation.
     # With a question they prefilter the semantic candidate set (ranking
     # untouched); without one they select the deterministic
@@ -1295,7 +1309,7 @@ class StancePosition(BaseModel):
     Computed at query time over the ``ENDORSES`` / ``DISPUTES`` edges into the
     target's CO_EVIDENTIAL group; never stored (substrate-plus-lens).
     ``effective_confidence`` is the *stance particle's own* believability
-    (how sure we are the holder holds the attitude) — it is surfaced alongside,
+    (how sure we are the holder holds the attitude); it is surfaced alongside,
     and never folded into, the target claim's confidence.
     """
 
@@ -1309,11 +1323,11 @@ class StancePosition(BaseModel):
 class PolicyRendering(BaseModel):
     """One nameable policy's rendering of a claim's effective confidence.
 
-    ``policy`` is the attributable member name — ``"local"`` for the store's own
-    policy or an adopted lens's name — and ``effective_confidence`` is the value
+    ``policy`` is the attributable member name (``"local"`` for the store's own
+    policy or an adopted lens's name) and ``effective_confidence`` is the value
     that policy renders for the claim (the §6.9 noisy-OR merge over the claim's
     co-evidential group, evaluated under this member alone). The extremes are
-    *nameable policies* by design — the range statistic exists so the max and min
+    *nameable policies* by design; the range statistic exists so the max and min
     can be attributed ("local: 0.43; acme-numismatics: 0.81").
     """
 
@@ -1329,7 +1343,7 @@ class ContestednessReading(BaseModel):
     adopted lens). It is **disclosure, not discount**: it MUST NOT
     feed ``effective_confidence``, ranking, ``min_confidence`` filtering, or the
     §6.4 conflict ladder. Computed at read time, never stored. Present only
-    when the viewer has two or more policies — a one-policy store
+    when the viewer has two or more policies; a one-policy store
     mints no contestedness, since absence of measurement is not measured
     invariance.
     """
@@ -1342,20 +1356,20 @@ class ContestedBadge(BaseModel):
     """The composed per-claim contested badge (§6.9).
 
     A claim renders *contested* iff at least one of three named bases fires;
-    the badge is a basis-carrying disjunction — a set of fired basis labels,
-    never a blended scalar — so every badge names which instrument(s) produced
-    it. The three gates: ``stance`` — ≥1
+    the badge is a basis-carrying disjunction (a set of fired basis labels,
+    never a blended scalar), so every badge names which instrument(s) produced
+    it. The three gates: ``stance``, at least one
     ``DISPUTES`` position in the
-    claim's query-time stance distribution; ``divergence`` — the
+    claim's query-time stance distribution; ``divergence``, the
     claim's :class:`ContestednessReading` spread is at least
-    ``contestedness.callout_threshold``; ``inconsistency`` — an open
+    ``contestedness.callout_threshold``; ``inconsistency``, an open
     INCONSISTENCY particle references the claim (subsumed as a
     basis). A claim with no available basis fired carries **no** badge (None in
     the parallel list), never an explicit "uncontested".
 
     Invariants: computed at read time, never stored; MUST NOT feed
     ``effective_confidence``, ranking, ``min_confidence`` filtering, or the §6.4
-    conflict ladder — disclosure, not discount. The divergence reading and
+    conflict ladder: disclosure, not discount. The divergence reading and
     stance distribution are not duplicated here; they remain the existing
     envelope blocks (the drill-downs).
     """
@@ -1384,10 +1398,32 @@ class AsOfSuccessor(BaseModel):
     asserted_at: datetime
 
 
+class ObserverScopeNote(BaseModel):
+    """What reading through a project observer did to one result.
+
+    Disclosure only — it never feeds ranking or confidence. ``engaged`` is
+    ``False`` when an observer was asked for but the store has not been
+    rescoped yet, in which case the read stayed store-wide and says so rather
+    than returning a silently emptied result.
+    """
+
+    project: str
+    engaged: bool
+    total: int
+    """Candidate beliefs before the observer was applied."""
+    in_scope: int
+    """Candidates in view: global, observed in this project, or widened."""
+    unattributed: int = 0
+    """Candidates harvested without a project key — in view for no project."""
+    lapsed: int = 0
+    """Candidates some source once stated and none still does —
+    in view for no project, and distinct from a stamping gap."""
+
+
 class AsOfNote(BaseModel):
     """The supersession crossing for a query hit retired after the as-of instant.
 
-    A **response model, not particle substrate** — computed at read time,
+    A **response model, not particle substrate**: computed at read time,
     never stored. Annotates a hit that was believed at the reference instant T
     but has since been retired: its current status + reason, the retirement
     instant, the ladder rung that dated it (so the instant is itself
@@ -1411,7 +1447,7 @@ class AsOfNote(BaseModel):
 class RelevanceNote(BaseModel):
     """The question-level relevance disclosure for a semantic query.
 
-    A **response model, not particle substrate** — computed at read time from
+    A **response model, not particle substrate**: computed at read time from
     the rendered top-k, never stored, and never an input to ranking or
     ``effective_confidence`` (the two-quantity discipline).
     ``max_similarity`` is the maximum raw cosine similarity over the rendered
@@ -1427,6 +1463,32 @@ class RelevanceNote(BaseModel):
     below_floor: bool
 
 
+class AnswerFailureCause(StrEnum):
+    """Why NL answer generation failed, for a caller that must tell them apart.
+
+    ``answer_generation_error`` carries the provider's message, which is the
+    actionable part for a human but opaque to a program: a benchmark that
+    must exclude unscoreable calls, or a UI choosing what to advise, cannot
+    read a free-text string. The split is the one the memory benchmark
+    already draws between its two exclusion classes (the
+    ``EmptyCompletionError`` carve, 1.137.1) — an operator's too-low budget
+    must never be laundered as infrastructure noise, or the other way round.
+
+    * ``BUDGET`` — the model replied HTTP-200 with no text block, having
+      spent the whole ``max_tokens`` allowance before emitting an answer
+      (the extended-thinking failure mode). Deterministic at a fixed
+      budget, so ``query`` has already retried once at
+      ``config.query.answer_retry_max_tokens``; reaching the caller means
+      even that was not enough. The fix is the operator's cap.
+    * ``PROVIDER`` — everything else: billing, network, timeout, a safety
+      refusal, a malformed reply. Not deterministic, and not the
+      operator's budget.
+    """
+
+    BUDGET = "BUDGET"
+    PROVIDER = "PROVIDER"
+
+
 class PredicateInfo(BaseModel):
     """One row of the predicate-vocabulary listing."""
 
@@ -1439,7 +1501,7 @@ class ClaimCoverage(BaseModel):
     """Coverage data for a structural-filter result.
 
     Rendered as the footer line "matched against the N of M ACTIVE particles
-    carrying a structured claim (store coverage P%)" — absence of a hit must
+    carrying a structured claim (store coverage P%)"; absence of a hit must
     never be mistaken for absence of a belief. ``not_normalizable_excluded``
     is the disclosure: claims excluded from a gt/lt comparison
     because their object would not normalize to a comparable type.
@@ -1472,7 +1534,7 @@ class AggregateBucket(BaseModel):
 class StructuralAggregate(BaseModel):
     """Deterministic aggregate result.
 
-    Counts **claims**, never entities — duplicates per subject exist. The
+    Counts **claims**, never entities; duplicates per subject exist. The
     effective-confidence distribution (min/median/max) is disclosed beside
     every count; the distribution fields are None only when zero claims match.
     """
@@ -1544,6 +1606,9 @@ class QueryResponse(BaseModel):
     # reconstructible (rung 4). Born-retired rows are never counted. Always 0
     # on a normal query.
     as_of_excluded_undatable: int = 0
+    # set when the request named an ``observer_project``; None on a
+    # store-wide read. Disclosure only.
+    observer_scope: ObserverScopeNote | None = None
     # present on every structural-filter result (prefilter,
     # deterministic listing, and aggregate modes); None on a plain semantic
     # query. Carries the coverage-footer data and the gt/lt
@@ -1579,6 +1644,12 @@ class QueryResponse(BaseModel):
     # generated prose. None on success AND on the paths that make no LLM
     # call by design (structural modes, the below-floor refusal).
     answer_generation_error: str | None = None
+    # The machine-readable half of the disclosure above: which *kind* of
+    # failure produced the listing, so a program can act on it where the
+    # provider's free-text message only serves a human. Set exactly when
+    # ``answer_generation_error`` is; see :class:`AnswerFailureCause` for
+    # why budget and provider failures must not be conflated.
+    answer_generation_error_cause: AnswerFailureCause | None = None
     # refusal flag, both flavours: True when ``answer`` is a
     # no-relevant-knowledge refusal — the deterministic below-floor answer of
     # §2, or the responder-declared one (the stripped
@@ -1593,7 +1664,7 @@ class QueryResponse(BaseModel):
 class GraphParticleInfo(BaseModel):
     """One particle's epistemics payload in a graph render.
 
-    A **view model, not particle substrate** — every derived quantity here
+    A **view model, not particle substrate**: every derived quantity here
     (``effective_confidence``, the contested badge, the as-of note, the
     utility score) is computed at render time and never stored.
     Rendered as an edge when the particle spans ≥2 in-scope subjects,
@@ -1663,7 +1734,7 @@ class GraphNode(BaseModel):
 class GraphEdge(BaseModel):
     """One rendered subject-pair segment of a multi-subject particle.
 
-    A particle spanning 3+ in-scope subjects renders as a pairwise clique —
+    A particle spanning 3+ in-scope subjects renders as a pairwise clique:
     one segment per pair, all sharing ``particle_id`` (clicking any segment
     opens the same particle; the panel discloses the full subject list).
     """
@@ -1685,7 +1756,7 @@ class GraphCensus(BaseModel):
 
     Candidate counts are what an uncapped render would have shown; rendered
     counts are what this render shows. When they differ the human-readable
-    disclosure line names the binding knob — a capped render is a disclosed
+    disclosure line names the binding knob; a capped render is a disclosed
     lower bound, never a silent truncation.
     """
 
@@ -1702,7 +1773,7 @@ class GraphCensus(BaseModel):
 
 
 class GraphData(BaseModel):
-    """One scoped subgraph render — the contract shared by the static HTML
+    """One scoped subgraph render: the contract shared by the static HTML
     exporter (embedded JSON) and the future ``GET /graph`` endpoint.
 
     Never a whole store: ``scope_type`` + ``scope_ref`` are mandatory, and the
@@ -1895,7 +1966,8 @@ class DuplicateGroup(BaseModel):
     ``content`` string — the §6.10 normalized key, whitespace runs collapsed
     and sentence-final punctuation trimmed, case and wording preserved), not by
     a similarity threshold: cosine is symptom, the hash is the mechanism, so
-    the tier stays decidable and model-independent. The mop and the extract-time suppression rung share that one key, so prevention
+    the tier stays decidable and model-independent. The mop and the
+    extract-time suppression rung share that one key, so prevention
     and cleanup reach exactly the same pairs. Every member is ACTIVE, truth-apt,
     asserted, and shares the group's ``stance:holder`` (``None`` for
     non-stances). Members need **not** carry a Subject — it was

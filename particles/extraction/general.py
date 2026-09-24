@@ -61,6 +61,7 @@ from particles.extraction.scope import (
     SCOPE_KEY,
 )
 from particles.extraction.structure import bind_subject_id, parse_structured_claim_payload
+from particles.extraction.tool_turns import TOOL_TURN_RULE, mark_tool_turns
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -71,11 +72,11 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 EXTRACTOR_ID = "general-extractor"
-EXTRACTOR_VERSION = "0.14.0"
+EXTRACTOR_VERSION = "0.15.0"
 # 0.4.0: prompt now preserves URL schemes.
 # 0.5.0: HTML chunking moves to paragraph boundaries with hash-input
-#        normalisation and routes through extract_with_carry_forward
-#. Chunk boundaries differ from 0.4.0, so the
+#        normalisation and routes through extract_with_carry_forward.
+#        Chunk boundaries differ from 0.4.0, so the
 #        version-mismatch rule forces a one-time full reindex.
 # 0.6.0: prompt now classifies each candidate's document scope
 #        (WORLD vs DOCUMENT_META) and the parser applies the configured
@@ -133,6 +134,22 @@ EXTRACTOR_VERSION = "0.14.0"
 #        reindex is required** — the version bumps because the same source now
 #        yields different ``properties``, which is what the
 #        version-mismatch rule keys on.
+# 0.15.0: confidence elicitation reworked and the parse clamp tightened to
+#        [0.01, 0.99]. The same source now yields a different
+#        ``confidence_value``, so this **does** require a reindex to apply
+#        retroactively. ``particles reindex --extractor-version 0.14.0``
+#        names the 0.14.0 tranche; it is NOT the whole stale set — every
+#        earlier version predates this rubric too, and on the author's store
+#        0.14.0 was 3,921 particles against 33,574 uncalibrated in total.
+#: The interval every emitted ``confidence_value`` is clamped into
+#: (D1). Strict interiority is the whole point: ``calibration.is_saturated``
+#: treats a value within ``_EPS = 1e-7`` of an endpoint as immovable, so
+#: anything strictly inside is fittable and the exact bound is not
+#: load-bearing. These are the widest such bounds that survive a JSON float
+#: round-trip unambiguously, chosen to minimise how far a stated value moves.
+_CONFIDENCE_FLOOR = 0.01
+_CONFIDENCE_CEILING = 0.99
+
 DEFAULT_TRUST_WEIGHT = 0.70
 
 # Extension-side audit crumbs recorded whenever the extractor sets a
@@ -206,11 +223,21 @@ Rules:
 - Do not include opinions, questions, instructions, or non-falsifiable statements (those that
   could never be shown false even in principle)
 - Use only information from the source text; do not add external knowledge
-- Confidence [0.0–1.0]: how clearly and definitively the claim is stated in the source
-  - 0.9–1.0: explicitly stated as fact
-  - 0.7–0.9: clearly implied or strongly suggested
-  - 0.5–0.7: mentioned with hedging or qualification
-  - below 0.5: speculative or weakly supported
+- confidence_value: how clearly and definitively THIS source states the claim.
+  **Never emit exactly 1.0 or exactly 0.0.** A source can state something
+  plainly without putting it beyond revision, and those two values are fixed
+  points that no downstream calibration can correct — an extractor that emits
+  them cannot be calibrated at all. Keep every value in [0.05, 0.97].
+  - 0.90–0.97: stated flatly and unconditionally, in the source's own voice
+  - 0.75–0.89: stated as fact but attributed, approximate, or carrying one
+    qualifier ("about 40 people", "according to the filing")
+  - 0.60–0.74: hedged, provisional, or framed as expectation ("we expect",
+    "should", "is on track to")
+  - 0.40–0.59: speculative, second-hand, or contested elsewhere in the source
+  - 0.05–0.39: raised only as a possibility, or explicitly doubted
+  Use the spread. Within one document some claims are stated more firmly than
+  others; returning the same value for most claims means that difference was
+  not read.
 - uncertainty_nature: EPISTEMIC (knowledge could in principle resolve it) or
   ALEATORY (inherently random/irreducible, e.g. future events, quantum phenomena)
 - subjects: the real-world entities this claim is primarily about. Use the most
@@ -380,14 +407,15 @@ def _build_extract_prompt(
     stance_enabled: bool = False,
     validity_enabled: bool = False,
     structure_enabled: bool = False,
+    tool_turns_present: bool = False,
 ) -> str:
     """Assemble the extraction prompt.
 
     When ``scope_enabled``, the document-scope rule and ``scope``
     JSON field are woven in; when ``modality_enabled``, the
     assertion-modality rule and field; when ``polarity_enabled`` (
-    cap. 1), the claim-polarity rule and field; when ``stance_enabled``
-    , the endorsement-stance rule and fields; when
+    cap. 1), the claim-polarity rule and field; when ``stance_enabled``,
+    the endorsement-stance rule and fields; when
     ``validity_enabled``, the event-anchored validity rule and the
     ``valid_until`` / ``validity_confidence`` / ``validity_basis`` fields; when
     ``structure_enabled``, the S-P-O annotation rule and the
@@ -407,6 +435,9 @@ def _build_extract_prompt(
         + (_STANCE_RULE if stance_enabled else "")
         + (_VALIDITY_RULE if validity_enabled else "")
         + (_STRUCTURE_RULE if structure_enabled else "")
+        # only when the source actually carries a tool turn, so
+        # every other prompt is byte-for-byte unchanged.
+        + (TOOL_TURN_RULE if tool_turns_present else "")
     )
     optional_fields = (
         (_SCOPE_SCHEMA_FIELD if scope_enabled else "")
@@ -431,7 +462,8 @@ def _extraction_response_schema(
     """The JSON Schema of the extraction reply — the candidate array.
 
     The machine-checkable half of :data:`_EXTRACT_SCHEMA`, passed as
-    ``response_schema`` so a schema-enforcing adapter (the ``LocalProvider`` under ``llm.local.structured_output: auto``) can pin the
+    ``response_schema`` so a schema-enforcing adapter (the
+    ``LocalProvider`` under ``llm.local.structured_output: auto``) can pin the
     array shape instead of hoping for it; :func:`_parse_extraction_response`
     remains the tolerant backstop. Optional fields mirror the enabled prompt
     clauses so the schema and prompt can never disagree about the dialect.
@@ -559,8 +591,8 @@ class CandidateParticle:
     # Stamped by ``extract_snapshot()`` after the extractor returns; left
     # ``None`` by extractors themselves.
     context_fingerprint: str | None = None
-    # The ``"<provider>:<model>"`` pairing that produced this candidate
-    #. Stamped by the completion seam itself — ``_call_llm`` here
+    # The ``"<provider>:<model>"`` pairing that produced this candidate.
+    # Stamped by the completion seam itself — ``_call_llm`` here
     # and ``journal._call_journal_llm`` — not by the extractor and not by the
     # pipeline, so a deterministic extractor (rdf, numista, wikidata, …) never
     # sets it and its particles are correctly unstamped. Same "written by the
@@ -648,7 +680,8 @@ class NormalizedDocument:
     This is a **pattern**, not a Protocol extension. ``ExtractorPlugin``
     stays exactly as it was defined. Structured extractors (Wikidata,
     Nomisma, the three Numista variants) have no prose stage and override
-    ``extract()`` directly without going through this convention. §"Decision" item 3 for the full rationale.
+    ``extract()`` directly without going through this convention.
+    §"Decision" item 3 for the full rationale.
 
     Attributes:
         chunks: Ordered ``ChunkUnit``s ready for ``extract_with_carry_forward``.
@@ -744,6 +777,11 @@ class GeneralExtractor:
             )
         source_type = kwargs.get("source_type")
         is_markdown = isinstance(source_type, str) and source_type == "LOCAL_MARKDOWN"
+        # a transcript's tool turns are relabelled before the model
+        # sees them, so tool output is never extracted as the speaker's fact.
+        mark_tools = isinstance(source_type, str) and (
+            source_type in get_config().extraction.tool_turn_source_types
+        )
         session_obj = kwargs.get("session")
         session: AsyncSession | None = session_obj if isinstance(session_obj, _Session) else None
         entry_obj = kwargs.get("corpus_entry_id")
@@ -755,6 +793,7 @@ class GeneralExtractor:
         return await self._extract_single_pass(
             content,
             is_markdown=is_markdown,
+            mark_tools=mark_tools,
             session=session,
             corpus_entry_id=corpus_entry_id,
             reference_published_at=reference_published_at,
@@ -767,6 +806,7 @@ class GeneralExtractor:
         content: bytes,
         *,
         is_markdown: bool = False,
+        mark_tools: bool = False,
         session: AsyncSession | None = None,
         corpus_entry_id: str | None = None,
         reference_published_at: datetime | None = None,
@@ -791,6 +831,10 @@ class GeneralExtractor:
         if is_markdown:
             _, text = _strip_obsidian_frontmatter(text)
 
+        tool_turns = 0
+        if mark_tools:
+            text, tool_turns = mark_tool_turns(text)
+
         if not text.strip():
             return ExtractionResult(quality_notes=["Empty content"])
 
@@ -810,17 +854,27 @@ class GeneralExtractor:
             # a single-chunk source rides the merged nightly
             # batch too — a one-request group is what lets it clear the
             # ``min_requests`` gate the pooled set is tested against.
-            planned = _build_llm_request(text, reference_published_at=reference_published_at)
+            planned = _build_llm_request(
+                text,
+                reference_published_at=reference_published_at,
+                tool_turns_present=tool_turns > 0,
+            )
             results, provider_model = await _pooled_group_complete(completion_pool, [planned])
             candidates, notes, transient = _finish_llm_call(results[0], provider_model, None)
         # pass the anchor only when set, so the no-anchor call is
         # byte-identical to the pre-0197 signature (see _extract_html_chunked).
         elif reference_published_at is not None:
             candidates, notes, transient = await _call_llm(
-                text, reference_published_at=reference_published_at
+                text,
+                reference_published_at=reference_published_at,
+                tool_turns_present=tool_turns > 0,
             )
         else:
-            candidates, notes, transient = await _call_llm(text)
+            candidates, notes, transient = await _call_llm(text, tool_turns_present=tool_turns > 0)
+        if tool_turns:
+            # Never silent (the disclosure habit): the operator can
+            # see that the source carried tool output and how much.
+            notes = [*notes, f"tool output: {tool_turns} turn(s) marked unverified"]
         return ExtractionResult(
             candidates=candidates,
             quality_notes=notes,
@@ -1357,8 +1411,7 @@ def _split_into_paragraph_chunks(text: str, size: int) -> list[str]:
 
     Empty / whitespace-only chunks are dropped. Unlike the line-based
     chunker, no overlap is prepended: paragraphs are the unit of extraction,
-    and overlap would double-hash the same text and defeat carry-forward
-    .
+    and overlap would double-hash the same text and defeat carry-forward.
     """
     chunks: list[str] = []
     start = 0
@@ -1395,8 +1448,7 @@ def _split_into_paragraph_chunks(text: str, size: int) -> list[str]:
 
 
 # Patterns intentionally narrow: only remove what is provably cosmetic and
-# has been observed to drift across re-deposits. New rules land additively
-#.
+# has been observed to drift across re-deposits. New rules land additively.
 _EDIT_MARKER_RE = re.compile(r"\[\s*edit\s*\]", re.IGNORECASE)
 _WIKI_FOOTER_LINE_RE = re.compile(
     r"^[ \t]*"
@@ -1479,6 +1531,7 @@ def _build_llm_request(
     images: list[VisionImage] | None = None,
     *,
     reference_published_at: datetime | None = None,
+    tool_turns_present: bool = False,
 ) -> _PlannedLLMCall:
     """Build one extraction request — the pre-network half of ``_call_llm``."""
     from particles.llm import CompletionRequest, fenced_prompt
@@ -1493,6 +1546,7 @@ def _build_llm_request(
         stance_enabled=_cfg.extraction_stance.enabled,
         validity_enabled=validity_enabled,
         structure_enabled=_cfg.structured_claim.enabled,
+        tool_turns_present=tool_turns_present,
     )
     # fill the validity rule's {reference_date} placeholder with the
     # source's publication instant (or the extraction wall-clock) so the model
@@ -1521,8 +1575,8 @@ def _build_llm_request(
     # injected "ignore the above …" line in a deposited document cannot steer
     # extraction. Hardening, not immunity — the JSON-array contract the parser
     # enforces is the structural backstop. The nonce is minted per request, so
-    # pooled sibling requests in one batch never share a fence
-    #. The cache split is *within* the system turn,
+    # pooled sibling requests in one batch never share a fence.
+    # The cache split is *within* the system turn,
     # so both halves stay trusted and F3 is unchanged.
     system, user = fenced_prompt(instructions, text, label="source")
     cache_prefix = system[:cache_split] or None
@@ -1578,6 +1632,7 @@ async def _call_llm(
     images: list[VisionImage] | None = None,
     *,
     reference_published_at: datetime | None = None,
+    tool_turns_present: bool = False,
 ) -> tuple[list[CandidateParticle], list[str], bool]:
     """Send text to the LLM and return (candidates, notes, transient_error).
 
@@ -1601,7 +1656,12 @@ async def _call_llm(
         is_account_level_failure,
     )
 
-    planned = _build_llm_request(text, images, reference_published_at=reference_published_at)
+    planned = _build_llm_request(
+        text,
+        images,
+        reference_published_at=reference_published_at,
+        tool_turns_present=tool_turns_present,
+    )
     # resolve the provider ONCE and read its pairing here, at
     # the call site. ``get_provider`` reads live config on every call, so a
     # reload between chunks can change the pairing mid-pass — a value read
@@ -1998,7 +2058,18 @@ def _parse_extraction_response(
                 conf = 0.5
                 notes.append(f"Item {i} has non-finite confidence_value; defaulted to 0.5")
             else:
-                conf = max(0.0, min(1.0, conf))
+                # D1: clamp strictly inside (0, 1). 0.0 and 1.0 are
+                # exact fixed points of the logit transform temperature
+                # scaling runs in, so a particle minted at either is
+                # uncalibratable for the rest of its life — and what is
+                # stored is immutable. The rubric asks the model
+                # not to emit them; this is what makes that hold when a model
+                # does anyway — and whether a model complies varies by model
+                # and by source genre, measured. Deliberately wider
+                # than the rubric's [0.05, 0.97] guidance: this is a backstop
+                # that should distort a stated value as little as possible,
+                # not a target.
+                conf = max(_CONFIDENCE_FLOOR, min(_CONFIDENCE_CEILING, conf))
         except (TypeError, ValueError):
             conf = 0.5
             notes.append(f"Item {i} has invalid confidence_value; defaulted to 0.5")
@@ -2157,8 +2228,8 @@ def candidate_to_particle(
     When ``calibration`` is None (the default and the historical
     behaviour), the constructed particle carries
     ``calibration_source=EXTRACTOR_DIRECT`` and the raw
-    ``candidate.confidence_value``. When a calibration record is supplied
-    , the raw value is passed through a
+    ``candidate.confidence_value``. When a calibration record is supplied,
+    the raw value is passed through a
     :class:`particles.extraction.calibration.TemperatureScaler` and the
     particle carries ``calibration_source=CALIBRATED_BENCHMARK``,
     ``calibration_method="temperature_scaling"``, and a

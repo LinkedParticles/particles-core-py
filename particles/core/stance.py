@@ -8,7 +8,8 @@ A *stance* is an ordinary ``FALSIFIABLE`` :class:`~particles.core.schema.Particl
 asserting an attribution fact — *"agent A endorses / disputes claim B"* — bound
 to its target by an outbound ``ENDORSES`` / ``DISPUTES`` relation. The edge is
 the role marker. Two ``stance:``-prefixed ``properties`` keys
-carry the holder identity and the optional attitude magnitude; the ``properties`` map itself is §6.8.
+carry the holder identity and the optional attitude magnitude;
+the ``properties`` map itself is §6.8.
 
 Core stays I/O-free: these are pure helpers over a particle's
 ``properties``. The authoritative edge-based "is this a stance" check (the role

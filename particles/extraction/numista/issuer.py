@@ -39,7 +39,7 @@ class NumistaIssuerExtractor:
     Produces one structured particle per coin using the summary fields available
     from the issuer search API (composition, weight, diameter, catalog refs).
     Fields only available from the individual coin endpoint (currency, demonetization,
-    edge, obverse/reverse) are absent — deposit individual coin pages for full infoboxes.
+    edge, obverse/reverse) are absent; deposit individual coin pages for full infoboxes.
     """
 
     EXTRACTOR_ID: str = EXTRACTOR_ID_ISSUER

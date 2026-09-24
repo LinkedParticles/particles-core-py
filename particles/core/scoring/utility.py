@@ -219,8 +219,8 @@ class SweepRow:
         reinforcement: The belief's :func:`reinforcement_score` under its
             resolved half-life.
         content_key: :func:`content_dedup_key` of the belief's content.
-        owner_relevant: ``A(p)`` — whether the belief is about the viewer
-            ; unused by the ``λ`` sweep and consumed by
+        owner_relevant: ``A(p)`` — whether the belief is about the viewer;
+            unused by the ``λ`` sweep and consumed by
             :func:`particles.core.scoring.relevance.sweep_owner_rank_lift`,
             which sweeps ``ω`` over these same rows.
     """

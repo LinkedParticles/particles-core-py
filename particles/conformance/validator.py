@@ -15,7 +15,8 @@ diversity rule declared ADVISORY reports its violation in
 extractor's set iff the production registry would *select* that extractor for
 the fixture's ``source_type`` — the ladder, read back through
 ``registry.selects``. It is deliberately **not** ``extractor.accepts(...)``:
-``GeneralExtractor.accepts()`` is unconditionally True because it is the fallback, so the accepts() predicate hands the fallback every fixture in
+``GeneralExtractor.accepts()`` is unconditionally True because it is the
+fallback, so the accepts() predicate hands the fallback every fixture in
 the corpus and reports its REQUIRED-field coverage over inputs production will
 never route it. ``all_accepted=True`` restores the wide set for the deliberate
 "what would the fallback do with a Wikibase blob?" run; the caller must not
@@ -362,7 +363,8 @@ async def validate_extractor(
         recommended_threshold: Minimum rate for RECOMMENDED fields, in [0, 1].
         all_accepted: Score every fixture the extractor ``accepts()`` instead of
             only the ones the registry routes to it. The widened
-            run is report-only by construction — a caller must not persist the conformance verdict from it.
+            run is report-only by construction — a caller must not persist the
+            conformance verdict from it.
 
     Returns:
         A :class:`ConformanceReport` with one :class:`FieldStat` per contract

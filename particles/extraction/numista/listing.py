@@ -42,7 +42,7 @@ class NumistaListingExtractor:
 
     Extracts per-coin structured particles from <div class="description_piece">
     elements. Parses composition, weight, diameter, catalog refs, and type
-    directly from the HTML text — no API key, no per-coin API calls required.
+    directly from the HTML text: no API key, no per-coin API calls required.
     """
 
     EXTRACTOR_ID: str = EXTRACTOR_ID_LISTING

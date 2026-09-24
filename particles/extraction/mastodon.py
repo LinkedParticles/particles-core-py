@@ -33,7 +33,8 @@ MastodonExtractor — parses the blob, renders the root status's spoiler_text
                     and the descendant reply tree below it as indented prose
                     handed to the chunked LLM extraction helper.
                     Additionally synthesises a single *story-meta*
-                    CandidateParticle whose ``properties`` dict follows URI-prefix convention with the dual-emission rule
+                    CandidateParticle whose ``properties`` dict follows
+                    URI-prefix convention with the dual-emission rule
                     (``mastodon:hasFavouritesCount`` + ``social:hasScore``,
                     etc.).
 

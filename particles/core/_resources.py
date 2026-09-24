@@ -17,8 +17,8 @@ Prefer the wheel-packaged copy; fall back to the source tree.
 Lives in ``core`` rather than ``conformance`` (where it started) because two
 Client subpackages now need it and ``extraction`` may not import ``conformance``
 — that edge would close a new subpackage cycle against the ``acyclic_siblings``
-contract, since ``conformance.validator`` already imports the extractor registry
-. ``particles.conformance._resources`` re-exports it unchanged.
+contract, since ``conformance.validator`` already imports the extractor registry.
+``particles.conformance._resources`` re-exports it unchanged.
 """
 
 from __future__ import annotations

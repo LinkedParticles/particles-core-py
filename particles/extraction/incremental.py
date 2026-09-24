@@ -14,9 +14,11 @@ and a marked particle must not veto its own re-extraction), and either:
 
 * **Cache hit:** skips the LLM call. The existing particles' IDs are
   recorded in ``ExtractionResult.carry_forward_ids`` so the reindex
-  operation can exclude them from supersession. Provenance is not
-  mutated — the carry-forward particle continues to point at the
-  snapshot it was originally extracted from.
+  operation can exclude them from supersession. Nothing is re-pointed —
+  the carry-forward particle still names the snapshot it was originally
+  extracted from — and the Engine appends one ref naming the re-observing
+  snapshot, as it does for a suppressed duplicate. This
+  module stays store-free: it only reports the ids.
 
 * **Cache miss:** calls ``_call_llm`` and stamps every resulting
   ``CandidateParticle`` with the chunk's hash so the next re-extraction
@@ -146,7 +148,7 @@ async def extract_with_carry_forward(
             eligible as carry-forward matches: a chunk whose only ACTIVE
             particles are in this set is a cache **miss** and is re-sent to
             the LLM. Without the exclusion, ``reindex --provider-model``
-             is defeated by the cache — the chunk text and
+            is defeated by the cache — the chunk text and
             extractor version are unchanged by design, so every in-scope
             particle would cache-hit and keep its old model's output.
 

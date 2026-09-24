@@ -20,7 +20,8 @@ probabilistic output to temperature-scale (calibration is identity),
 so it carries no benchmark / ECE gate.
 
 **Granularity: one particle per documented symbol.** Content is the
-docstring's *summary* (first paragraph); the structured sections fold into the ``properties`` dict under ``docstring:`` keys. Each particle is a
+docstring's *summary* (first paragraph); the structured sections fold into the
+``properties`` dict under ``docstring:`` keys. Each particle is a
 ``FALSIFIABLE`` ``CLAIM`` — load-bearing, because truth-gating
 **excludes** non-``FALSIFIABLE`` particles from contradiction-checking, and the
 whole code/design-drift payoff (surfaces a docstring claiming *X*

@@ -12,12 +12,14 @@ format. Three load-bearing rules:
   immutable stored substrate and never carries *per-observer or per-query*
   derived quantities (effective / calibrated confidence) — those are recomputed
   on import, and have no stable value to serialize anyway. (They are not model
-  fields, so they cannot leak.) A **stamped** derived annotation — the structured claim — does travel, *with its stamp*, so the importer can see what
+  fields, so they cannot leak.) A **stamped** derived annotation — the
+  structured claim — does travel, *with its stamp*, so the importer can see what
   produced it and when; dropping it would make a store round-trip lose an
   annotation that cost an LLM call per particle. The embedding still does not
   travel: it is large, model-specific, and locally recomputable from ``content``
   at zero marginal cost. Round-trip preserves the substrate exactly.
-- **Cross-store identity (§3).** Subjects travel by *external reference* (the join key), not by store-local UUID. The source particle/subject
+- **Cross-store identity (§3).** Subjects travel by *external reference* (the
+  join key), not by store-local UUID. The source particle/subject
   UUIDs ride along as origin metadata (``sourceParticleId`` /
   ``sourceSubjectId``), never as the target's identity — ``from_unit`` mints a
   fresh particle id; import resolves subjects by external ref + claim identity.
@@ -304,8 +306,8 @@ def to_unit(particle: Particle, subjects: dict[str, Subject]) -> dict[str, Any]:
     if particle.properties is not None:
         unit["properties"] = particle.properties
     if particle.contributors is not None:
-        # Attribution travels as data so "who said this" survives a store copy
-        #. model_dump(mode="json") renders ``at`` as an ISO string.
+        # Attribution travels as data so "who said this" survives a store copy.
+        # model_dump(mode="json") renders ``at`` as an ISO string.
         unit["contributors"] = [c.model_dump(mode="json") for c in particle.contributors]
     if particle.structured_claim is not None:
         # a STAMPED derived annotation travels with its stamp.

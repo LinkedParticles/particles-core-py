@@ -64,8 +64,7 @@ class EmbeddingProfile:
     vector lives in: the encoder ``model``, its output ``dim``ensionality, and
     the ``normalization`` applied to each vector. Two stores can compare cosine
     similarities — and therefore reproduce the standard's similarity thresholds —
-    only when they share a profile; a profile change requires re-embedding
-    .
+    only when they share a profile; a profile change requires re-embedding.
 
     The reference profile published by the standard is
     ``{model: all-MiniLM-L6-v2, dim: 384, normalization: l2}``. ``model`` is the

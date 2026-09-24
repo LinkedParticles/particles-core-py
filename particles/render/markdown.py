@@ -39,6 +39,7 @@ from particles.core.schema import (
     ContestednessReading,
     LintFinding,
     LintReport,
+    ObserverScopeNote,
     Particle,
     RelationType,
     StancePosition,
@@ -707,7 +708,7 @@ def render_contested_callout(
 
     Called with only a ``reading`` (the earlier signature), it derives a
     divergence-only badge gated by ``config.contestedness.callout_threshold``
-     so existing callers keep today's behavior.
+    so existing callers keep today's behavior.
 
     The callout is **disclosure, not discount**: it
     never moves the claim's own confidence, which the particle block shows.
@@ -825,7 +826,8 @@ def format_sources_trailer(short_ids: Iterable[str]) -> str:
     """The per-section provenance trailer (fork #2).
 
     A single HTML-comment line listing the cited / selected particle short-ids
-    (sorted, de-duplicated) — the machine-diffable selection fingerprint the freshness check compares. Returns ``""`` for an empty input.
+    (sorted, de-duplicated) — the machine-diffable selection fingerprint the
+    freshness check compares. Returns ``""`` for an empty input.
     """
     unique = sorted(set(short_ids))
     if not unique:
@@ -865,7 +867,8 @@ def format_memory_bullet(
 
     The line carries the belief content and its short-id drill-down handle
     (resolved via the MCP tools); a contested belief is flagged
-    rather than omitted — an agent must *know* a belief is disputed. ``contested_bases`` names the composed badge's fired bases
+    rather than omitted — an agent must *know* a belief is disputed.
+    ``contested_bases`` names the composed badge's fired bases
     — "⚠ contested (stance, divergence) — …" — keeping the "(vs. p-xxx)"
     drill-down when the inconsistency basis fired (``contested_by``). With no
     bases supplied, a bare ``contested_by`` renders the pre-badge
@@ -888,7 +891,8 @@ class DigestEntry:
 
     The assembly side (``particles/mcp/resources``) fills these — content,
     query-time effective confidence, subject canonical names, ``asserted_at``,
-    and the referencing INCONSISTENCY id when the belief is contested — and hands a pre-ordered list to :func:`render_digest`. This keeps the
+    and the referencing INCONSISTENCY id when the belief is contested—
+    and hands a pre-ordered list to :func:`render_digest`. This keeps the
     formatter pure (no session, no trust math, no clock).
     """
 
@@ -904,7 +908,30 @@ class DigestEntry:
     contested_bases: tuple[str, ...] = ()
 
 
-def render_digest(store: str, entries: list[DigestEntry], total_active: int) -> str:
+def observer_scope_line(note: ObserverScopeNote) -> str:
+    """The one-line disclosure a project-observer read carries. Never silent."""
+    if not note.engaged:
+        return (
+            f"_Project observer `{note.project}` not applied: this store has not been "
+            "rescoped yet (`particles memory rescope`), so this is the whole store._"
+        )
+    line = (
+        f"_Observer: project `{note.project}` — {note.in_scope} of {note.total} ACTIVE "
+        "belief(s) in scope (global, or observed in this project)"
+    )
+    if note.unattributed:
+        line += f"; {note.unattributed} unattributed"
+    if note.lapsed:
+        line += f"; {note.lapsed} lapsed (no source states them any more)"
+    return line + "._"
+
+
+def render_digest(
+    store: str,
+    entries: list[DigestEntry],
+    total_active: int,
+    observer: ObserverScopeNote | None = None,
+) -> str:
     """Render a store's ACTIVE beliefs as a terse session-start digest.
 
     The ``MEMORY.md`` analog: one line per belief, **already ordered by the
@@ -916,18 +943,31 @@ def render_digest(store: str, entries: list[DigestEntry], total_active: int) -> 
     fewer entries are shown than ``total_active`` the footer discloses the
     truncation (no silent cap).
 
+    ``observer`` is set when the digest was read through a project
+    observer: ``total_active`` is then the in-scope population the entries were
+    ranked from, and one line says which observer, how many beliefs are in
+    scope, and how many the store holds. With no observer the output is
+    byte-identical to before.
+
     Pure: no session and no clock — ``asserted_at`` renders as its date, and
     recency is already folded into the effective-confidence ordering, so the
     output is deterministic for a given input.
     """
     header = f"# Memory digest — {store}"
+    scope_lines = [observer_scope_line(observer), ""] if observer is not None else []
     if not entries:
-        return f"{header}\n\n_No ACTIVE beliefs in `{store}`._\n"
+        where = (
+            f"in view for project `{observer.project}` in `{store}`"
+            if observer is not None and observer.engaged
+            else f"in `{store}`"
+        )
+        return "\n".join([header, "", *scope_lines, f"_No ACTIVE beliefs {where}._"]) + "\n"
 
     shown = len(entries)
     lines = [
         header,
         "",
+        *scope_lines,
         f"_{shown} of {total_active} ACTIVE belief(s), ranked by effective confidence._",
         "",
     ]

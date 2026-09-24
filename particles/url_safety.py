@@ -39,12 +39,16 @@ Failure mode is fail-closed: an unresolvable hostname raises
 from __future__ import annotations
 
 import ipaddress
+import logging
 import socket
+import time
 from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 ALLOWED_SCHEMES = frozenset({"http", "https"})
 
@@ -216,6 +220,17 @@ class ValidatingTransport(httpx.AsyncHTTPTransport):
     Because the check runs at connect time, the validated address *is* the
     connected address (closes DNS-rebinding / TOCTOU), and it runs on every
     hop including redirects (closes redirect SSRF).
+
+    The pin covers the **whole** vetted set, in resolver order: when the
+    connection to one address cannot be established, the next is tried, the
+    failover httpx would have done itself over a multi-A-record host and which
+    ``curl --resolve`` keeps on the subprocess paths. Every
+    candidate has already passed ``_is_blocked_ip``, so widening from one
+    address to all cannot admit a blocked one. Only a failure to *connect* moves
+    on — nothing has been sent yet, so any method is safe to retry — and the
+    connect-timeout budget is shared rather than multiplied: each address but
+    the last gets half of what remains and the last gets the rest (libcurl's
+    rule), so a dead host still fails within one connect timeout.
     """
 
     def __init__(self, *, resolve: Resolver | None = None, **kwargs: Any) -> None:
@@ -241,6 +256,24 @@ class ValidatingTransport(httpx.AsyncHTTPTransport):
                 )
         # Pin to a vetted address; keep the Host header and bind TLS SNI to the
         # real hostname so certificate verification is unaffected.
-        request.url = request.url.copy_with(host=str(addrs[0]))
         request.extensions["sni_hostname"] = host
-        return await super().handle_async_request(request)
+        url = request.url
+        timeouts: dict[str, float | None] = dict(request.extensions.get("timeout") or {})
+        budget = timeouts.get("connect")
+        deadline = None if budget is None else time.monotonic() + budget
+        for i, ip in enumerate(addrs):
+            last = i == len(addrs) - 1
+            request.url = url.copy_with(host=str(ip))
+            if deadline is not None:
+                remaining = max(deadline - time.monotonic(), 0.0)
+                request.extensions["timeout"] = {
+                    **timeouts,
+                    "connect": remaining if last else remaining / 2,
+                }
+            try:
+                return await super().handle_async_request(request)
+            except (httpx.ConnectError, httpx.ConnectTimeout):
+                if last:
+                    raise
+                logger.debug("connect to %s (%s) failed; trying the next vetted address", host, ip)
+        raise AssertionError("unreachable: addrs is non-empty")  # pragma: no cover

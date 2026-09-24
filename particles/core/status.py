@@ -26,6 +26,15 @@ class Status(StrEnum):
 class StatusReason(StrEnum):
     RETRACTED_DEPENDENCY = "RETRACTED_DEPENDENCY"
     CORPUS_ENTRY_MISSING = "CORPUS_ENTRY_MISSING"
+    # Reserved, and deliberately unwritten. §6.6 assigns this reason to a *Lint*
+    # trust pass — a post-extraction re-scan that demotes an ACTIVE particle when
+    # the trust of its source changes — and no such pass exists: nothing in
+    # ``operations/lint/`` is trust-driven. Every trust demotion this SDK performs
+    # happens on the extract-time §6.4 ladder and writes ``LOWER_TRUST_SOURCE``
+    # instead (``ingest/pipeline.py``). Kept rather than retired, because the
+    # value is published in the normative artifacts and the pass it names is an
+    # open pending decision rather than a rejected one.
+    # Audited 2026-09-19; if you are re-deriving this, stop and read those rows.
     TRUST_DEMOTED = "TRUST_DEMOTED"
     # Every member below is a normative §6.2 ``status_reason`` value; the
     # transition each one accompanies is a row of the §6.6 table.
@@ -42,6 +51,10 @@ class StatusReason(StrEnum):
     DOCUMENT_SUPERSEDED = "DOCUMENT_SUPERSEDED"  # §6.4 rung 1.5 (cap. 2):
     # the conflicting claim's provenance document is (transitively) superseded by
     # the winner's
+    SUPERSEDED_BY_UPDATE = "SUPERSEDED_BY_UPDATE"  # §6.4 rung 2.5: an older
+    # claim retired by a strictly newer, contradicting claim from the same source
+    # lineage — a record that the world changed, not a verdict on the value, so it
+    # is deliberately outside the judgment set (a later revert re-mints)
     DUPLICATE_MERGED = "DUPLICATE_MERGED"  # redundant byte-identical copy folded
     # into its group's survivor by exact-duplicate auto-merge. Deliberately distinct from
     # EXPLICIT_SUPERSESSION so a revert can select precisely auto-merge's own writes.

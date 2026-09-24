@@ -160,6 +160,7 @@ def run_l2(profile: ConformanceProfile) -> LevelReport:
             trust_score_new=lv.trust_score_new,
             trust_differential_threshold=lv.trust_differential_threshold,
             single_trust_order=lv.single_trust_order,
+            update_order=lv.update_order,
         )
         checks.append(_eq(f"conflict_ladder/{lv.id}", verdict.value, lv.expected))
 

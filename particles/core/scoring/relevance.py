@@ -47,8 +47,8 @@ structural property of the composition rather than a policy someone has to
 remember to honour.
 
 The bonus enters the **recall ranking score only** — the projection, the digest,
-and (as a node-selection term, never as a rendered confidence) the graph view
-. It never enters the semantic-search ``query`` path, which already
+and (as a node-selection term, never as a rendered confidence) the graph view.
+It never enters the semantic-search ``query`` path, which already
 has ``QueryRequest.subject_id`` for the caller who wants the viewer's beliefs
 specifically; the lens exists to fix the *unqueried* surfaces. It is never
 folded into the stored ``confidence.value`` or the read-time
@@ -154,8 +154,8 @@ class OwnerHeadOutcome:
             occupy (criterion 2 — it must not *take* the head).
         target_ranks: ``(particle_id, rank)`` for beliefs that must **stay** in
             the head, ranked over the whole population (1-based; ``0`` = absent
-            from the scored set). Criterion 3 — typically the utility targets
-            , checked for non-regression under the new term.
+            from the scored set). Criterion 3 — typically the utility targets,
+            checked for non-regression under the new term.
         baseline_targets_in_head: the subset of ``target_ranks`` ids that were
             already inside this head at ``ω = 0``. Criterion 3 is evaluated
             **against this baseline**, not against absolute head membership: the
@@ -293,8 +293,8 @@ def sweep_owner_rank_lift(
             confidence).
         head_sizes: Each rendered surface's ``N``.
         lambda_: The configured ``utility.default.rank_lift``, held fixed.
-        target_ids: Beliefs that must **stay** in the head — the utility targets
-            . Criterion 3 is the non-regression check.
+        target_ids: Beliefs that must **stay** in the head — the utility targets.
+            Criterion 3 is the non-regression check.
         min_owner_in_head: Criterion 1's floor.
         max_owner_share: Criterion 2's ceiling, as a fraction of head slots.
         configured_rank_lift: The store's configured ``ω``, carried through for

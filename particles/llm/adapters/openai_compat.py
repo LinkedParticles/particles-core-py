@@ -23,7 +23,8 @@ implements a small bounded retry loop with exponential backoff on transient
 failures (connection errors, timeouts, HTTP 429 / 5xx) and raises
 :class:`particles.llm.registry.CompletionError` on exhaustion or an empty
 response — the port's failure contract, which every call site already handles.
-A 401 / 403 is surfaced with its HTTP status attached so the account-level circuit breaker (duck-typed on ``status_code``) can trip on a
+A 401 / 403 is surfaced with its HTTP status attached so the
+account-level circuit breaker (duck-typed on ``status_code``) can trip on a
 mis-configured endpoint just as it does for a hosted provider. Budget
 exhaustion — ``finish_reason: length``, an HTTP 200 whose text stops mid-token
 — is named as truncation rather than handed to the call site as unexplained
@@ -246,8 +247,7 @@ class OpenAICompatProvider:
         Keyed by the operator-chosen provider name, so renaming a provider
         orphans its calibration rows. A fresh pairing is
         uncalibrated until the benchmark harness is run for it, so
-        its particles carry the ``EXTRACTOR_DIRECT`` disclosure until then
-        .
+        its particles carry the ``EXTRACTOR_DIRECT`` disclosure until then.
         """
         return f"{self.name}:{self.model}"
 

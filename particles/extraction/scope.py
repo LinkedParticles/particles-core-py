@@ -17,8 +17,8 @@ document-meta particles out of the factual surface:
 * ``particles.operations.query.main`` — the default result set excludes
   them (overridable via ``QueryRequest.include_document_meta``).
 
-The signal lives on a particle's Extension-side ``properties`` dict
-, so Core modules never branch on it; only the operation layer and
+The signal lives on a particle's Extension-side ``properties`` dict,
+so Core modules never branch on it; only the operation layer and
 the extraction pipeline do. ``confidence`` is never used as the scope lever —
 a ``DOCUMENT_META`` claim may be perfectly true (§Decision 3).
 
@@ -67,7 +67,8 @@ def is_excluded_document_meta(properties: dict[str, object] | None) -> bool:
 
     True only when the particle was tagged ``extraction:scope == DOCUMENT_META`` **and**
     the recorded scope action neither put the classifier in ``passthrough``
-    (``observe``) nor exempted the source's genre (``source_exempt``). This is the single predicate the pipeline, lint, and query
+    (``observe``) nor exempted the source's genre (``source_exempt``).
+    This is the single predicate the pipeline, lint, and query
     consumers share — keeping the key/value strings in one place.
     """
     if not properties:
@@ -82,8 +83,8 @@ def is_scope_exempt_source(tags: Iterable[str] | None) -> bool:
     """Return True if a corpus entry's tags exempt its claims.
 
     Membership is ``extraction_scope.exempt_source_tags`` — ``["rule-file"]``
-    by default, which is the tag already put on every rule-source entry
-    , so ``particles rules sync`` enrols a document with no extra
+    by default, which is the tag already put on every rule-source entry,
+    so ``particles rules sync`` enrols a document with no extra
     gesture.
     An operator extends the exemption to their own genre by adding a tag, and
     disables it entirely by emptying the list.

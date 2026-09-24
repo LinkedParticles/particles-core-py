@@ -80,7 +80,7 @@ EXTRACTOR_ID = "journal-extractor"
 #        user message). Mirrors general-extractor 0.11.0; benign output unchanged.
 # 0.2.0: over-length entries (> html_chunk_size) are extracted in multiple
 #        carry-forward passes and merged into one whole-entry NARRATIVE
-# instead of truncated to a single leading pass. Output differs
+#        instead of truncated to a single leading pass. Output differs
 #        for over-length entries, so the version-mismatch rule lets
 #        `reindex --extractor-version 0.1.1` recover the previously-dropped tails.
 # 0.1.1: _parse_journal_response recovers complete claims from a truncated /
@@ -203,7 +203,7 @@ class JournalExtractor:
 
         Entries within ``html_chunk_size`` take a single whole-entry call;
         over-length entries are chunked through ``extract_with_carry_forward``
-         and their per-chunk NARRATIVE fragments are merged downstream
+        and their per-chunk NARRATIVE fragments are merged downstream
         by the Engine post-pass. ``session`` / ``corpus_entry_id`` (read from
         kwargs, passed by the pipeline) drive the carry-forward cache.
         """
@@ -251,7 +251,7 @@ class JournalExtractor:
         """Single whole-entry pass for short entries; multi-pass for long ones.
 
         Entries over ``html_chunk_size`` route through :meth:`_extract_chunked`
-         instead of being truncated to the leading slice.
+        instead of being truncated to the leading slice.
         """
         cfg = get_config().extraction
         if len(text) > cfg.html_chunk_size:
@@ -279,7 +279,8 @@ class JournalExtractor:
         """Paragraph-chunked multi-pass journal extraction with carry-forward.
 
         Over-length entries are split on paragraph boundaries and routed through
-        :func:`extract_with_carry_forward` with the journal prompt (2). Each cache-miss chunk yields its claims (chunk-local
+        :func:`extract_with_carry_forward` with the journal prompt
+        (2). Each cache-miss chunk yields its claims (chunk-local
         ``narrative_index``) plus one per-chunk NARRATIVE candidate; the Engine
         post-pass
         (:func:`particles.ingest.narrative_merge.collapse_chunk_narratives`)
@@ -318,8 +319,8 @@ class JournalExtractor:
 async def _call_journal_llm(text: str) -> tuple[list[CandidateParticle], list[str], bool]:
     """Run one journal-prompt LLM call → ``(candidates, notes, transient_error)``.
 
-    The per-chunk caller injected into :func:`extract_with_carry_forward`
-    ; mirrors the general extractor's ``_call_llm`` but builds the
+    The per-chunk caller injected into :func:`extract_with_carry_forward`;
+    mirrors the general extractor's ``_call_llm`` but builds the
     journal prompt and parses via :func:`_parse_journal_response`. ``transient``
     is True when the API call raised, so the pipeline resets the snapshot to
     PENDING for retry rather than stamping it COMPLETE with partial output.

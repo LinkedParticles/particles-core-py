@@ -336,7 +336,8 @@ def scaler_for_record(calibration: ExtractorCalibration) -> TemperatureScaler | 
     """Scaler for a stored calibration, or ``None`` if it must not be applied.
 
     ``None`` is returned for any record whose ``transform`` is not
-    :data:`TRANSFORM_LOGIT` — which today means every record fitted before. Such a record must not be applied for two independent reasons,
+    :data:`TRANSFORM_LOGIT` — which today means every record fitted before.
+    Such a record must not be applied for two independent reasons,
     either of which alone would be sufficient:
 
     1. Its T was fitted against **all-False labels** (the bug: the

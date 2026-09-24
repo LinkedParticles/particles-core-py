@@ -86,8 +86,7 @@ CONTRACT: list[FieldContract] = [
     FieldContract(
         "extractor_ref",
         FieldTier.RECOMMENDED,
-        "Required for trust weighting; "
-        "without it queries fall back to general-extractor trust",
+        "Required for trust weighting; without it queries fall back to general-extractor trust",
     ),
     # ------------------------------------------------------------------
     # OPTIONAL — informational only

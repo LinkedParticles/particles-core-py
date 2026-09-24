@@ -26,8 +26,10 @@ config selection — only the (provider, model) pairing is.
 
 from __future__ import annotations
 
+import contextlib
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, runtime_checkable
 
@@ -152,11 +154,11 @@ class CompletionProvider(Protocol):
         When ``images`` is supplied, they are sent alongside the
         prompt as a multimodal request; a provider whose model is not
         vision-capable raises :class:`CompletionError`. ``cache_prefix``
-         marks a leading slice of the system turn as a prompt-cache
+        marks a leading slice of the system turn as a prompt-cache
         boundary; the effective system is ``cache_prefix + system`` and an
         adapter MAY cache it (the Anthropic adapter does) or MAY ignore the
         marker and concatenate (every other adapter). ``response_schema``
-         is the JSON Schema of the reply the
+        is the JSON Schema of the reply the
         caller will parse — advisory: an adapter MAY enforce it (the
         ``LocalProvider`` sends OpenAI-style ``response_format`` when
         ``structured_output`` on the named entry is ``"auto"``/``"strict"``) and MAY ignore it (the
@@ -174,7 +176,8 @@ class BatchCompletionProvider(Protocol):
 
     An **optional capability**, deliberately not folded into
     :class:`CompletionProvider`: batch submission is a property of a hosted
-    provider's API surface, not of completion itself, and the ``LocalProvider`` has no equivalent. :func:`complete_many` duck-types on
+    provider's API surface, not of completion itself, and the
+    ``LocalProvider`` has no equivalent. :func:`complete_many` duck-types on
     this protocol and falls back to sequential :meth:`CompletionProvider.complete`
     calls for any provider that does not implement it, so a new adapter opts
     in by adding the method and opts out by doing nothing.
@@ -206,8 +209,8 @@ class BatchCompletionProvider(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# Adapter-kind registry — the plugin-registry house style
-#: a lazily-built keyed factory, one registration line per
+# Adapter-kind registry — the plugin-registry house style:
+# a lazily-built keyed factory, one registration line per
 # wire protocol. See particles/llm/AGENTS.md for the two-file procedure.
 # ---------------------------------------------------------------------------
 
@@ -254,8 +257,40 @@ def adapter_kinds() -> frozenset[str]:
     return frozenset(_get_adapters())
 
 
+#: Scoped per-purpose provider overrides. A ``ContextVar`` so an
+#: override is visible to every task spawned inside the ``with`` block and to
+#: nothing outside it — concurrent callers never see each other's routing.
+_OVERRIDES: ContextVar[Mapping[LLMPurpose, CompletionProvider] | None] = ContextVar(
+    "particles_llm_provider_overrides", default=None
+)
+
+
+@contextlib.contextmanager
+def override_providers(
+    overrides: Mapping[LLMPurpose, CompletionProvider],
+) -> Iterator[None]:
+    """Route the named purposes to in-process providers for the block's duration.
+
+    A supported port feature, not a test seam: the memory-rot benchmark's
+    ``oracle`` arm routes ``semantic_lint`` to a scripted
+    ground-truth provider so the real §6.6 ladder runs end to end with no paid
+    call, and routes every other purpose to a refusing provider so an
+    unexpected call fails loudly instead of billing. Nested blocks merge, the
+    inner mapping winning; config is never touched, so ``reset_config()`` and
+    concurrent callers are unaffected.
+    """
+    current = _OVERRIDES.get() or {}
+    token = _OVERRIDES.set({**current, **overrides})
+    try:
+        yield
+    finally:
+        _OVERRIDES.reset(token)
+
+
 def get_provider(purpose: LLMPurpose) -> CompletionProvider:
     """Resolve the provider configured for ``purpose``.
+
+    A scoped :func:`override_providers` entry for ``purpose`` wins over config.
 
     ``provider: "anthropic"`` selects the native-SDK adapter directly; any
     other name is an ``llm.providers`` entry whose ``adapter`` field picks
@@ -264,6 +299,10 @@ def get_provider(purpose: LLMPurpose) -> CompletionProvider:
     is constructed per call; adapters are cheap handles over cached clients,
     so this is not a hot-path cost.
     """
+    overrides = _OVERRIDES.get()
+    if overrides is not None and purpose in overrides:
+        return overrides[purpose]
+
     from particles.config import get_config
 
     selection = get_config().llm.for_purpose(purpose)
@@ -301,9 +340,9 @@ async def complete(
 ) -> str:
     """Resolve the provider for ``purpose`` and run one completion.
 
-    The one-liner every call site uses. Pass ``images`` for a multimodal call
-    , ``response_schema`` when the reply will be parsed as JSON
-    , and ``cache_prefix`` to mark a prompt-cache boundary on the
+    The one-liner every call site uses. Pass ``images`` for a multimodal call,
+    ``response_schema`` when the reply will be parsed as JSON,
+    and ``cache_prefix`` to mark a prompt-cache boundary on the
     system turn. See :class:`CompletionProvider` for the failure
     contract.
 

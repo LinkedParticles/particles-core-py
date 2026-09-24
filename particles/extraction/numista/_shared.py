@@ -87,8 +87,9 @@ def _issuer_suffix(issuer_code: str, issuer_name: str) -> str:
 def _predicate_term(predicate: str) -> ClaimTerm:
     """Render a predicate as a URI term when published, else as a TOKEN.
 
-    "Published" means ``artifacts/schemas/context.jsonld`` carries the prefix
-     — a predicate spelled with one is a ``URI`` term in sense, "an absolute IRI, or a CURIE in a context.jsonld prefix".
+    "Published" means ``artifacts/schemas/context.jsonld`` carries the prefix—
+    a predicate spelled with one is a ``URI`` term in
+    sense, "an absolute IRI, or a CURIE in a context.jsonld prefix".
     Anything else is recorded honestly as a ``TOKEN`` rather than coerced into a
     namespace we would then have to defend.
 

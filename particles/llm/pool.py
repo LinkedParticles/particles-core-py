@@ -81,7 +81,8 @@ class CompletionPool:
     ``complete_group`` parks the caller until the wave dispatches; results
     slice back positionally per group, with ``None`` marking a per-request
     failure exactly as ``complete_many`` reports it. A job-level failure
-    (e.g. an account-level error re-raised by the sequential fallback) is raised **in every parked group**, so each worker's own
+    (e.g. an account-level error re-raised by the sequential fallback)
+    is raised **in every parked group**, so each worker's own
     failure handling — for extraction, the IN_PROGRESS → PENDING reset —
     runs unchanged.
 

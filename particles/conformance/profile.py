@@ -138,6 +138,7 @@ class ConflictLadderVector(BaseModel):
     trust_score_new: float | None = None
     trust_differential_threshold: float = 0.15
     single_trust_order: bool = True
+    update_order: int | None = None
     expected: str
 
 

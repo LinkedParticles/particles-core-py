@@ -11,8 +11,8 @@ The public surface:
   an :data:`LLMPurpose` and run a completion.
 * :func:`complete_many` / :class:`CompletionRequest` — the same for a *set* of
   independent prompts, submitted as one half-price batch when the caller is
-  latency-tolerant and the adapter implements :class:`BatchCompletionProvider`
-  , and run sequentially otherwise.
+  latency-tolerant and the adapter implements :class:`BatchCompletionProvider`,
+  and run sequentially otherwise.
 * :func:`get_client` / :func:`set_client` — the shared Anthropic SDK client
   and its test seam, re-exported from ``particles/llm/client.py`` so the
   long-standing ``from particles.llm import get_client`` /
@@ -49,6 +49,7 @@ from particles.llm.registry import (
     complete_many_with_provider_model,
     complete_with_provider_model,
     get_provider,
+    override_providers,
 )
 
 __all__ = [
@@ -75,5 +76,6 @@ __all__ = [
     "get_provider",
     "is_account_level_failure",
     "make_nonce",
+    "override_providers",
     "set_client",
 ]

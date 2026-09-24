@@ -17,7 +17,7 @@ One notion of "the same claim, twice" for the whole SDK:
   preserved**. This is *exact*-content identity, not near-duplicate merging.
 * :func:`content_hash` — SHA-256 over the normalized key, stored on
   ``particles.content_norm_hash`` so the extract-time suppression lookup
-   is one indexed probe instead of a scan.
+  is one indexed probe instead of a scan.
 * :func:`duplicate_key` — the full comparison tuple: normalized content,
   subject-id set, and ``stance:holder``.
 

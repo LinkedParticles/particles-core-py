@@ -488,8 +488,8 @@ class LLMConfig(BaseModel):
     # dream cycle's other semantic passes use.
     abstraction: ProviderSelection | None = None
     # Named OpenAI-compatible providers. Keys are operator-chosen
-    # provider names — the calibration/disclosure key is "<name>:<model>"
-    #, so treat a rename as a recalibration event. "anthropic" is
+    # provider names — the calibration/disclosure key is "<name>:<model>",
+    # so treat a rename as a recalibration event. "anthropic" is
     # reserved for the native adapter and never appears here. The compiled-in
     # "local" entry (an Ollama endpoint) is inserted by the
     # validator when absent, so `provider: local` always resolves; precedence
@@ -581,9 +581,34 @@ class DuplicateSuppressionConfig(BaseModel):
     enabled: bool = True
 
 
+class RetiredValueQuarantineConfig(BaseModel):
+    """Retired-value quarantine on the write paths.
+
+    When a candidate claim is the exact twin (same normalized content, subject
+    set and stance holder; the exact-duplicate key) of a particle an operator or
+    reviewer retired by judgment — ``EXPLICIT_RETRACTION``,
+    ``EXPLICIT_SUPERSESSION``, or a review / cascade ``CONFLICT_RESOLVED``
+    loser — the candidate is stored **quarantined** (``PROVENANCE_STALE`` /
+    ``CONFLICT_PENDING``) behind an INCONSISTENCY record for review instead of
+    re-entering ACTIVE. The source still says it, and the ledger records that;
+    the value does not walk back onto the answer surface without a person.
+
+    Retirements that encode no judgment about the value — ``SOURCE_RETRACTED``,
+    ``SUPERSEDED_BY_REINDEX``, ``DUPLICATE_MERGED``, ``DOCUMENT_SUPERSEDED``,
+    ``VALIDITY_EXPIRED``, the trust-differential demotions — never fire it.
+
+    **Default ON.** Like exact-duplicate suppression, it only
+    declines to *activate*: the candidate is stored in full and one review
+    lifts it, so a wrong hold costs a review
+    round-trip, while the failure it prevents (a reindex of an unchanged source
+    silently re-minting a retracted claim as ACTIVE) leaves no trace at all.
+    """
+
+    enabled: bool = True
+
+
 class ExtractionConfig(BaseModel):
     max_tokens: int = 8192
-    query_max_tokens: int = 1024
     similarity_threshold: float = 0.80
     pdf_page_overlap_lines: int = 5
     # PDF hardening (security): a malicious PDF can carry an enormous page
@@ -621,10 +646,29 @@ class ExtractionConfig(BaseModel):
     # max_llm_calls_per_source=8) but short enough that operator
     # recovery is quick.
     stale_in_progress_minutes: float = 30.0
+    # The bulk extraction paths skip an unextracted snapshot of a MUTABLE
+    # entry once a newer extractable snapshot of the same entry exists: the
+    # generation cascade would retire the older generation's beliefs anyway,
+    # so extracting it buys nothing and, out of order, retires the current
+    # generation. The skipped snapshot is marked COMPLETE and recorded in
+    # ``snapshots.superseded_by_snapshot_id``. ``False`` restores extracting
+    # every generation, for an operator who wants intermediate generations
+    # as PROVENANCE_STALE belief history and accepts the bill.
+    collapse_superseded_pending: bool = True
     # don't re-mint a claim the store already holds verbatim.
     duplicate_suppression: DuplicateSuppressionConfig = Field(
         default_factory=DuplicateSuppressionConfig
     )
+    # a claim retired by judgment is quarantined for review when
+    # re-asserted, not re-minted ACTIVE.
+    retired_value_quarantine: RetiredValueQuarantineConfig = Field(
+        default_factory=RetiredValueQuarantineConfig
+    )
+    # source types whose prose is scanned for tool turns before
+    # extraction, so a tool's words are never extracted as the speaker's.
+    # Deliberately the conversational set: a transcript is where a tool turn
+    # appears beside a human one. Empty disables the marker.
+    tool_turn_source_types: list[str] = Field(default_factory=lambda: ["CONVERSATION", "JOURNAL"])
 
 
 class ExtractionScopeConfig(BaseModel):
@@ -759,7 +803,8 @@ class RdfConfig(BaseModel):
     ``default_confidence`` states the extractor's confidence in its *reading*,
     not in the source — a parse is exact, so it is high. How much the source is
     believed is the separate trust quantity (``DEFAULT_TRUST_WEIGHT`` on the
-    extractor plus the operator's ``SourceTrustStatement``s), per the two-quantity separation. It is overridden per-triple only when the document
+    extractor plus the operator's ``SourceTrustStatement``s), per the
+    two-quantity separation. It is overridden per-triple only when the document
     itself annotates a confidence with one of ``confidence_predicates``.
 
     ``skip_predicates`` are the triples that are *about the document* rather than
@@ -821,7 +866,8 @@ class DocumentSupersessionConfig(BaseModel):
     ``status_reason = DOCUMENT_SUPERSEDED`` and no ``INCONSISTENCY`` is surfaced.
     The relation is document-level but the prior is **conflict-gated** — a
     still-true, non-conflicting claim from the superseded document is never
-    touched. Single-trust-order stores only in v1 (matching the trust rung). ``enabled: false`` reproduces the pre-cap-2 behaviour exactly
+    touched. Single-trust-order stores only in v1 (matching the trust rung).
+    ``enabled: false`` reproduces the pre-cap-2 behaviour exactly
     (no supersession prior; a superseded decision falls through to the trust
     rung / INCONSISTENCY).
     """
@@ -863,7 +909,8 @@ class JournalExtractorConfig(BaseModel):
     When ``enabled`` (default), a ``JOURNAL`` corpus entry (set by
     ``particles deposit --journal`` / ``--source-type JOURNAL``) is routed to
     the journal extractor, which reifies first-person prose into
-    ``EXPERIENTIAL`` particles, tags opinions ``EVALUATIVE``, and emits the ``NARRATIVE`` graph for the entry. ``enabled: false`` makes the
+    ``EXPERIENTIAL`` particles, tags opinions ``EVALUATIVE``, and emits the
+    ``NARRATIVE`` graph for the entry. ``enabled: false`` makes the
     extractor decline, so ``JOURNAL`` entries fall through to the general
     extractor unchanged.
 
@@ -884,7 +931,8 @@ class ImportProjectConfig(BaseModel):
 
     ``particles import project <dir>`` walks a software-project tree and
     deposits one corpus entry per source file. ``extensions`` is the set of file
-    suffixes deposited as ``PYTHON_SOURCE`` (the first registered glob instance); ``ignore_dirs`` are directory names pruned during the walk
+    suffixes deposited as ``PYTHON_SOURCE`` (the first registered glob instance);
+    ``ignore_dirs`` are directory names pruned during the walk
     (dot-prefixed components are pruned regardless, so ``.git`` / ``.venv`` need
     not be listed — they are kept here for explicitness). Underscore-prefixed
     module files (``__init__.py`` / ``_shared.py``) are **kept**, unlike the
@@ -1032,6 +1080,32 @@ class TrustConfig(BaseModel):
     )
 
 
+class UpdateSupersessionConfig(BaseModel):
+    """Same-subject update supersession at extraction.
+
+    Two halves behind one switch. **Candidacy:** each extracted claim with an
+    about-subject key (its structured-claim subject, else its sole subject) is
+    also compared with ACTIVE claims about that subject in *any* corpus entry,
+    at a subject-scoped content-cosine floor well below
+    ``extraction.similarity_threshold`` — value updates differ in exactly the
+    word that carries the value, so they rarely clear 0.80. Every pair still
+    goes through the contradiction probe; the floor only finds candidates.
+    **Rung 2.5:** a confirmed contradiction between two extractor-asserted
+    claims that no trust key distinguishes resolves to the strictly newer one
+    by source date, in ``single`` and ``multi`` stores alike (a lineage
+    updating itself is not cross-contributor arbitration).
+    """
+
+    enabled: bool = True
+    # Subject-scoped §6.6 candidacy floor on the normalized cosine scale (ADR
+    # 0179). 0.45 is the measured operating point on the live stores:
+    # 76 % of real same-subject update pairs found, 1.7 % of cross-attribute
+    # same-subject pairs let through (each costs one probe that answers NO).
+    subject_floor: float = Field(default=0.45, ge=0.0, le=1.0)
+    # Probes per extracted claim from the subject-scoped search, at most.
+    max_candidates: int = Field(default=3, ge=1)
+
+
 class ReconciliationConfig(BaseModel):
     """Cross-entry §6.6 reconciliation policy.
 
@@ -1040,7 +1114,8 @@ class ReconciliationConfig(BaseModel):
 
     * ``single`` (default) — a single global trust order. §6.6 rung 2
       auto-supersede fires: the higher-trust claim wins and the lower-trust
-      one is demoted (today's behavior — unchanged; preserves the invariant §1 that single-store solo behavior is byte-for-byte the same).
+      one is demoted (today's behavior — unchanged; preserves the
+      invariant §1 that single-store solo behavior is byte-for-byte the same).
     * ``multi`` — a multi-contributor / consensus store. There is no global
       trust order (trust is per-viewer at query time), so
       auto-supersede is suppressed and the contradiction surfaces as an
@@ -1059,6 +1134,9 @@ class ReconciliationConfig(BaseModel):
     # defaults to "multi" even without an entry here; an explicit "single" on a
     # write store is rejected by ParticlesConfig's validator.
     per_store: dict[str, Literal["single", "multi"]] = Field(default_factory=dict)
+    # Same-subject update supersession: cross-entry candidacy keyed
+    # on the claim's subject, and the rung 2.5 same-lineage recency rung.
+    update_supersession: UpdateSupersessionConfig = Field(default_factory=UpdateSupersessionConfig)
 
 
 class SourceDecayConfig(BaseModel):
@@ -1088,8 +1166,8 @@ class UtilityRuleConfig(BaseModel):
     ``floor`` / ``cap`` triple when the bounded multiplier was superseded.
     ``0.0`` disables the lift (projection ranks by effective confidence alone).
 
-    The default ``0.015`` is **empirically calibrated** (re-centred
-, re-measured post-dedup, re-centred
+    The default ``0.015`` is **empirically calibrated** (re-centred,
+    re-measured post-dedup, re-centred
     again), not derived. The admissible band is a property of the
     **surface**, not of the store, because a larger head has more room to expose
     duplicate clusters — so the three head sizes this SDK renders disagree.
@@ -1144,17 +1222,17 @@ class UtilityRuleConfig(BaseModel):
     porting this number; it is a property of one store's confidence spread and
     event volume.
 
-    If the sweep's *ceiling* is what binds for you, the fix is deduplication
-    , not a smaller ``λ`` — but check that your dedup pass can
+    If the sweep's *ceiling* is what binds for you, the fix is deduplication,
+    not a smaller ``λ`` — but check that your dedup pass can
     actually *reach* the clusters setting the ceiling. On the dogfood store it
     could not at first: merge cut near-duplicate mass from 16.0% to
     3.1% of ACTIVE, yet the ceiling *fell* (0.0190 → 0.0165 at ``N = 200``)
     rather than rising, because the two clusters that set it were 21
     **byte-identical** copies each carrying 1/21 and 0/21 subject links, and
-    ``suggest_co_evidential`` iterates Subjects so it never saw them
-     — reporting zero groups while 211 exact-duplicate groups / 534
+    ``suggest_co_evidential`` iterates Subjects so it never saw them—
+    reporting zero groups while 211 exact-duplicate groups / 534
     redundant ACTIVE copies remained. The grouping was made subject-agnostic
-     and the ceiling then left the measurable range entirely:
+    and the ceiling then left the measurable range entirely:
     305 groups / 350 redundant copies remain (1.29% of ACTIVE), largest cluster
     7, none of them in the head. That is the payoff predicted,
     arriving one dedup pass later than it expected.
@@ -1168,8 +1246,8 @@ class UtilityMiningConfig(BaseModel):
     """The transcript-mining pass that produces per-belief utility evidence.
 
     The literal matcher (deterministic, zero-cost) is always on when mining
-    runs; ``behavioural_matching`` adds the bounded LLM soft-guideline matcher
-    , capped at ``max_behavioural_calls`` per run (
+    runs; ``behavioural_matching`` adds the bounded LLM soft-guideline matcher,
+    capped at ``max_behavioural_calls`` per run (
     cost-discipline).
 
     ``behavioural_candidate_limit`` bounds *which* beliefs compete for that
@@ -1233,15 +1311,15 @@ class OwnerLensConfig(BaseModel):
     ``subjects`` identifies **the viewer** — the party whose lenses are in
     effect for this read. It lives in the reader's config rather than in the
     store because viewer identity is reader-local: three contributors sharing
-    one store each need their own, which a store-resident field would defeat
-    . This is the single-viewer binding of the viewer
+    one store each need their own, which a store-resident field would defeat.
+    This is the single-viewer binding of the viewer
     seam, valid up to multi-tenant line.
 
     A **list**, not a scalar, because a viewer's Subject fragments in practice
     ("Jeff" / "Jeff Gage") until the N→1 merge lands. Entries are
     canonical names or Subject ids and resolve **locally only** — never a live
-    authority lookup, since the digest is a zero-LLM, zero-network surface
-    . Resolve-or-inert: if nothing resolves the
+    authority lookup, since the digest is a zero-LLM, zero-network surface.
+    Resolve-or-inert: if nothing resolves the
     lens is inert and the ordering is byte-identical to ``enabled: false``.
 
     ``rank_lift`` (``ω``) is **store-specific and must be calibrated** against
@@ -1253,6 +1331,28 @@ class OwnerLensConfig(BaseModel):
     enabled: bool = True
     subjects: list[str] = Field(default_factory=list)
     rank_lift: float = Field(default=0.0, ge=0.0)
+
+
+class ObserverScopeConfig(BaseModel):
+    """Observer scope — the project as an observer.
+
+    A belief's observer scope is derived at read time from the ``project:<key>``
+    tags on the corpus entries its sources name; nothing is stored on the claim.
+    This section holds the one piece of static policy that derivation needs.
+
+    ``harness_tags`` are the tags a harness adapter puts on everything it
+    harvests. A keyless corpus entry that carries one is **unattributed** —
+    in view store-wide and for no project observer — rather than global: a
+    stamping gap must fail closed, not make a harness's deposits visible
+    everywhere. A keyless entry without one (a hand deposit, a web page, a
+    user-level rule file) is global. Add your adapter's tag here when you wire
+    a second harness.
+
+    Which surfaces read through a project observer is the adapter's setting
+    (``claude_code.observer_scope``), not this section's.
+    """
+
+    harness_tags: list[str] = Field(default_factory=lambda: ["claude-code"])
 
 
 _CALIBRATION_SOURCE_VALUES = frozenset(
@@ -1387,6 +1487,51 @@ class SubjectsConfig(BaseModel):
     skip_live_authorities_source_types: list[str] = Field(
         default_factory=lambda: ["CONVERSATION", "JOURNAL", "MCP_MEMORY_EXPORT"]
     )
+    # one persona per store for conversational sources. An
+    # extractor names the speaker differently from session to session ("user",
+    # "the user", "the speaker"), which minted a Subject per surface form and
+    # split the persona's claims across them — so an update about "the user"
+    # was never compared with a belief about "User" (measured: 13 of 31
+    # residual stale answers in the live run). Any alias below
+    # resolves to `persona_canonical_name` for these source types. A resolution
+    # rule only: Subjects already split stay split (`subjects merge` is the
+    # operator's tool), and an empty alias list disables it.
+    #
+    # The fold is only as good as the agreement between the two paths that use
+    # it. It shipped off for one release (1.146.3) because it measurably cost
+    # update supersessions — 1 / 3 / 0 against 13 / 10 / 13 unfolded, over three
+    # fixed live extraction samples — and back on in 1.146.4 once that was
+    # traced to its cause: the §6.6 precompute looked a candidate's subject up
+    # by the extractor's *raw* surface form while the write path stored it
+    # folded, found nothing, and skipped the rung entirely. With both paths
+    # folding, the same three samples give 12 / 15 / 14 supersessions —
+    # better than not folding at all, and better on recall too (0.963 against
+    # 0.944 mean).
+    #
+    # The fold records each surface form it folds as an alias of the canonical
+    # Subject, so a lookup by name resolves "user" or "the speaker"
+    # without knowing about the fold, and `subjects show` lists what the
+    # persona has been called. Those aliases are scoped the way the fold is:
+    # a path that binds a particle to a Subject outside `persona_source_types`
+    # (extraction of a web page, an interchange import) never resolves a
+    # persona form through them, so "I" or "User" from such a source still
+    # becomes its own Subject. A caller that must agree with the write path
+    # about a name uses `ingest.subject_resolver.find_existing_subject` rather
+    # than folding by hand. Renaming `persona_canonical_name` on a folded store
+    # wants a `subjects merge` of the old persona Subject into the new one.
+    persona_aliases: list[str] = Field(
+        default_factory=lambda: [
+            "user",
+            "the user",
+            "speaker",
+            "the speaker",
+            "i",
+            "me",
+            "myself",
+        ]
+    )
+    persona_canonical_name: str = "the user"
+    persona_source_types: list[str] = Field(default_factory=lambda: ["CONVERSATION", "JOURNAL"])
 
     @model_validator(mode="after")
     def _abstain_at_most_suppress(self) -> SubjectsConfig:
@@ -1566,6 +1711,23 @@ class QueryConfig(BaseModel):
     # (all-MiniLM-L6-v2; measured off-topic band ≤ 0.15, on-topic ≥ 0.6);
     # re-examine on a non-reference profile. 0.0 disables the gate.
     relevance_floor: float = Field(default=0.25, ge=0.0, le=1.0)
+    # Output budget for the §9.3 NL answer call. This is a *total output*
+    # allowance on the wire, not a response-length cap: an extended-thinking
+    # model spends its thinking tokens from the same budget, so a value sized
+    # to the prose alone returns a reply with no text block at all and the
+    # answer degrades to the deterministic listing. Moved here from the
+    # misfiled ``extraction.query_max_tokens`` (whose 1024 default did exactly
+    # that on `claude-sonnet-5`); the old key is still honoured for a
+    # deprecation cycle. 4096 matches the memory benchmark's answer budget,
+    # which was raised for this same failure class.
+    answer_max_tokens: int = Field(default=4096, gt=0)
+    # One retry of the answer call at this larger budget when the first came
+    # back with no text block — the deterministic budget failure, which is the
+    # only failure worth re-issuing: an identical call at an identical budget
+    # reproduces it, while a bigger budget is a different call. Never fires on
+    # a billing/network/refusal failure, which degrades immediately as before.
+    # 0 disables the retry. Costs nothing on a query that answered.
+    answer_retry_max_tokens: int = Field(default=16384, ge=0)
 
 
 class ContestednessConfig(BaseModel):
@@ -1619,8 +1781,8 @@ class LintConfig(BaseModel):
     contradiction_candidate_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
 
     # RECENCY_DECAY: flag an ACTIVE particle whose effective_confidence is
-    # materially reduced by content age alone (decay; surfaced in lint
-    #). A particle fires when 1 - recency_factor >= this threshold —
+    # materially reduced by content age alone (decay; surfaced in lint).
+    # A particle fires when 1 - recency_factor >= this threshold —
     # i.e. age alone has discounted its confidence by at least this fraction.
     # Default 0.5 = flag once age has at least halved the recency multiplier.
     # Read-only WARNING; never flips status. Source types with no decay config
@@ -1695,8 +1857,8 @@ class ObsidianConfig(BaseModel):
     # so the Logseq exporter honours the same gate. Read it via
     # ``get_config().exporter_common.synthesis_min_particles``.
     # when true (default), `export obsidian --with-synthesis` also emits
-    # one note per ACTIVE NARRATIVE under `Narratives/`, rendered as cited prose
-    #. Set false to keep only per-subject articles.
+    # one note per ACTIVE NARRATIVE under `Narratives/`, rendered as cited prose.
+    # Set false to keep only per-subject articles.
     emit_narrative_notes: bool = True
 
 
@@ -1918,7 +2080,8 @@ _DEFAULT_REFETCH_FLOORS: dict[str, int] = {
 class LocalRefreshConfig(BaseModel):
     """The local-source refresh tier — change detection for ``file://`` entries.
 
-    The gate on *which* entries are refreshed is not here: it is the ``fetch_policy = LAZY`` flag on the entry itself, so refreshing stays an
+    The gate on *which* entries are refreshed is not here: it is the
+    ``fetch_policy = LAZY`` flag on the entry itself, so refreshing stays an
     operator promise made per source at deposit time rather than a global
     switch. These knobs bound the sweep, not its membership.
     """
@@ -2093,8 +2256,7 @@ class ClaudeCodeHarvestConfig(BaseModel):
     # The refusal is logged; the catch-up sweep back-fills once enabled.
     allow_remote: bool = False
     # Extract deposited entries inside the hook (LLM-priced). Default deferred:
-    # the hook only deposits; extraction runs on the store's schedule
-    #.
+    # the hook only deposits; extraction runs on the store's schedule.
     extract_inline: bool = False
     # Ceiling on inline extractions per SessionEnd run (current session first).
     max_extract_entries_per_session: int = Field(default=3, ge=0)
@@ -2130,6 +2292,11 @@ class ClaudeCodeConfig(BaseModel):
     # timeout. On expiry the hook logs and exits 0 with no output — a memory
     # outage must cost an empty digest, never a hung session start.
     hook_deadline_seconds: float = Field(default=10.0, gt=0.0)
+    # What a session's digest and MEMORY.md region see. ``store`` is
+    # the whole store, as before. ``project`` reads through the session's
+    # project observer: global beliefs plus those observed in this project.
+    # Engages only once ``particles memory rescope`` has run on the store.
+    observer_scope: Literal["store", "project"] = "store"
     harvest: ClaudeCodeHarvestConfig = Field(default_factory=ClaudeCodeHarvestConfig)
 
 
@@ -2398,6 +2565,11 @@ class ConsolidationConfig(BaseModel):
     # is disclosed ("probed X of Y candidate pairs"), in the spirit of the
     # census cap. Correction rider on the consolidation cadence (v1.74.1).
     max_reconcile_probes: int = Field(default=50, ge=0)
+    # per-run probe budget for the same-subject update sweep.
+    # Higher than the document-supersession cap because the backlog it clears
+    # is a store's whole history of changed facts, and because its pre-filter
+    # (update_order) means every probe is spent on a pair rung 2.5 can act on.
+    max_update_probes: int = Field(default=100, ge=0)
     # Stale cycle-lock reclaim: a consolidate.lock whose pid is dead or whose
     # age exceeds this is reclaimed, so a crashed run cannot wedge the cadence.
     lock_timeout_minutes: int = Field(default=120, ge=1)
@@ -2444,6 +2616,13 @@ class DaemonConfig(BaseModel):
     web_clipper_poll_minutes: int = Field(default=5, ge=1)
 
 
+class TokenPrice(BaseModel):
+    """One model's list price in US$ per million tokens (``benchmark_memory.price_per_mtok``)."""
+
+    input: float = Field(ge=0.0)
+    output: float = Field(ge=0.0)
+
+
 class MemoryBenchmarkConfig(BaseModel):
     """Agent-memory benchmark evaluation — LongMemEval.
 
@@ -2462,8 +2641,57 @@ class MemoryBenchmarkConfig(BaseModel):
     # haystacks) | m (~500-session haystacks). The published table is the
     # ``s`` variant (owner-resolved 2026-07-12).
     variant: str = "s"
-    # Top-k for the retrieval stage and the qa_particles context.
-    top_k: int = Field(default=10, ge=1)
+    # Top-k for the retrieval stage and the qa_particles context. Mirrors the
+    # product's query default (``QueryRequest.top_k``, the CLI ``--top-k``
+    # and the MCP ``query`` tool all default to 40) because the published
+    # number must describe the product, not a lab build. The
+    # value is recorded on the run tuple, so a lower k is a disclosed
+    # ablation rather than the product. ``tests/test_config.py`` pins the two
+    # defaults equal so they cannot drift.
+    top_k: int = Field(default=40, ge=1)
+    # Version of the answer scaffold shared by the three QA conditions
+    # (``_ANSWER_SYSTEMS`` in the runner). 1 is the inaugural 2026-08-16
+    # table's text; 2 adds question-type-blind reader guidance (conditional
+    # abstention, preference grounding, an enumerate-merge-count protocol,
+    # date arithmetic, latest-wins). Recorded on the run tuple and in the
+    # checkpoint key: runs under different versions are not comparable.
+    answer_scaffold: int = Field(default=2, ge=1, le=2)
+    # Version of the judge-prompt protocol (``judge_prompt`` in the runner).
+    # 1 is the 1.74.0 paraphrase of the dataset's autoeval prompts, which the
+    # inaugural 2026-08-16 table was scored under; 2 is the official
+    # ``get_anscheck_prompt`` templates verbatim (the judge *model* stays the
+    # configured Anthropic one). Recorded on the run tuple and in the
+    # checkpoint key: verdicts under different protocols are not comparable.
+    judge_protocol: int = Field(default=2, ge=1, le=2)
+    # How the qa_particles context renders each claim's subjects (
+    # specifies that context as "claim text, subjects, dates").
+    #   uuids - the resolved subject_ids verbatim, which is what every
+    #           published table through 1.146.5 was measured under
+    #   names - each subject's canonical_name
+    #   none  - no subject field at all
+    # Measured 2026-09-20 over the kept s150 store set: `names` costs 33.6%
+    # fewer context tokens than `uuids` at top_k 40 and `none` 52.2% fewer,
+    # because a UUID tokenizes far worse than the name it stands for.
+    # Recorded on the run tuple and in the checkpoint key.
+    #
+    # The default moved to `names` in 1.148.2, after the nine-run ablation:
+    # three repeats per rendering showed two samples of ONE rendering disagree
+    # on 4-8 questions, `uuids` returned 0.820 three times while disagreeing
+    # with itself each time, and only one question in each direction is one a
+    # rendering always decides. So the accuracy ordering between renderings is
+    # noise and the 33.6% token saving is not.
+    #
+    # `names` rather than the cheaper `none` (52.2%), deliberately. The
+    # qa_particles context is specified as "claim text, subjects, dates",
+    # so rendering the subject readably is a CORRECTION while
+    # removing the field is a redefinition of what the benchmark measures.
+    # And `none` scoring
+    # above `names` is precisely the noise the repeats established: choosing on
+    # that 0.7-point gap would be selecting on sampling. `none` stays available
+    # for anyone who wants to re-open the spec question with data.
+    #
+    # `uuids` reproduces every published figure through 1.146.16.
+    subject_rendering: Literal["uuids", "names", "none"] = "names"
     # Dev-loop default question count; a full run requires --all.
     default_question_limit: int = Field(default=10, ge=1)
     # Seed for the stratified-by-question-type subset selection; part of the
@@ -2474,8 +2702,8 @@ class MemoryBenchmarkConfig(BaseModel):
     # non-interactive runs without it abort with the estimate printed).
     confirm_call_threshold: int = Field(default=50, ge=0)
     # Retries for a *transient* answer/judge call failure before the call is
-    # reported as an infra failure and excluded from the accuracy denominator
-    #. A no-text-block reply is never retried — it is deterministic
+    # reported as an infra failure and excluded from the accuracy denominator.
+    # A no-text-block reply is never retried — it is deterministic
     # at a fixed budget — and is excluded under the separate budget count.
     call_retries: int = Field(default=2, ge=0)
     # Backoff before each retry, multiplied by the attempt number. 0 disables
@@ -2488,6 +2716,190 @@ class MemoryBenchmarkConfig(BaseModel):
     # elsewhere. The check is what makes the ~500-session ``m`` variant refuse
     # up front instead of silently crushing the baseline via overflow.
     answer_context_window_tokens: int = Field(default=200_000, ge=1)
+    # Per-call *output*-token assumptions the pre-run estimate multiplies the
+    # projected call counts by. Output dominates an extraction run's bill —
+    # the 2026-09 provider survey measured ~6.7k output tokens per
+    # claude-sonnet-5 extraction call against ~3.9k input, and the inaugural
+    # LongMemEval run came in at nearly twice an input-only projection
+    # (Phase 0 costing) — so an estimate that ignores them is not a
+    # cost preview. The answer scaffold says "answer concisely" and the judge
+    # returns a bare yes/no, hence the small QA-side defaults. Every figure is
+    # disclosed in the rendered estimate as the assumption it is.
+    estimate_output_tokens_per_extraction_call: int = Field(default=6_700, ge=0)
+    estimate_output_tokens_per_answer_call: int = Field(default=300, ge=0)
+    # The judge figure predates adaptive thinking: thinking is billed as
+    # output and the judge call's budget is 1,024, but no run has recorded
+    # the judge's usage, so the default stays at the bare-verdict size and
+    # EXCLUDES thinking tokens. Raise it from measured usage, not by guess.
+    estimate_output_tokens_per_judge_call: int = Field(default=32, ge=0)
+    # Per-model override of the extraction figure, keyed like ``price_per_mtok``
+    # (resolved model id, or ``"<provider>:<model>"`` to pin one route), and
+    # resolved by the same lookup so the two can never disagree on a key.
+    # Consulted before the scalar above; the scalar is the fallback. Output
+    # per call is a property of the model — the 2026-09 survey measured ~6.7k
+    # on claude-sonnet-5 but ~3.6k on claude-haiku-4-5 — so an arm routing
+    # ``llm.extraction`` elsewhere is mis-estimated ~2x on the write side
+    # without an entry here. The rendered estimate says which source it used.
+    estimate_output_tokens_per_extraction_call_by_model: dict[str, int] = Field(
+        default_factory=dict
+    )
+    # Characters per input token — the factor the estimate and the pre-flight
+    # context-window check divide prompt bytes by. The scalar is the classic
+    # ~4-chars/token rule of thumb, correct for the pre-4.7 tokenizer
+    # (claude-haiku-4-5, claude-sonnet-4-6). Models on the newer tokenizer
+    # (Claude 4.7 and later, claude-sonnet-5 included) produce ~1.3-1.4x the
+    # tokens for the same text, so the per-model mapping — same key shape and
+    # lookup as ``price_per_mtok`` — is what keeps their input projection and
+    # their window verdict honest. The write side is keyed on the extraction
+    # model, the answer side and the window check on the answer model.
+    chars_per_token: float = Field(default=4.0, gt=0.0)
+    chars_per_token_by_model: dict[str, float] = Field(default_factory=dict)
+
+    @field_validator("estimate_output_tokens_per_extraction_call_by_model")
+    @classmethod
+    def _non_negative_output_tokens(cls, value: dict[str, int]) -> dict[str, int]:
+        """Every per-model output figure is a token count: zero or more."""
+        for key, tokens in value.items():
+            if tokens < 0:
+                raise ValueError(
+                    f"estimate_output_tokens_per_extraction_call_by_model[{key!r}] "
+                    f"must be >= 0, got {tokens}"
+                )
+        return value
+
+    @field_validator("chars_per_token_by_model")
+    @classmethod
+    def _positive_chars_per_token(cls, value: dict[str, float]) -> dict[str, float]:
+        """A chars-per-token factor is a divisor: strictly positive."""
+        for key, factor in value.items():
+            if factor <= 0:
+                raise ValueError(f"chars_per_token_by_model[{key!r}] must be > 0, got {factor}")
+        return value
+
+    # Fraction of list price removed when a call rides the Message Batches API
+    # (``--pooled`` for the write side, ``--batch-qa`` for the answerer/judge,
+    # both only while ``llm.batch.enabled``). Anthropic's batch discount is 50 %
+    # on both input and output.
+    batch_discount: float = Field(default=0.5, ge=0.0, le=1.0)
+    # Per-MTok list prices the estimate turns its token projection into
+    # dollars with, keyed by resolved model id (``claude-sonnet-5``) or, to
+    # pin one provider's route, ``"<provider>:<model>"``. Empty by default:
+    # prices go stale, and a compiled-in dollar figure would quietly misprice
+    # every run after the next price change. With no entry for a run's model
+    # the estimate prints "no price configured" instead of a number.
+    price_per_mtok: dict[str, TokenPrice] = Field(default_factory=dict)
+
+
+class RotBenchmarkConfig(BaseModel):
+    """Memory-rot benchmark — currency / supersession / source trust.
+
+    Run knobs, world size, and cost-projection assumptions only. The pipeline
+    under test runs the shipped defaults: nothing here re-tunes detection,
+    reconciliation, or ranking (the harness measures the product
+    as configured and must never make the number look better). Prices come
+    from ``benchmark_memory.price_per_mtok`` so the two harnesses cannot
+    disagree about what a model costs.
+    """
+
+    # Seeds a run covers when none is given on the CLI. A seed *is* the
+    # fixture: the world is a pure function of (seed, days), so three seeds
+    # are three independent worlds and the report shows their spread.
+    seeds: list[int] = Field(default_factory=lambda: [42, 43, 44])
+    # Simulated world length in days and the probe checkpoints within it.
+    days: int = Field(default=90, ge=30)
+    checkpoints: list[int] = Field(default_factory=lambda: [15, 30, 45, 60, 75, 90])
+    # Probe top-k. RotBench scores the context block a system returns, which
+    # is a short list; 10 is that surface. Recorded on the run tuple.
+    top_k: int = Field(default=10, ge=1, le=200)
+    # The domain trust score the `source` poison channel's untrusted domain is
+    # given in each scratch store — the operator's policy. Ignored
+    # under --no-trust-policy, which measures the neutral default.
+    untrusted_domain_trust: float = Field(default=0.2, ge=0.0, le=1.0)
+    # Relevance floors the offline sweep evaluates over the recorded top-1
+    # cosines. Pure arithmetic; no call is made.
+    floor_sweep: list[float] = Field(
+        default_factory=lambda: [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40]
+    )
+    # Cost-projection assumptions for the `live` arm (the estimate discloses
+    # them). A rot session is a short templated chat, far smaller than a
+    # LongMemEval haystack session, so it gets its own output assumption.
+    estimate_output_tokens_per_extraction_call: int = Field(default=1500, ge=0)
+    # The general extractor's fixed system prompt (rules + modality / polarity
+    # / stance / structure / validity addenda, ~8k chars) is re-sent on every
+    # call; on a short rot session it rivals the session itself, so the
+    # estimate adds it per call rather than pricing session text alone.
+    estimate_extraction_prompt_overhead_tokens: int = Field(default=2500, ge=0)
+    # Contradiction probes per world, and their size. Bounded above by the
+    # candidate pairs over the similarity threshold; the world's value-change
+    # and decoy events are what pair, so this scales with them.
+    estimate_probe_calls_per_update: float = Field(default=4.0, ge=0.0)
+    estimate_probe_input_tokens: int = Field(default=120, ge=0)
+    estimate_probe_output_tokens: int = Field(default=200, ge=0)
+    # Above this many projected LLM calls the CLI asks before spending
+    # (--yes pre-confirms). The `oracle` arm projects zero and never asks.
+    confirm_call_threshold: int = Field(default=100, ge=0)
+
+    @field_validator("checkpoints")
+    @classmethod
+    def _checkpoints_sorted_positive(cls, value: list[int]) -> list[int]:
+        """Checkpoints are strictly increasing positive days."""
+        if not value or any(d <= 0 for d in value) or value != sorted(set(value)):
+            raise ValueError("checkpoints must be non-empty, positive, strictly increasing")
+        return value
+
+
+class RelevanceFloorBenchmarkConfig(BaseModel):
+    """Relevance-floor benchmark — the gate's error rates.
+
+    Run knobs and cost-projection assumptions only. The query op under test
+    runs as configured; the single thing the judged stage changes is the gate
+    itself, which it disables for the run so the response step can be scored
+    over the top-k the floor would have suppressed. Prices come from
+    ``benchmark_memory.price_per_mtok``.
+    """
+
+    # Floors the sweep evaluates (the range, so the synthetic and
+    # the real-question curves line up setting for setting).
+    floors: list[float] = Field(default_factory=lambda: [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40])
+    # Retrieval depth of the replay — the query surfaces' own default, since
+    # the floor reads the maximum cosine over the *rendered* top-k.
+    top_k: int = Field(default=40, ge=1, le=200)
+    # Where `harvest` reads agent transcripts and writes the held-out set. The
+    # set is real questions from a real person: it lives outside any
+    # repository by default and is never vendored.
+    transcripts_dir: str = "~/.claude/projects"
+    heldout_path: str = "~/.particles/benchmark/relevance-floor/heldout.jsonl"
+    # Length bounds of a question-shaped sentence harvested from a typed prompt.
+    min_question_chars: int = Field(default=15, ge=1)
+    max_question_chars: int = Field(default=300, ge=1)
+    # Seed of the `--limit` sample (stratified by source).
+    sample_seed: int = 0
+    # Version of the reference-free grounded-and-useful judge prompt. Never
+    # edit a protocol's text in place; add a version.
+    judge_protocol: int = Field(default=1, ge=1)
+    # Concurrent questions in the judged stage (each holds its own session).
+    concurrency: int = Field(default=4, ge=1)
+    # A transient answer/judge failure is retried this many times with a
+    # linear backoff before the question is excluded as `infra`.
+    call_retries: int = Field(default=2, ge=0)
+    call_retry_backoff_seconds: float = Field(default=2.0, ge=0.0)
+    # Cost-projection assumptions (disclosed by --estimate). Input is measured
+    # from each question's real top-k, so only output needs assuming.
+    estimate_answer_prompt_overhead_tokens: int = Field(default=700, ge=0)
+    estimate_answer_output_tokens: int = Field(default=500, ge=0)
+    estimate_judge_prompt_overhead_tokens: int = Field(default=350, ge=0)
+    estimate_judge_output_tokens: int = Field(default=20, ge=0)
+    # Above this many projected LLM calls the CLI asks before spending
+    # (--yes pre-confirms). The unjudged replay projects zero and never asks.
+    confirm_call_threshold: int = Field(default=50, ge=0)
+
+    @field_validator("floors")
+    @classmethod
+    def _floors_sorted_unit(cls, value: list[float]) -> list[float]:
+        """Floors are strictly increasing and inside the cosine scale."""
+        if not value or any(not 0.0 <= f <= 1.0 for f in value) or value != sorted(set(value)):
+            raise ValueError("floors must be non-empty, within [0, 1], strictly increasing")
+        return value
 
 
 class BenchmarkConfig(BaseModel):
@@ -2501,14 +2913,39 @@ class BenchmarkConfig(BaseModel):
     Sibling harnesses (modality / polarity / validity / compare) may adopt
     the same directory later; filenames carry the harness kind.
 
-    ``confirm_call_threshold`` gates the repeat-runs mode (``--runs N``), whose cost scales linearly with N: above this many projected
+    ``confirm_call_threshold`` gates the repeat-runs mode (``--runs N``),
+    whose cost scales linearly with N: above this many projected
     extraction calls the CLI requires confirmation (mirrors
     ``audit.confirm_call_threshold``; ``--yes`` pre-confirms).
     A single run is never gated — the estimate only prints when N > 1.
+
+    ``record_claim_text`` controls whether each report carries the *text* of
+    the claims the extractor emitted, beside their ids. On (the default) is
+    what makes a saved report auditable: a benchmark run never persists to the
+    store, so an emitted particle's uuid resolves to nothing once the process
+    exits, and a precision figure cannot be inspected after the fact. Turn it
+    off when pointing the harness at a corpus whose content must not land in a
+    run file — the ids, counts, and every metric are unaffected, and gold text
+    from the suite YAML is unaffected too (the report has always carried it).
+
+    ``subject_aware_matching`` embeds each emitted claim as the
+    particle actually asserts it — subject prepended when the ``content``
+    string does not already name it — instead of comparing a subject-elided
+    claim against subject-bearing gold prose. On by default because the
+    un-qualified comparison measurably misreports: it charges an extractor
+    twice, once to precision and once to recall, for putting the subject in
+    the field the schema provides.
+
+    Set it **false to reproduce a pre-0262 number** — the provider-survey
+    pages and every run file written before 1.140.0 were measured under the
+    old semantics, and are not comparable to a run made under the new ones.
+    That is the knob's purpose; it is not a tuning dial.
     """
 
     runs_dir: str = "~/.particles/benchmark/runs"
     confirm_call_threshold: int = Field(default=50, ge=0)
+    record_claim_text: bool = True
+    subject_aware_matching: bool = True
 
 
 class MetricsConfig(BaseModel):
@@ -2553,9 +2990,9 @@ class MetricsConfig(BaseModel):
     pypi_distributions: list[str] = Field(
         default_factory=lambda: ["linkedparticles", "linkedparticles-core"]
     )
-    # The GoatCounter site code (``<code>.goatcounter.com``). Until the
-    # analytics tag reaches the published sites this source returns nothing;
-    # it is recorded as unavailable and never fails a capture run.
+    # The GoatCounter site code (``<code>.goatcounter.com``). The analytics
+    # tag has been live on both published sites since 1.139.6. Without a token
+    # the source is recorded as unavailable; it never fails a capture run.
     goatcounter_site: str = "linkedparticles"
     # Tags applied to every corpus entry the deposit half writes, so the
     # deposited series is addressable as one body of material.
@@ -2579,6 +3016,23 @@ class CliConfig(BaseModel):
     """
 
     heartbeat_seconds: float = Field(default=20.0, ge=0)
+
+
+class SourcePassageConfig(BaseModel):
+    """Source-passage hydration (``particles.operations.source_passage``).
+
+    Display-only knobs: nothing here reaches ranking. ``locate_min_overlap``
+    is the share of a particle's distinct terms a paragraph must contain to be
+    offered as the *located* passage when no chunk hash can be matched; below
+    it the whole snapshot text is shown instead of a guess.
+    ``max_passage_chars`` caps the text returned for any one passage, and
+    ``query_show_limit`` how many of a query's top hits ``--show-source``
+    hydrates (one blob read each).
+    """
+
+    locate_min_overlap: float = Field(default=0.5, gt=0.0, le=1.0)
+    max_passage_chars: int = Field(default=6000, ge=200)
+    query_show_limit: int = Field(default=5, ge=1)
 
 
 class ParticlesConfig(BaseModel):
@@ -2617,6 +3071,7 @@ class ParticlesConfig(BaseModel):
     content_age_decay: ContentAgeDecayConfig = Field(default_factory=ContentAgeDecayConfig)
     utility: UtilityConfig = Field(default_factory=UtilityConfig)
     owner_lens: OwnerLensConfig = Field(default_factory=OwnerLensConfig)
+    observer_scope: ObserverScopeConfig = Field(default_factory=ObserverScopeConfig)
     confidence: ConfidenceConfig = Field(default_factory=ConfidenceConfig)
     conformance: ConformanceConfig = Field(default_factory=ConformanceConfig)
     deposit_date: DepositDateConfig = Field(default_factory=DepositDateConfig)
@@ -2629,6 +3084,7 @@ class ParticlesConfig(BaseModel):
     mastodon: MastodonConfig = Field(default_factory=MastodonConfig)
     github: GithubConfig = Field(default_factory=GithubConfig)
     query: QueryConfig = Field(default_factory=QueryConfig)
+    source_passage: SourcePassageConfig = Field(default_factory=SourcePassageConfig)
     contestedness: ContestednessConfig = Field(default_factory=ContestednessConfig)
     lint: LintConfig = Field(default_factory=LintConfig)
     obsidian: ObsidianConfig = Field(default_factory=ObsidianConfig)
@@ -2645,6 +3101,10 @@ class ParticlesConfig(BaseModel):
     consolidation: ConsolidationConfig = Field(default_factory=ConsolidationConfig)
     daemon: DaemonConfig = Field(default_factory=DaemonConfig)
     benchmark_memory: MemoryBenchmarkConfig = Field(default_factory=MemoryBenchmarkConfig)
+    benchmark_rot: RotBenchmarkConfig = Field(default_factory=RotBenchmarkConfig)
+    benchmark_relevance_floor: RelevanceFloorBenchmarkConfig = Field(
+        default_factory=RelevanceFloorBenchmarkConfig
+    )
     benchmark: BenchmarkConfig = Field(default_factory=BenchmarkConfig)
     refetch_floors: dict[str, int] = Field(default_factory=lambda: dict(_DEFAULT_REFETCH_FLOORS))
     local_refresh: LocalRefreshConfig = Field(default_factory=LocalRefreshConfig)
@@ -2804,6 +3264,8 @@ _ENV_OVERRIDES: list[tuple[str, str, str]] = [
     ("BENCHMARK_MEMORY_CONFIRM_CALL_THRESHOLD", "benchmark_memory", "confirm_call_threshold"),
     ("BENCHMARK_RUNS_DIR", "benchmark", "runs_dir"),
     ("BENCHMARK_CONFIRM_CALL_THRESHOLD", "benchmark", "confirm_call_threshold"),
+    ("BENCHMARK_RECORD_CLAIM_TEXT", "benchmark", "record_claim_text"),
+    ("BENCHMARK_SUBJECT_AWARE_MATCHING", "benchmark", "subject_aware_matching"),
     ("AUDIT_MAX_CONTRADICTION_PROBES", "audit", "max_contradiction_probes"),
     # Resident daemon mode. ``engine serve --daemon`` sets
     # PARTICLES_DAEMON_ENABLED for its own process before reset_config() — the
@@ -2965,7 +3427,7 @@ def validate_config() -> tuple[Path | None, ParticlesConfig]:
 def _migrate_legacy_keys(raw: dict[str, Any]) -> None:
     """Migrate deprecated config keys in-place, logging a one-time warning.
 
-    Two migrations are active:
+    Three migrations are active:
 
     * ``lint.co_evidential_candidate_threshold`` was renamed to
       ``links_suggest.candidate_threshold``.
@@ -2974,6 +3436,8 @@ def _migrate_legacy_keys(raw: dict[str, Any]) -> None:
       extraction, query-response, and the reconcile-ladder contradiction check
       — the "general" purposes), and ``wiki.model`` migrates to
       ``llm.synthesis.model``.
+    * ``extraction.query_max_tokens`` — the query op's answer budget, never an
+      extraction knob — moved to ``query.answer_max_tokens``.
 
     Each old key is honoured only when its new home is unset, so an operator
     who has already moved to the new key wins. The shims may be removed once
@@ -2981,6 +3445,7 @@ def _migrate_legacy_keys(raw: dict[str, Any]) -> None:
     """
     _migrate_co_evidential_threshold(raw)
     _migrate_llm_model_keys(raw)
+    _migrate_query_answer_max_tokens(raw)
 
 
 def _migrate_co_evidential_threshold(raw: dict[str, Any]) -> None:
@@ -3021,6 +3486,34 @@ def _migrate_llm_model_keys(raw: dict[str, Any]) -> None:
             section_name,
             purpose,
         )
+
+
+def _migrate_query_answer_max_tokens(raw: dict[str, Any]) -> None:
+    """``extraction.query_max_tokens`` → ``query.answer_max_tokens``.
+
+    The knob only ever drove the §9.3 answer call; living under ``extraction``
+    made it read as an extraction cap and hid it from the operator looking for
+    why an answer degraded to a listing. The value is carried over verbatim —
+    an operator who had deliberately raised it keeps their setting — but the
+    *default* changed (1024 → 4096), so an operator who had merely pinned the
+    old default in their file is warned and should drop the key.
+    """
+    section = raw.get("extraction")
+    if not isinstance(section, dict):
+        return
+    legacy = section.pop("query_max_tokens", None)
+    if legacy is None:
+        return
+    query_section = raw.setdefault("query", {})
+    if isinstance(query_section, dict) and "answer_max_tokens" not in query_section:
+        query_section["answer_max_tokens"] = legacy
+    log.warning(
+        "config: 'extraction.query_max_tokens' is deprecated and will be removed "
+        "in a future release. Use 'query.answer_max_tokens' instead — note the "
+        "default rose from 1024 to 4096, because an extended-thinking model "
+        "spends its thinking tokens from this same budget and 1024 left it with "
+        "none for the answer."
+    )
 
 
 _config: ParticlesConfig | None = None

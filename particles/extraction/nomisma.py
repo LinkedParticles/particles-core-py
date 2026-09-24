@@ -269,8 +269,7 @@ class NomismaExtractor:
         # publishes dereferenceable LOD URIs, so `bind_subject_id`'s URI rung
         # matches it against this candidate's external ref and
         # binds `subject_id`. That is the join back into the graph, and it is
-        # why this extractor is the best-keyed member of the family
-        #.
+        # why this extractor is the best-keyed member of the family.
         #
         # PROSE-canonical either way: with a definition, `content` renders the
         # class *and* the definition — two facts, one triple — so it fails the

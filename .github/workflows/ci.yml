@@ -15,17 +15,16 @@
 # comment is the human-readable tag that SHA resolves to. Bump a SHA only
 # deliberately.
 #
-# Scope note — DCO and pytest run; ruff is still deferred. The split-package
-# build made this tree independently installable (it is a whole distribution,
-# not a partial package: it owns `particles/__init__.py` and extends the
-# package path so the engine's modules resolve when that distribution is also
-# present), and it carries the shared fixture body its conftest re-exports, so
-# the suite is honest here. Remaining blocker:
-#   * ruff — the export's citation-strip rewrite still joins a citation wrapped
-#     across a line boundary into an over-length line, a lint + format issue in
-#     the exported copy only. The import-grouping half is fixed (the pyproject
-#     declares isort known-first-party = ["particles"]); the ruff job lands
-#     once the reflow is too.
+# Scope note — DCO, pytest, ruff and REUSE all run. The split-package build
+# made this tree independently installable (it is a whole distribution, not a
+# partial package: it owns `particles/__init__.py` and extends the package path
+# so the engine's modules resolve when that distribution is also present), and
+# it carries the shared fixture body its conftest re-exports, so the suite is
+# honest here. ruff was the last deferred check: the export's citation strip
+# used to join a citation wrapped across a line boundary into one over-length
+# line. The export now keeps line structure, formats the Python files it
+# rewrote with the same pinned ruff this job runs, and refuses to publish a
+# tree either command would fail.
 name: CI
 
 on:
@@ -71,6 +70,28 @@ jobs:
       # tier makes real Anthropic calls and is a developer-key concern.
       - name: Run the suite
         run: uv run pytest tests/ -m "not integration" -q
+
+
+  ruff:
+    name: ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: "3.11"
+          enable-cache: false
+
+      # Pinned, not floated: formatter output is version-specific, and the
+      # upstream export formats this tree with exactly this ruff before it is
+      # published, so a different version can fail on a no-op diff. Needs no
+      # project install.
+      - name: ruff check
+        run: uvx --from 'ruff==0.15.17' ruff check .
+      - name: ruff format --check
+        run: uvx --from 'ruff==0.15.17' ruff format --check .
 
   reuse:
     name: REUSE licensing

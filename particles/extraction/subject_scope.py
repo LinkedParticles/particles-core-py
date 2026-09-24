@@ -7,8 +7,8 @@
 Two things live here, and the second is the load-bearing one:
 
 1. ``extraction:subject_scope`` — the ``properties`` key an extractor sets to
-   record that a claim's only available subject is the journal's **author**
-   . It is a *record*, never a subject: it says "the subject of
+   record that a claim's only available subject is the journal's **author**.
+   It is a *record*, never a subject: it says "the subject of
    this claim is the author, and this store does not currently hold that
    Subject". The rule and its owner-resolved fork **O2** hold author
    resolution — byline → real-person Subject, *and/or* a ``journal:<handle>``

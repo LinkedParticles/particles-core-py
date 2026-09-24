@@ -374,7 +374,8 @@ class TestValidateExtractorNumista:
         The structured-extractor reading: a parser reports what a source
         states, so its residual uncertainty is never about sampling. The rule
         still fires and still rides the report; it just does not adjudicate,
-        which is what keeps the extractor out of ``failures`` and out of the trust cap.
+        which is what keeps the extractor out of ``failures`` and out of the
+        trust cap.
         """
         report = await validate_extractor("numista-coin-extractor", fixture_dir=FIXTURE_DIR)
         un_stat = next(s for s in report.fields if s.field == "uncertainty_nature")

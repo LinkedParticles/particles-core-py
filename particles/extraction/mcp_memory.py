@@ -14,7 +14,8 @@ its knowledge graph as JSONL — one JSON object per line, each carrying a
     {"type": "relation", "from": ..., "to": ..., "relationType": ...}
 
 :func:`parse_memory_jsonl` reads that file; :class:`McpMemoryExtractor` turns it
-into candidate particles. It is a **structured extractor** in the sense — the Wikidata / Nomisma / Numista family, no prose stage and no LLM —
+into candidate particles. It is a **structured extractor** in the
+sense — the Wikidata / Nomisma / Numista family, no prose stage and no LLM —
 because the records are already claim-granular. Running them through the
 general extractor would paraphrase claims that are already atomic, spend budget
 per record, and introduce hallucination risk into content that carried none.
@@ -69,11 +70,12 @@ from particles.core.schema import (
 )
 from particles.core.scoring.confidence import CalibrationSource
 from particles.extraction.general import CandidateParticle, ExtractionResult
+from particles.extraction.migration_preview import MigrationPreview, build_preview
 
 log = logging.getLogger(__name__)
 
 EXTRACTOR_ID = "mcp-memory-extractor"
-EXTRACTOR_VERSION = "0.1.0"
+EXTRACTOR_VERSION = "0.1.1"
 
 #: The per-incumbent source type. One string keys four existing
 #: levers: extractor applicability, the extractor trust weight, a
@@ -226,6 +228,25 @@ class ParsedGraph:
     entities: list[MemoryEntity] = field(default_factory=list)
     relations: list[MemoryRelation] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    #: ``"<record kind>.<field>"`` to the number of records carrying a field the
+    #: reference format does not define (a fork's ``createdAt``, say). The
+    #: mapping has no honest place for it, so it stays in the blob and out of
+    #: the particle, and is counted rather than passed over.
+    unmapped_fields: dict[str, int] = field(default_factory=dict)
+
+
+#: The fields the reference format defines, per record kind. Anything else on a
+#: record is unplaced, not guessed at.
+_KNOWN_FIELDS: dict[str, frozenset[str]] = {
+    "entity": frozenset({"type", "name", "entityType", "observations"}),
+    "relation": frozenset({"type", "from", "to", "relationType"}),
+}
+
+
+def _count_unmapped(graph: ParsedGraph, kind: str, record: dict[str, Any]) -> None:
+    for key in sorted(record.keys() - _KNOWN_FIELDS[kind]):
+        label = f"{kind}.{key}"
+        graph.unmapped_fields[label] = graph.unmapped_fields.get(label, 0) + 1
 
 
 def parse_memory_jsonl(content: bytes) -> ParsedGraph:
@@ -269,6 +290,7 @@ def parse_memory_jsonl(content: bytes) -> ParsedGraph:
                     f"from entity {name!r}."
                 )
             entity_type = record.get("entityType")
+            _count_unmapped(graph, "entity", record)
             graph.entities.append(
                 MemoryEntity(
                     name=name,
@@ -284,6 +306,7 @@ def parse_memory_jsonl(content: bytes) -> ParsedGraph:
                     f"Line {number}: relation is missing an endpoint or type; skipped."
                 )
                 continue
+            _count_unmapped(graph, "relation", record)
             graph.relations.append(
                 MemoryRelation(
                     from_name=str(src), to_name=str(dst), relation_type=str(rel), line=number
@@ -293,6 +316,75 @@ def parse_memory_jsonl(content: bytes) -> ParsedGraph:
             graph.notes.append(f"Line {number}: unknown record type {kind!r}; skipped.")
 
     return graph
+
+
+#: How many dropped entity names a single note spells out before summarising the
+#: rest. A note is read in a terminal; the full list is always recoverable from
+#: the deposited export, which is held verbatim.
+_NAMED_ENTITY_LIMIT = 10
+
+
+@dataclass
+class EmptyEntityReport:
+    """Where an export's observation-less entities end up.
+
+    An extractor emits candidates, a candidate is a particle, and a Subject
+    exists only because some candidate named it. So an entity with no
+    observations has two possible fates, and they are not the same loss:
+
+    * ``endpoint_only`` — some relation names it, so the relation candidate
+      brings the Subject into being (with its ``entityType``). It migrates.
+    * ``dropped`` — nothing names it. It does **not** migrate, by decision
+      rather than by oversight: minting a bare Subject here would manufacture a
+      phantom subject that ``particles lint`` flags on the very next command.
+      The accepted cost is disclosed wherever the export is first read.
+    """
+
+    dropped: list[str] = field(default_factory=list)
+    endpoint_only: list[str] = field(default_factory=list)
+
+
+def _key(name: str) -> str:
+    """Names compare the way the subject resolver compares them: case-insensitively."""
+    return name.lower()
+
+
+def empty_entity_report(graph: ParsedGraph) -> EmptyEntityReport:
+    """Split the export's observation-less entities by whether a relation rescues them."""
+    endpoints = {_key(r.from_name) for r in graph.relations} | {
+        _key(r.to_name) for r in graph.relations
+    }
+    report = EmptyEntityReport()
+    for entity in graph.entities:
+        if entity.observations:
+            continue
+        if _key(entity.name) in endpoints:
+            report.endpoint_only.append(entity.name)
+        else:
+            report.dropped.append(entity.name)
+    return report
+
+
+def empty_entity_notes(report: EmptyEntityReport) -> list[str]:
+    """Render an :class:`EmptyEntityReport` as disclosure lines.
+
+    Shared by the extractor's quality notes and the ``import mcp-memory`` verb,
+    so the count a user is shown at the door is the count extraction reports.
+    """
+    notes: list[str] = []
+    if report.dropped:
+        named = ", ".join(repr(n) for n in report.dropped[:_NAMED_ENTITY_LIMIT])
+        more = len(report.dropped) - _NAMED_ENTITY_LIMIT
+        if more > 0:
+            named += f", and {more} more"
+        notes.append(
+            f"{len(report.dropped)} entity/entities carry no observations and appear in no "
+            f"relation, and will not migrate: {named}. A Particles store holds a name only "
+            "through something believed about it."
+        )
+    # ``endpoint_only`` raises no note: those entities migrate whole, and a
+    # note is a disclosure of loss, not a progress report.
+    return notes
 
 
 def _import_floor() -> float:
@@ -322,81 +414,136 @@ class McpMemoryExtractor:
         content: bytes,
         **kwargs: object,
     ) -> ExtractionResult:
-        graph = parse_memory_jsonl(content)
-        if not graph.entities and not graph.relations:
-            return ExtractionResult(
-                quality_notes=graph.notes or ["No entity or relation records found in export."]
-            )
-
-        floor = _import_floor()
         # The pipeline passes the corpus entry's depositor;
         # the fallback covers a direct call in a test or a tool.
         actor = str(kwargs.get("deposited_by") or "operator")
-        contributors = [
-            ContributorRef(id=_contributor_id(actor), role="importer", at=datetime.now(UTC))
-        ]
-        candidates: list[CandidateParticle] = []
+        return map_graph(parse_memory_jsonl(content), deposited_by=actor)
 
-        for entity in graph.entities:
-            ref = ExternalRef(
-                namespace=EXTERNAL_REF_NAMESPACE,
-                id=entity.name,
-                confidence=1.0,
-            )
-            classes = {entity.name: entity.entity_type} if entity.entity_type else {}
-            for index, observation in enumerate(entity.observations):
-                candidates.append(
-                    CandidateParticle(
-                        content=observation,
-                        confidence_value=floor,
-                        uncertainty_nature=UncertaintyNature.EPISTEMIC,
-                        subjects=[entity.name],
-                        subject_classes=classes,
-                        external_refs={entity.name: ref},
-                        tags=[IMPORT_TAG, OBSERVATION_TAG],
-                        contributors=contributors,
-                        calibration_source=CalibrationSource.IMPORTED,
-                        provenance_location=f"line {entity.line} observation {index}",
-                    )
-                )
 
-        for relation in graph.relations:
+def map_graph(graph: ParsedGraph, *, deposited_by: str = "operator") -> ExtractionResult:
+    """Map a parsed export onto candidate particles: the whole of the mapping.
+
+    Synchronous and store-free, and the **only** implementation of the mapping:
+    :meth:`McpMemoryExtractor.extract` and :func:`preview_memory_export` both
+    call it, so a dry run reports what the real import produces rather than
+    what a second code path believes it would.
+    """
+    if not graph.entities and not graph.relations:
+        return ExtractionResult(
+            quality_notes=graph.notes or ["No entity or relation records found in export."]
+        )
+
+    floor = _import_floor()
+    contributors = [
+        ContributorRef(id=_contributor_id(deposited_by), role="importer", at=datetime.now(UTC))
+    ]
+    candidates: list[CandidateParticle] = []
+
+    for entity in graph.entities:
+        ref = ExternalRef(
+            namespace=EXTERNAL_REF_NAMESPACE,
+            id=entity.name,
+            confidence=1.0,
+        )
+        classes = {entity.name: entity.entity_type} if entity.entity_type else {}
+        for index, observation in enumerate(entity.observations):
             candidates.append(
                 CandidateParticle(
-                    content=relation_content(
-                        relation.from_name, relation.to_name, relation.relation_type
-                    ),
+                    content=observation,
                     confidence_value=floor,
                     uncertainty_nature=UncertaintyNature.EPISTEMIC,
-                    subjects=[relation.from_name, relation.to_name],
-                    external_refs={
-                        relation.from_name: ExternalRef(
-                            namespace=EXTERNAL_REF_NAMESPACE, id=relation.from_name, confidence=1.0
-                        ),
-                        relation.to_name: ExternalRef(
-                            namespace=EXTERNAL_REF_NAMESPACE, id=relation.to_name, confidence=1.0
-                        ),
-                    },
-                    tags=[
-                        IMPORT_TAG,
-                        *relation_tags(
-                            relation.from_name, relation.to_name, relation.relation_type
-                        ),
-                    ],
+                    subjects=[entity.name],
+                    subject_classes=classes,
+                    external_refs={entity.name: ref},
+                    tags=[IMPORT_TAG, OBSERVATION_TAG],
                     contributors=contributors,
                     calibration_source=CalibrationSource.IMPORTED,
-                    provenance_location=f"line {relation.line}",
+                    provenance_location=f"line {entity.line} observation {index}",
                 )
             )
 
-        notes = list(graph.notes)
-        phantom = [e.name for e in graph.entities if not e.observations]
-        if phantom:
-            notes.append(
-                f"{len(phantom)} entity/entities carried no observations and produced no "
-                "particles; they exist in the export only as names."
+    # An endpoint's entityType rides the relation too. For an entity with
+    # observations this repeats what its own candidates already said; for an
+    # observation-less one it is the only candidate that names it, and without
+    # this the entity migrated with its type silently blanked.
+    entity_types = {_key(e.name): e.entity_type for e in graph.entities if e.entity_type}
+
+    for relation in graph.relations:
+        endpoint_classes = {
+            name: entity_types[_key(name)]
+            for name in (relation.from_name, relation.to_name)
+            if _key(name) in entity_types
+        }
+        candidates.append(
+            CandidateParticle(
+                content=relation_content(
+                    relation.from_name, relation.to_name, relation.relation_type
+                ),
+                confidence_value=floor,
+                uncertainty_nature=UncertaintyNature.EPISTEMIC,
+                subjects=[relation.from_name, relation.to_name],
+                subject_classes=endpoint_classes,
+                external_refs={
+                    relation.from_name: ExternalRef(
+                        namespace=EXTERNAL_REF_NAMESPACE, id=relation.from_name, confidence=1.0
+                    ),
+                    relation.to_name: ExternalRef(
+                        namespace=EXTERNAL_REF_NAMESPACE, id=relation.to_name, confidence=1.0
+                    ),
+                },
+                tags=[
+                    IMPORT_TAG,
+                    *relation_tags(relation.from_name, relation.to_name, relation.relation_type),
+                ],
+                contributors=contributors,
+                calibration_source=CalibrationSource.IMPORTED,
+                provenance_location=f"line {relation.line}",
             )
-        return ExtractionResult(candidates=candidates, quality_notes=notes)
+        )
+
+    notes = [*graph.notes, *empty_entity_notes(empty_entity_report(graph))]
+    if graph.unmapped_fields:
+        fields = ", ".join(f"{name} ({count})" for name, count in graph.unmapped_fields.items())
+        notes.append(
+            f"Field(s) the mapping does not place were left in the export and out of the "
+            f"particles: {fields}."
+        )
+    return ExtractionResult(candidates=candidates, quality_notes=notes)
+
+
+def preview_memory_export(
+    content: bytes, *, deposited_by: str = "operator", sample_size: int = 5
+) -> MigrationPreview:
+    """Report what importing this export would produce, without a store.
+
+    The ``import mcp-memory --dry-run`` report. Parses the export and runs
+    :func:`map_graph` (the mapping the real import runs), then counts the
+    result: nothing is deposited, no Subject is resolved, no particle is
+    written. The counts are therefore what the export contributes; on a store
+    that already holds some of it, existing Subjects re-attach and identical
+    claims dedup, so the real import can only write *fewer* records than this.
+
+    An entity with no observations produces no particle. It survives only if a
+    relation names it (the relation candidate carries its entity type);
+    otherwise it is lost, and ``entities_lost`` names it, agreeing with
+    :func:`empty_entity_report` by construction of the same name match.
+    """
+    graph = parse_memory_jsonl(content)
+    return build_preview(
+        source_type=SOURCE_TYPE,
+        extractor_id=EXTRACTOR_ID,
+        extractor_version=EXTRACTOR_VERSION,
+        result=map_graph(graph, deposited_by=deposited_by),
+        records={
+            "entities": len(graph.entities),
+            "observations": sum(len(e.observations) for e in graph.entities),
+            "relations": len(graph.relations),
+        },
+        declared_entities=[e.name for e in graph.entities],
+        entities_without_records=[e.name for e in graph.entities if not e.observations],
+        unmapped_fields=graph.unmapped_fields,
+        sample_size=sample_size,
+    )
 
 
 def _contributor_id(actor: str) -> str:

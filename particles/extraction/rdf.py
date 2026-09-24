@@ -193,8 +193,7 @@ class RemoteRetrievalRefused(RuntimeError):
     """A parse tried to fetch something outside the deposited bytes.
 
     Raised by the :func:`no_remote_retrieval` guard. The extractor converts it
-    into a quality note, so it never escapes ``extract()`` as an exception
-    .
+    into a quality note, so it never escapes ``extract()`` as an exception.
     """
 
 

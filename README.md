@@ -24,7 +24,7 @@ wire format, and the extraction pipeline. Everything you need to *make* and
 > an MCP server), install
 > **[`linkedparticles`](https://pypi.org/project/linkedparticles/)** instead.
 > It depends on this package and pulls it in automatically. This one is the
-> substrate underneath it. Its repository,
+> foundation it is built on. Its repository,
 > **[`particles-engine-py`](https://github.com/LinkedParticles/particles-engine-py)**,
 > is the reference implementation's front door: issues, discussion, and
 > documentation live there.

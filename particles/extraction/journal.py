@@ -33,7 +33,7 @@ size — narrative grouping (one label, one sequence) is a whole-document concer
 Over-length entries (> ``extraction.html_chunk_size``) are extracted in multiple
 carry-forward passes and their per-chunk NARRATIVE fragments are
 merged into one whole-entry NARRATIVE by the Engine-side post-pass
-(:func:`particles.ingest.narrative_merge.collapse_chunk_narratives`).
+(:func:`particles.ingest.narrative_merge.collapse_narratives`).
 """
 
 from __future__ import annotations
@@ -283,7 +283,7 @@ class JournalExtractor:
         (2). Each cache-miss chunk yields its claims (chunk-local
         ``narrative_index``) plus one per-chunk NARRATIVE candidate; the Engine
         post-pass
-        (:func:`particles.ingest.narrative_merge.collapse_chunk_narratives`)
+        (:func:`particles.ingest.narrative_merge.collapse_narratives`)
         collapses those fragments into one whole-entry NARRATIVE with a global
         ``SEQUENCE_IN`` order. Chunks beyond ``max_llm_calls_per_source`` emit
         the shared ``CHUNK_TRUNCATION`` note — the new, much higher truncation

@@ -21,6 +21,10 @@ with cross-lingual detection and the ``language`` field.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
+from particles.core.schema import ParticleRelation
+
 
 def effective_equivalence(link_confidence: float, *, observer_trust: float | None = None) -> float:
     """Observer-relative claim-equivalence strength in ``[0, 1]`` (§6.10).
@@ -38,3 +42,45 @@ def effective_equivalence(link_confidence: float, *, observer_trust: float | Non
     if observer_trust is None:
         return link_confidence
     return max(0.0, min(1.0, link_confidence * observer_trust))
+
+
+def co_evidential_components(
+    edges: Iterable[ParticleRelation], min_confidence: float
+) -> dict[str, frozenset[str]]:
+    """Group ids into CO_EVIDENTIAL components from the whole edge list at once.
+
+    The in-memory equivalent of running ``get_co_evidential_group`` per particle,
+    honouring the same ``effective_equivalence >= min_confidence`` gate, so a
+    caller reads the relation table once and decides "already linked" without a
+    session (D2). Ids with no qualifying edge are simply
+    absent: their component is the singleton the caller supplies.
+
+    Args:
+        edges: CO_EVIDENTIAL edges, e.g. ``get_all_relations(session, CO_EVIDENTIAL)``.
+        min_confidence: Edges whose effective equivalence falls below this are
+            not traversed.
+
+    Returns:
+        Every id that sits on a qualifying edge, mapped to its whole component
+        (itself included).
+    """
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for e in edges:
+        if effective_equivalence(e.confidence) < min_confidence:
+            continue
+        a, b = find(e.particle_a), find(e.particle_b)
+        if a != b:
+            parent[a] = b
+
+    groups: dict[str, set[str]] = {}
+    for node in list(parent):
+        groups.setdefault(find(node), set()).add(node)
+    return {node: frozenset(members) for members in groups.values() for node in members}

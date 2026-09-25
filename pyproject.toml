@@ -19,7 +19,7 @@
 # version and advance together.
 [project]
 name = "linkedparticles-core"
-version = "1.149.0"
+version = "1.151.18"
 description = "Store-free client library for Particles: define, validate, serialize, and extract provenance-tracked belief particles"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -80,8 +80,10 @@ dependencies = [
     # The extraction layer types its session parameters against SQLAlchemy's
     # async session; the import is executed at module load even though no
     # Client module opens a connection. Declared so a store-free install still
-    # imports.
-    "sqlalchemy>=2.0",
+    # imports, and with `[asyncio]` because that import needs greenlet, which
+    # SQLAlchemy stopped installing by default in 2.1. Bounded below the next
+    # minor: 2.1 changed ORM and typing behaviour this code depends on.
+    "sqlalchemy[asyncio]>=2.0,<2.2",
     # JSON-LD / RDF / SHACL parsing stack — these handle attacker-influenced
     # input (interchange import, conformance validation), so they carry tested
     # next-breaking upper bounds in addition to the floor: a future breaking

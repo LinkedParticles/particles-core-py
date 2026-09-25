@@ -12,10 +12,13 @@ trust inputs already resolved by the caller, return a ``ConflictVerdict``
 saying what should happen. It also owns the constructor that builds an
 ``INCONSISTENCY`` ``Particle`` from a conflicting pair.
 
+It also owns the overrides around the verdict (:func:`decide_ladder`): the
+tri-state probe, the observer precondition, and which rung 2.5 input applies.
 The *effect* half of the ladder — DB writes, trust-rank lookups, embedding
 similarity computation, the LLM contradiction-signal call — stays in
-``particles/extraction/pipeline.py`` because it touches I/O. Core code must
-remain pure (see ``particles/core/AGENTS.md``).
+``particles/ingest/`` because it touches I/O: ``conflict_plan`` maps an outcome
+to writes, and ``pipeline`` gathers the inputs and applies the plan. Core code
+must remain pure (see ``particles/core/AGENTS.md``).
 
 Ladder (normative, applied in order — §6.4, rung for rung):
 
@@ -83,9 +86,11 @@ Two extra verdicts are emitted by the pre-ladder gate the caller may apply:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from particles.core.observer_scope import PairPrecondition
 from particles.core.schema import (
     SCHEMA_VERSION,
     Confidence,
@@ -307,6 +312,165 @@ def resolve_conflict(
 
     # Rung 3: default — INCONSISTENCY particle.
     return ConflictVerdict.INCONSISTENT
+
+
+@dataclass(frozen=True)
+class RungInputs:
+    """The gathered §6.4 rung inputs for one pair; the defaults are "no input".
+
+    The caller resolves these only when :func:`needs_rung_inputs` says the
+    ladder can consult them (a confirmed or fail-closed signal on a pair the
+    observer precondition does not decline).
+    """
+
+    new_supersedes_existing: bool = False
+    """Rung 1.5: ``new``'s document (transitively) supersedes ``existing``'s."""
+    existing_supersedes_new: bool = False
+    """Rung 1.5 mirror."""
+    trust_score_new: float | None = None
+    """Rung 2: the candidate's pre-resolved trust score."""
+    trust_score_existing: float | None = None
+    """Rung 2: the existing particle's pre-resolved trust score."""
+    update_order: int | None = None
+    """Rung 2.5: see :func:`resolve_conflict`'s ``update_order``."""
+
+
+@dataclass(frozen=True)
+class LadderOutcome:
+    """What the §6.6 ladder decided for one pair, overrides included."""
+
+    verdict: ConflictVerdict | None
+    """The verdict; ``None`` when the observer precondition declined the pair:
+    the candidate is written ``ACTIVE`` beside the existing claim."""
+    record_divergence: bool
+    """Declined and the signal is set: the pair is recorded as a divergence."""
+
+
+class UpdateOrderSource(StrEnum):
+    """Which rung 2.5 input the caller gathers for a pair."""
+
+    UPDATE = "update"
+    """Extraction's same-lineage update order."""
+    OWN_ASSERTION = "own_assertion"
+    """The assertion pathway's own-assertion order."""
+
+
+def ladder_signal(probe: bool | None, *, fail_closed: bool) -> bool:
+    """The contradiction signal the ladder runs on, from a tri-state probe.
+
+    ``True``/``False`` is a verdict. ``None`` means the probe could not
+    complete: extraction stays fail-open (no signal), and the assertion pathway
+    fails closed (a signal, which :func:`forces_inconsistent` then overrides to
+    ``INCONSISTENT``).
+    """
+    if probe is None:
+        return fail_closed
+    return probe
+
+
+def forces_inconsistent(
+    probe: bool | None, *, fail_closed: bool, precondition: PairPrecondition
+) -> bool:
+    """Whether the verdict is ``INCONSISTENT`` whatever the rungs would say.
+
+    Two overrides: an incomplete probe under ``fail_closed``, and
+    a project's candidate contesting a global claim with a signal (
+    ``REVIEW``). A ``DECLINE`` outranks both; :func:`decide_ladder` checks it
+    first.
+    """
+    if probe is None and fail_closed:
+        return True
+    return precondition is PairPrecondition.REVIEW and ladder_signal(probe, fail_closed=fail_closed)
+
+
+def needs_rung_inputs(
+    probe: bool | None, *, fail_closed: bool, precondition: PairPrecondition
+) -> bool:
+    """Whether the caller should gather :class:`RungInputs` for the pair.
+
+    Only a set signal reaches the rungs, and a declined pair reaches none. A
+    forced ``INCONSISTENT`` still gathers: the domain read alongside the trust
+    scores is the INCONSISTENCY record's ``domain_hint``.
+    """
+    if precondition is PairPrecondition.DECLINE:
+        return False
+    return ladder_signal(probe, fail_closed=fail_closed)
+
+
+def update_order_source(
+    *,
+    allow_update: bool,
+    allow_own_assertion: bool,
+    forced: bool,
+) -> UpdateOrderSource | None:
+    """Which rung 2.5 input applies, if any.
+
+    ``allow_update`` is extraction's door with the config switch already folded
+    in; ``allow_own_assertion`` the assertion pathway's narrower one.
+    A forced ``INCONSISTENT`` consults neither.
+    """
+    if forced:
+        return None
+    if allow_update:
+        return UpdateOrderSource.UPDATE
+    if allow_own_assertion:
+        return UpdateOrderSource.OWN_ASSERTION
+    return None
+
+
+def effective_single_trust_order(override: bool | None, store_mode: str) -> bool:
+    """The trust regime the ladder runs under.
+
+    A caller's explicit ``override`` wins; otherwise the store mode decides.
+    """
+    if override is not None:
+        return override
+    return store_mode == "single"
+
+
+def decide_ladder(
+    existing: Particle,
+    new: Particle,
+    *,
+    probe: bool | None,
+    fail_closed: bool,
+    precondition: PairPrecondition,
+    rung_inputs: RungInputs | None,
+    single_trust_order: bool,
+    trust_differential_threshold: float,
+) -> LadderOutcome:
+    """The §6.6 ladder for one pair, with every override applied in order.
+
+    Pure: the caller gathers the probe, the precondition and (when
+    :func:`needs_rung_inputs`) the rung inputs, then applies the outcome. The
+    override order is:
+
+      1. ``DECLINE``: no rung runs, whatever the probe said. The
+         divergence is recorded when the signal is set, a fail-closed
+         incomplete probe included.
+      2. a forced ``INCONSISTENT`` (:func:`forces_inconsistent`): the rungs are
+         skipped.
+      3. otherwise :func:`resolve_conflict` on the signal and the rung inputs.
+    """
+    signal = ladder_signal(probe, fail_closed=fail_closed)
+    if precondition is PairPrecondition.DECLINE:
+        return LadderOutcome(verdict=None, record_divergence=signal)
+    if forces_inconsistent(probe, fail_closed=fail_closed, precondition=precondition):
+        return LadderOutcome(verdict=ConflictVerdict.INCONSISTENT, record_divergence=False)
+    inputs = rung_inputs if rung_inputs is not None else RungInputs()
+    verdict = resolve_conflict(
+        existing,
+        new,
+        has_contradiction_signal=signal,
+        new_supersedes_existing=inputs.new_supersedes_existing,
+        existing_supersedes_new=inputs.existing_supersedes_new,
+        trust_score_existing=inputs.trust_score_existing,
+        trust_score_new=inputs.trust_score_new,
+        trust_differential_threshold=trust_differential_threshold,
+        single_trust_order=single_trust_order,
+        update_order=inputs.update_order,
+    )
+    return LadderOutcome(verdict=verdict, record_divergence=False)
 
 
 # the ``properties`` marker on an INCONSISTENCY record whose

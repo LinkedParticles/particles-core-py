@@ -20,10 +20,12 @@ order. Same split as :mod:`particles.core.cascade_gate`.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from enum import Enum
 
 from particles.core.conflict_resolution import RETIRED_VALUE_KEY
+from particles.core.contradiction_disclosure import census_sides
 from particles.core.schema import Particle, ProvenanceRefType, ResolutionAction
 from particles.core.status import Status, StatusReason
 
@@ -44,6 +46,16 @@ class Demotion(Enum):
 
     TRANSITION = "transition"
     """A live claim: transition to ``PROVENANCE_STALE`` / ``CONFLICT_RESOLVED``."""
+
+
+@dataclass(frozen=True)
+class Retirement:
+    """One DISCARD side to retire: ``→ RETRACTED`` / ``CONFLICT_RESOLVED``."""
+
+    particle: Particle
+    was_believed: bool
+    """False for a quarantined loser, which was never on the answer surface:
+    it is retracted, but no ``PARTICLE_RETRACTED`` event is written for it."""
 
 
 @dataclass(frozen=True)
@@ -84,8 +96,47 @@ class ResolutionPlan:
     aleatory: tuple[AleatoryMark, ...]
     trust: TrustJudgment | None
     """None: no trust statement is written, and no cascade runs."""
+    retire: tuple[Retirement, ...]
+    """DISCARD's retractions; empty for every other action."""
     close_wrapper: bool
     """False only for DEFER, the one action that leaves the wrapper open."""
+    also_demote: tuple[tuple[Particle, Demotion], ...] = field(default=())
+    """The losing side's further members of a census record,
+    applied after ``demote`` in order. Empty for a two-claim record."""
+
+
+@dataclass(frozen=True)
+class FurtherMembers:
+    """A census record's members beyond its representative pair, by side.
+
+    Review resolves such a record per side: every member of the losing side is
+    demoted, ``BOTH_VALID`` marks every member, ``DISCARD`` retracts every
+    member. Missing (dangling) members are simply absent.
+    """
+
+    a: tuple[Particle, ...] = ()
+    b: tuple[Particle, ...] = ()
+
+    @property
+    def all(self) -> tuple[Particle, ...]:
+        return self.a + self.b
+
+
+def further_member_ids(inconsistency: Particle) -> tuple[list[str], list[str]]:
+    """The ids of a census record's members beyond A and B, as ``(side a, side b)``.
+
+    Empty for every other record, and for a two-claim census record.
+    """
+    sides = census_sides(inconsistency)
+    if sides is None:
+        return [], []
+    return list(sides.a[1:]), list(sides.b[1:])
+
+
+def member_count(inconsistency: Particle) -> int:
+    """How many claims a record names: two, unless it is a larger census record."""
+    sides = census_sides(inconsistency)
+    return 2 if sides is None else len(sides.members)
 
 
 @dataclass(frozen=True)
@@ -151,6 +202,20 @@ def decide_demotion(loser: Particle | None) -> Demotion:
     return Demotion.TRANSITION
 
 
+def decide_retirement(side: Particle | None) -> Retirement | None:
+    """What DISCARD does to one side of a conflict.
+
+    Every side still standing, ``ACTIVE`` or ``PROVENANCE_STALE`` for any
+    reason (a quarantined loser included), is retracted with
+    ``CONFLICT_RESOLVED``. That pairing is outside the judgment set:
+    a discard is not a verdict on the value, so a later restatement is not
+    held. A missing or terminal side needs nothing.
+    """
+    if side is None or side.status not in (Status.ACTIVE, Status.PROVENANCE_STALE):
+        return None
+    return Retirement(particle=side, was_believed=not is_quarantined(side))
+
+
 def _source_entry_id(particle: Particle) -> str | None:
     """The corpus entry of the claim's first SOURCE provenance ref."""
     ref = next((r for r in particle.provenance if r.type is ProvenanceRefType.SOURCE), None)
@@ -181,6 +246,7 @@ def decide_resolution(
     inconsistency: Particle,
     particle_a: Particle | None,
     particle_b: Particle | None,
+    further: FurtherMembers | None = None,
 ) -> ResolutionPlan:
     """Decide every write a review resolution makes (§9.6).
 
@@ -189,12 +255,16 @@ def decide_resolution(
         inconsistency: The INCONSISTENCY wrapper.
         particle_a: Claim A as stored, or None when its ref dangles.
         particle_b: Claim B as stored, or None when its ref dangles.
+        further: A census record's members beyond A and B, so
+            the resolution applies per side. ``None`` for a two-claim record,
+            whose plan is exactly the pre-0277 one.
 
     Returns:
         The plan the operation applies.
     """
     a_id, b_id = conflict_pair_ids(inconsistency)
     retired_value = is_retired_value(inconsistency)
+    more = further or FurtherMembers()
 
     match action:
         case ResolutionAction.PREFER_A:
@@ -209,7 +279,9 @@ def decide_resolution(
                 promote=None,
                 aleatory=(),
                 trust=trust,
+                retire=(),
                 close_wrapper=True,
+                also_demote=_demote_all(more.b),
             )
         case ResolutionAction.PREFER_B:
             # A quarantined B is minted as a new ACTIVE particle carrying its
@@ -231,25 +303,59 @@ def decide_resolution(
                 promote=promote,
                 aleatory=(),
                 trust=trust,
+                retire=(),
                 close_wrapper=True,
+                also_demote=_demote_all(more.a),
             )
         case ResolutionAction.BOTH_VALID:
             marks = tuple(
                 AleatoryMark(particle=p, mint=is_quarantined(p))
                 for p in (particle_a, particle_b)
                 if p is not None
+            ) + tuple(
+                AleatoryMark(particle=p, mint=is_quarantined(p))
+                for p in more.all
+                if p.status not in _TERMINAL
             )
             return ResolutionPlan(
-                demote=None, promote=None, aleatory=marks, trust=None, close_wrapper=True
+                demote=None,
+                promote=None,
+                aleatory=marks,
+                trust=None,
+                retire=(),
+                close_wrapper=True,
             )
         case ResolutionAction.DEFER:
             return ResolutionPlan(
-                demote=None, promote=None, aleatory=(), trust=None, close_wrapper=False
+                demote=None,
+                promote=None,
+                aleatory=(),
+                trust=None,
+                retire=(),
+                close_wrapper=False,
+            )
+        case ResolutionAction.DISCARD:
+            retire = tuple(
+                r
+                for r in map(decide_retirement, (particle_a, particle_b, *more.all))
+                if r is not None
+            )
+            return ResolutionPlan(
+                demote=None,
+                promote=None,
+                aleatory=(),
+                trust=None,
+                retire=retire,
+                close_wrapper=True,
             )
 
 
 def _demote(loser: Particle | None) -> tuple[Particle, Demotion] | None:
     return (loser, decide_demotion(loser)) if loser is not None else None
+
+
+def _demote_all(losers: Sequence[Particle]) -> tuple[tuple[Particle, Demotion], ...]:
+    return tuple((p, decide_demotion(p)) for p in losers)
 
 
 def cascade_pair(
@@ -260,7 +366,10 @@ def cascade_pair(
     The trust cascade leaves a wrapper for a person when either claim is
     missing (a pre-ADR-0117 dangling ref), when it records a retired value, or
     when A has since left the surface by a terminal transition: source trust
-    cannot answer a question about an earlier judgment.
+    cannot answer a question about an earlier judgment. It also
+    leaves a census record naming more than two claims: its
+    trust comparison ranks two sources, and a side drawn from several notes
+    has no one rank to compare.
 
     The operation calls this before looking up trust ranks, so a skipped
     wrapper costs no rank lookups. :func:`decide_cascade` applies it again,
@@ -272,6 +381,8 @@ def cascade_pair(
     if particle_a is None or particle_b is None:
         return None
     if is_retired_value(inconsistency) or particle_a.status in _TERMINAL:
+        return None
+    if member_count(inconsistency) > 2:
         return None
     return particle_a, particle_b
 

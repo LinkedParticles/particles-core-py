@@ -19,14 +19,18 @@ CALIBRATED_BENCHMARK.
 from __future__ import annotations
 
 import contextlib
+import functools
+import inspect
 import json
 import logging
 import math
 import re
 import time
+from collections.abc import Iterator, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from particles.config import get_config
 from particles.core.schema import (
@@ -49,6 +53,19 @@ from particles.core.schema import (
     UncertaintyNature,
 )
 from particles.core.scoring.confidence import CalibrationSource
+from particles.extraction import polarity as _polarity_module
+from particles.extraction import scope as _scope_module
+from particles.extraction import session_state as _session_state_module
+from particles.extraction import structure as _structure_module
+from particles.extraction.components import (
+    ComponentTable,
+    PromptComponent,
+    assemble_prompt,
+    component_digest,
+    declare_components,
+    record_component,
+    record_prompt_components,
+)
 from particles.extraction.polarity import (
     NON_ASSERTED_POLARITIES,
     POLARITY_ASSERTED,
@@ -60,6 +77,7 @@ from particles.extraction.scope import (
     SCOPE_DOCUMENT_META,
     SCOPE_KEY,
 )
+from particles.extraction.session_state import drop_session_state
 from particles.extraction.structure import bind_subject_id, parse_structured_claim_payload
 from particles.extraction.tool_turns import TOOL_TURN_RULE, mark_tool_turns
 
@@ -67,12 +85,12 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from particles.extraction.incremental import ChunkUnit
-    from particles.llm import CompletionPool, CompletionRequest, VisionImage
+    from particles.llm import CompletionPool, CompletionRequest, RequestFailure, VisionImage
 
 log = logging.getLogger(__name__)
 
 EXTRACTOR_ID = "general-extractor"
-EXTRACTOR_VERSION = "0.15.0"
+EXTRACTOR_VERSION = "0.16.0"
 # 0.4.0: prompt now preserves URL schemes.
 # 0.5.0: HTML chunking moves to paragraph boundaries with hash-input
 #        normalisation and routes through extract_with_carry_forward.
@@ -141,6 +159,15 @@ EXTRACTOR_VERSION = "0.15.0"
 #        names the 0.14.0 tranche; it is NOT the whole stale set — every
 #        earlier version predates this rubric too, and on the author's store
 #        0.14.0 was 3,921 particles against 33,574 uncalibrated in total.
+# 0.16.0: reference resolution. The prompt now asks the model to replace a
+#        deictic or relative reference ("my flat", "last month", "my current
+#        job") with what the same source says it is, to emit the locating claim
+#        a source implies ("X is in <place>"), and to keep relative wording when
+#        the source does not resolve it. A claim that read "a ten-minute walk
+#        from the user's flat" silently changed referent when the user moved.
+#        The reference date now rides every prompt, not only the validity rule.
+#        Output differs from 0.15.0; ``reindex --extractor-version 0.15.0``
+#        re-extracts the prior tranche.
 #: The interval every emitted ``confidence_value`` is clamped into
 #: (D1). Strict interiority is the whole point: ``calibration.is_saturated``
 #: treats a value within ``_EPS = 1e-7`` of an endpoint as immovable, so
@@ -247,6 +274,47 @@ Rules:
 - Preserve URLs verbatim, including the scheme (https:// or http://). Do not
   shorten, paraphrase, or strip the scheme — downstream renderers rely on the
   scheme to auto-link them."""
+
+# Reference resolution: a claim is stored alone and read later beside claims
+# from other sources, so a deictic or relative reference ("my flat", "last
+# month") silently changes referent when the speaker's situation changes. Shared
+# with the journal extractor, so it names no date line of its own: the general
+# prompt supplies the reference date through ``_REFERENCE_DATE_RULE`` (or the
+# validity rule, which already carries it). The examples deliberately name
+# nothing a test fixture uses, so a passing test is resolution, not copying.
+REFERENCE_RULE = """
+- Resolve references before you write a claim. Each claim is stored on its own
+  and read later beside claims from other sources, so it must still mean the
+  same thing then. Words whose meaning depends on who is speaking, where, or
+  when ("my flat", "home", "here", "this city", "my current job", "my manager",
+  "last month", "yesterday", "now", "this year") are replaced with what they
+  refer to whenever THIS source says what that is:
+  - a place: in a source where Maria says she lives in Kreuzberg, Berlin,
+    "Rosa's Bakery is five minutes from my flat" becomes "Rosa's Bakery is five
+    minutes from Maria's flat in Kreuzberg, Berlin";
+  - a time: in a source dated 2026-03-14, "I started the course last month"
+    becomes "Maria started the course in February 2026". Resolve against a date
+    the source states for itself (a dated heading, a timestamp, a "Date:" line)
+    first, and otherwise against the REFERENCE DATE when one is given;
+  - a role or relation: "my current job" in a source that names the employer
+    becomes the employer's name.
+  Resolving a reference adds words to the claim; it does not change what the
+  claim is about. Keep in "subjects" every entity you would have listed before
+  resolving it, including the speaker wherever the subjects rule lists the
+  speaker: "Maria moved to Hamburg in February 2026" is about Maria and
+  Hamburg, never Hamburg alone.
+- When the source places a named thing only by reference to such an anchor
+  ("five minutes from my flat", "the café downstairs"), also emit the locating
+  claim it implies as its own particle ("Rosa's Bakery is in Kreuzberg,
+  Berlin"), at a confidence no higher than the claim it comes from.
+- When the source does not say what a reference points to, keep its own
+  relative wording. Never invent a place, a date, an employer, or any other
+  anchor the source does not give."""
+
+# The reference date for REFERENCE_RULE when the validity rule (which carries
+# the same placeholder) is off, so relative time always has an anchor.
+_REFERENCE_DATE_RULE = """
+- REFERENCE DATE: the source was published/captured on {reference_date}."""
 
 # optional document-scope classification clause. Appended to the
 # rules and the JSON schema only when ``extraction_scope.enabled`` is set, so
@@ -388,15 +456,116 @@ _STRUCTURE_SCHEMA_FIELD = (
     ' "object": "<value>"} or null'
 )
 
-_EXTRACT_SCHEMA = """
+# The output-schema frame. The optional fields of each enabled rule are woven
+# in between its head and its tail, which is why the frame is one component
+# placed last in the table (see ``assemble_prompt``): its head closes the rules
+# block and its tail closes the fields block.
+_EXTRACT_SCHEMA_HEAD = '''
 
 Return ONLY a JSON array. No prose before or after. Each element:
 {
   "content": "<the claim as a complete sentence>",
   "subjects": ["<entity name>"],
   "confidence_value": <float 0.0–1.0>,
-  "uncertainty_nature": "EPISTEMIC" or "ALEATORY"%s
+  "uncertainty_nature": "EPISTEMIC" or "ALEATORY"'''
+_EXTRACT_SCHEMA_TAIL = """
 }"""
+
+
+#: The rule a delta read carries when its prompt holds a context section
+#:. In the prompt proper, never inlined in the chunk text, so the
+#: instruction is a trusted rule rather than words inside the fenced data.
+APPEND_CONTEXT_RULE = """
+- The user message holds two fenced sections. The one labelled "context" is
+  earlier text of this same source, already extracted. Use it ONLY to work out
+  what the "source" section refers to (a person, a file, a failure described
+  earlier, "that", "it", "the fix"). Extract NO claim from the context section,
+  even one it states plainly. Every claim you return must be stated in the
+  "source" section, with its references resolved from the context where the
+  source section alone leaves them unclear.
+"""
+
+
+#: Component names. Stable identifiers: a stored record names a
+#: component by these, so renaming one reads as "removed and added" to every
+#: snapshot stamped before the rename. Change the text freely; keep the name.
+PROMPT_RULES = "prompt.general.rules"
+PROMPT_REFERENCE = "prompt.reference"
+PROMPT_SCOPE = "prompt.scope"
+PROMPT_MODALITY = "prompt.modality"
+PROMPT_POLARITY = "prompt.polarity"
+PROMPT_STANCE = "prompt.stance"
+PROMPT_VALIDITY = "prompt.validity"
+PROMPT_REFERENCE_DATE = "prompt.reference_date"
+PROMPT_STRUCTURE = "prompt.structure"
+PROMPT_TOOL_TURNS = "prompt.tool_turns"
+PROMPT_APPEND_CONTEXT = "prompt.append_context"
+PROMPT_SCHEMA = "prompt.general.schema"
+PATH_SINGLE_PASS = "path.single_pass"
+PATH_CHUNKED = "path.chunked"
+PATH_APPEND_DELTA = "path.append_delta"
+PATH_PDF_PAGES = "path.pdf_pages"
+PATH_IMAGE = "path.image"
+CHANNEL_VISION = "channel.vision"
+CODE_PARSE = "code.general.parse"
+ROUTING = "routing.general"
+
+
+def modality_prompt_component() -> PromptComponent:
+    """The assertion-modality rule as one extraction component.
+
+    The classifier identity a modality stamp names is this component's
+    ``name@digest``, and the standalone regeneration classifier
+    runs this same component, so a regenerated claim and a freshly extracted
+    one carry one identity while the rule text is unchanged.
+    """
+    return PromptComponent(PROMPT_MODALITY, _MODALITY_RULE, _MODALITY_SCHEMA_FIELD)
+
+
+def extract_prompt_components(
+    *,
+    scope_enabled: bool,
+    modality_enabled: bool,
+    polarity_enabled: bool = False,
+    stance_enabled: bool = False,
+    validity_enabled: bool = False,
+    structure_enabled: bool = False,
+    tool_turns_present: bool = False,
+    context_present: bool = False,
+) -> list[PromptComponent]:
+    """The components of one extraction prompt, in prompt order.
+
+    The single table the prompt is assembled from (:func:`_build_extract_prompt`)
+    and the extraction records as exercised (:func:`_build_llm_request`), so a
+    component's name cannot drift from its text. Each optional rule is one
+    component carrying both its rule text and its JSON-schema field; the output
+    schema is the last component (see :func:`assemble_prompt`).
+    """
+    table: list[PromptComponent | None] = [
+        PromptComponent(PROMPT_RULES, _EXTRACT_RULES),
+        PromptComponent(PROMPT_REFERENCE, REFERENCE_RULE),
+        PromptComponent(PROMPT_SCOPE, _SCOPE_RULE, _SCOPE_SCHEMA_FIELD) if scope_enabled else None,
+        modality_prompt_component() if modality_enabled else None,
+        PromptComponent(PROMPT_POLARITY, _POLARITY_RULE, _POLARITY_SCHEMA_FIELD)
+        if polarity_enabled
+        else None,
+        PromptComponent(PROMPT_STANCE, _STANCE_RULE, _STANCE_SCHEMA_FIELD)
+        if stance_enabled
+        else None,
+        PromptComponent(PROMPT_VALIDITY, _VALIDITY_RULE, _VALIDITY_SCHEMA_FIELD)
+        if validity_enabled
+        else PromptComponent(PROMPT_REFERENCE_DATE, _REFERENCE_DATE_RULE),
+        PromptComponent(PROMPT_STRUCTURE, _STRUCTURE_RULE, _STRUCTURE_SCHEMA_FIELD)
+        if structure_enabled
+        else None,
+        # only when the source actually carries a tool turn, so
+        # every other prompt is byte-for-byte unchanged.
+        PromptComponent(PROMPT_TOOL_TURNS, TOOL_TURN_RULE) if tool_turns_present else None,
+        # only on a delta read with a context section.
+        PromptComponent(PROMPT_APPEND_CONTEXT, APPEND_CONTEXT_RULE) if context_present else None,
+        PromptComponent(PROMPT_SCHEMA, _EXTRACT_SCHEMA_HEAD, _EXTRACT_SCHEMA_TAIL),
+    ]
+    return [component for component in table if component is not None]
 
 
 def _build_extract_prompt(
@@ -408,8 +577,9 @@ def _build_extract_prompt(
     validity_enabled: bool = False,
     structure_enabled: bool = False,
     tool_turns_present: bool = False,
+    context_present: bool = False,
 ) -> str:
-    """Assemble the extraction prompt.
+    """Assemble the extraction prompt from :func:`extract_prompt_components`.
 
     When ``scope_enabled``, the document-scope rule and ``scope``
     JSON field are woven in; when ``modality_enabled``, the
@@ -419,35 +589,201 @@ def _build_extract_prompt(
     ``validity_enabled``, the event-anchored validity rule and the
     ``valid_until`` / ``validity_confidence`` / ``validity_basis`` fields; when
     ``structure_enabled``, the S-P-O annotation rule and the
-    ``structured_claim`` field. With all disabled the prompt is byte-for-byte
-    the pre-0.6.0 prompt, so disabling any feature is fully inert.
+    ``structured_claim`` field. Disabling any feature removes exactly its rule
+    and field. The reference-resolution rule (0.16.0) is always present.
 
-    The validity rule carries a ``{reference_date}`` placeholder that
-    :func:`_call_llm` substitutes per call (the source's publication instant or
-    the extraction wall-clock); the substitution uses ``str.replace`` — never
-    ``str.format`` — because the JSON schema block contains literal braces.
+    The prompt always carries a ``{reference_date}`` placeholder, in the
+    validity rule when it is on and in ``_REFERENCE_DATE_RULE`` otherwise, so
+    relative time in a claim can be resolved either way. :func:`_call_llm`
+    substitutes it per call (the source's publication instant or the extraction
+    wall-clock); the substitution uses ``str.replace`` — never ``str.format`` —
+    because the JSON schema block contains literal braces.
     """
-    rules = (
-        _EXTRACT_RULES
-        + (_SCOPE_RULE if scope_enabled else "")
-        + (_MODALITY_RULE if modality_enabled else "")
-        + (_POLARITY_RULE if polarity_enabled else "")
-        + (_STANCE_RULE if stance_enabled else "")
-        + (_VALIDITY_RULE if validity_enabled else "")
-        + (_STRUCTURE_RULE if structure_enabled else "")
-        # only when the source actually carries a tool turn, so
-        # every other prompt is byte-for-byte unchanged.
-        + (TOOL_TURN_RULE if tool_turns_present else "")
+    return assemble_prompt(
+        extract_prompt_components(
+            scope_enabled=scope_enabled,
+            modality_enabled=modality_enabled,
+            polarity_enabled=polarity_enabled,
+            stance_enabled=stance_enabled,
+            validity_enabled=validity_enabled,
+            structure_enabled=structure_enabled,
+            tool_turns_present=tool_turns_present,
+            context_present=context_present,
+        )
     )
-    optional_fields = (
-        (_SCOPE_SCHEMA_FIELD if scope_enabled else "")
-        + (_MODALITY_SCHEMA_FIELD if modality_enabled else "")
-        + (_POLARITY_SCHEMA_FIELD if polarity_enabled else "")
-        + (_STANCE_SCHEMA_FIELD if stance_enabled else "")
-        + (_VALIDITY_SCHEMA_FIELD if validity_enabled else "")
-        + (_STRUCTURE_SCHEMA_FIELD if structure_enabled else "")
+
+
+def _configured_prompt_components(
+    *, tool_turns_present: bool = False, context_present: bool = False
+) -> list[PromptComponent]:
+    """:func:`extract_prompt_components` under the current config."""
+    cfg = get_config()
+    return extract_prompt_components(
+        scope_enabled=cfg.extraction_scope.enabled,
+        modality_enabled=cfg.extraction_modality.enabled,
+        polarity_enabled=cfg.extraction_polarity.enabled,
+        stance_enabled=cfg.extraction_stance.enabled,
+        validity_enabled=cfg.extraction_validity.enabled,
+        structure_enabled=cfg.structured_claim.enabled,
+        tool_turns_present=tool_turns_present,
+        context_present=context_present,
     )
-    return rules + (_EXTRACT_SCHEMA % optional_fields)
+
+
+def path_component_digests() -> dict[str, str]:
+    """The digest of each extraction path and of the vision channel, under current config.
+
+    A path's text is the settings that decide what the model is shown on it
+    (where chunks break, how much context a delta carries, which PDF pages are
+    read); the vision channel's is the settings that decide which pages go to
+    the vision provider and at what resolution. A change to one re-digests
+    that path only.
+    """
+    ext = get_config().extraction
+    vision = get_config().extraction_vision
+    return {
+        PATH_SINGLE_PASS: component_digest("single_pass", f"html_chunk_size={ext.html_chunk_size}"),
+        PATH_CHUNKED: component_digest(
+            "paragraph_chunks",
+            f"html_chunk_size={ext.html_chunk_size}",
+            f"html_chunk_overlap_lines={ext.html_chunk_overlap_lines}",
+            f"max_llm_calls_per_source={ext.max_llm_calls_per_source}",
+        ),
+        PATH_APPEND_DELTA: component_digest(
+            "append_delta",
+            f"append_context_chars={ext.append_context_chars}",
+            f"append_chunk_chars={ext.append_chunk_chars}",
+            f"max_llm_calls_per_source={ext.max_llm_calls_per_source}",
+        ),
+        PATH_PDF_PAGES: component_digest(
+            "pdf_pages",
+            f"pdf_page_overlap_lines={ext.pdf_page_overlap_lines}",
+            f"max_pdf_pages={ext.max_pdf_pages}",
+            f"max_pdf_page_chars={ext.max_pdf_page_chars}",
+        ),
+        PATH_IMAGE: component_digest("image", f"max_image_bytes={ext.max_image_bytes}"),
+        CHANNEL_VISION: component_digest(
+            "vision",
+            f"trigger={vision.trigger}",
+            f"low_text_threshold={vision.low_text_threshold}",
+            f"render_dpi={vision.render_dpi}",
+            f"max_pages={vision.max_pages}",
+        ),
+    }
+
+
+def source_text(obj: object) -> str:
+    """The source of a function or module, for a code component's digest.
+
+    Falls back to a text that changes with every ``EXTRACTOR_VERSION`` when no
+    source is shipped, so the component then reads as changed on every bump:
+    the safe direction.
+    """
+    try:
+        return inspect.getsource(obj)  # type: ignore[arg-type]
+    except (OSError, TypeError):
+        return f"no-source:{EXTRACTOR_VERSION}"
+
+
+@functools.cache
+def _parse_code_texts() -> tuple[str, ...]:
+    """The source of everything between the model's reply and the stored claim.
+
+    Read once per process: source does not change while it runs. Named
+    functions rather than this whole module, because the module also holds the
+    prompt text, and a prompt edit must change only its own component.
+    """
+    functions = (
+        extraction_text,
+        content_to_text,
+        _strip_obsidian_frontmatter,
+        mark_tool_turns,
+        _finish_llm_reply,
+        _parse_extraction_response,
+        _parse_extraction_reply,
+        _gate_valid_until,
+        _drop_session_state_candidates,
+        candidate_to_particle,
+    )
+    modules = (_polarity_module, _scope_module, _session_state_module, _structure_module)
+    return tuple(source_text(f) for f in (*functions, *modules))
+
+
+def parse_component_digest() -> str:
+    """The digest of the general extractor's reply-to-claim code and its config.
+
+    Exercised by every extraction call, and on every extraction's ``always``
+    list, so a change to how a reply becomes a claim (a parser rule, the
+    confidence clamp, a filter, a classifier's config) selects every snapshot
+    the general extractor made. Over-selecting is the price of not having to
+    name which snapshots a parser change reaches.
+    """
+    cfg = get_config()
+    return component_digest(
+        *_parse_code_texts(),
+        f"confidence_clamp={_CONFIDENCE_FLOOR},{_CONFIDENCE_CEILING}",
+        *(
+            section.model_dump_json()
+            for section in (
+                cfg.extraction_scope,
+                cfg.extraction_modality,
+                cfg.extraction_polarity,
+                cfg.extraction_stance,
+                cfg.extraction_validity,
+                cfg.structured_claim,
+            )
+        ),
+    )
+
+
+def routing_component_digest() -> str:
+    """The digest of the settings that decide which source-dependent components a source gets.
+
+    Which source types get the tool-turn marker or the working-state filter,
+    whether an append-only snapshot is read as a delta, where the chunking
+    threshold sits, whether a PDF page may go to the vision provider. A record
+    cannot say whether a source it never routed somewhere would go there now,
+    so a change here selects every snapshot.
+    """
+    ext = get_config().extraction
+    vision = get_config().extraction_vision
+    return component_digest(
+        "tool_turn_source_types=" + ",".join(sorted(ext.tool_turn_source_types)),
+        "session_state_source_types=" + ",".join(sorted(ext.session_state_source_types)),
+        f"append_only_delta={ext.append_only_delta}",
+        f"html_chunk_size={ext.html_chunk_size}",
+        f"vision_enabled={vision.enabled}",
+        f"vision_trigger={vision.trigger}",
+    )
+
+
+def _record_path(name: str) -> None:
+    """Record the extraction path (or the vision channel) this extraction took."""
+    record_component(name, path_component_digests()[name])
+
+
+def general_component_table() -> ComponentTable:
+    """Every component the general extractor could exercise under the current config.
+
+    ``always`` is the prompt every extraction sends (the core rules, the
+    reference rule, each config-enabled rule, the output schema), the
+    reply-to-claim code (:func:`parse_component_digest`) and the routing
+    settings (:func:`routing_component_digest`). The tool-turn and
+    append-context rules, the paths and the vision channel depend on the source
+    and are in the table but not in ``always``.
+    """
+    base = _configured_prompt_components()
+    gated = [
+        c
+        for c in _configured_prompt_components(tool_turns_present=True, context_present=True)
+        if c.name not in {b.name for b in base}
+    ]
+    digests = {c.name: c.digest for c in [*base, *gated]}
+    digests.update(path_component_digests())
+    digests[CODE_PARSE] = parse_component_digest()
+    digests[ROUTING] = routing_component_digest()
+    always = {c.name for c in base} | {CODE_PARSE, ROUTING}
+    return ComponentTable(digests=digests, always=frozenset(always))
 
 
 def _extraction_response_schema(
@@ -581,6 +917,11 @@ class CandidateParticle:
     properties: dict[str, object] | None = None
     subject_classes: dict[str, str] = field(default_factory=dict)
     external_refs: dict[str, ExternalRef] = field(default_factory=dict)
+    # subject name → non-entity gate class, for the names the gate
+    # kept as *qualified* (scoped by the source's project) rather than
+    # suppressed. Written by the gate in the Engine pipeline, never by an
+    # extractor; empty on every candidate the gate did not qualify.
+    qualified_subjects: dict[str, str] = field(default_factory=dict)
     # SHA-256 of the LLM-prompt text that produced this candidate.
     # Set by ``extract_with_carry_forward``; passed through to the
     # ``SOURCE`` ProvenanceRef so the next re-extraction can carry the
@@ -629,6 +970,27 @@ class PageStat:
     candidate_count: int
 
 
+ChunkStatus = Literal["carried", "answered", "failed", "capped"]
+
+
+@dataclass
+class ChunkOutcome:
+    """What happened to one chunk of a chunked read, in chunk order.
+
+    ``status`` is ``carried`` (skipped by carry-forward, its claims already
+    exist), ``answered`` (the model replied), ``failed`` (a transient failure)
+    or ``capped`` (skipped at ``max_llm_calls_per_source``). ``start`` is the
+    chunk's position in the text the read cut it from: the extraction text for
+    a delta chunk, the normalised text for a whole read's. The pipeline uses
+    the outcomes to decide what a partly failed read keeps.
+    """
+
+    chunk_id: str
+    prompt_hash: str
+    status: ChunkStatus
+    start: int | None = None
+
+
 @dataclass
 class ExtractionResult:
     """The complete output of one extractor run.
@@ -648,15 +1010,67 @@ class ExtractionResult:
     # *structurally*, never by string-matching ``quality_notes`` (whose
     # "API error: …" text the chunked/PDF paths prefix with chunk/page labels —
     # the F4.1 silent-loss bug). >0 ⇒ ``extract_snapshot`` resets the snapshot
-    # to PENDING for ``extract --all-pending`` retry; carry-forward dedupes
-    # already-succeeded chunks cheaply on the retry.
+    # to PENDING for ``extract --all-pending`` retry and writes nothing from the
+    # pass, so the retry sends every call again: carry-forward cannot
+    # skip a chunk whose claims were never written.
     transient_error_count: int = 0
+    # Count of LLM calls (per chunk or per page) that answered, on the paths
+    # that make more than one call. When the pass also had a transient failure,
+    # these are the calls a retry sends, and pays for, a second time.
+    answered_calls: int = 0
     # IDs of existing ACTIVE particles eligible for carry-forward.
     # Populated by ``extract_with_carry_forward`` when a chunk's text hashes
     # match an existing particle's recorded ``chunk_hash``. The reindex
     # operation reads this list and excludes the named particles from
     # supersession.
     carry_forward_ids: list[str] = field(default_factory=list)
+    # ``chunk_id`` of every chunk ``extract_with_carry_forward`` skipped at the
+    # ``max_llm_calls`` cap (``CHUNK_TRUNCATION``), in chunk order.
+    unread_chunk_ids: list[str] = field(default_factory=list)
+    # where the read stopped, in characters of the extraction
+    # text (:func:`extraction_text`), when it stopped short of the end: the
+    # start of the first chunk the call cap skipped. ``None`` when the read
+    # reached the end, the common case. The pipeline turns it into the
+    # snapshot's ``extracted_through`` byte offset.
+    read_through: int | None = None
+    # the snapshot was read as a delta after the prefix the
+    # pipeline handed over (``append_prefix``).
+    append_delta: bool = False
+    # why a handed-over prefix was not used, when it was not.
+    # The extraction then ran as a whole read.
+    append_fallback: str | None = None
+    # one outcome per chunk of a chunked read, in chunk order,
+    # with each chunk's start once the extractor fills it in. Empty for a
+    # single-call read and for every path that does not chunk through
+    # ``extract_with_carry_forward``.
+    chunk_outcomes: list[ChunkOutcome] = field(default_factory=list)
+
+
+def extraction_text(content: bytes, *, is_markdown: bool, mark_tools: bool) -> tuple[str, int]:
+    """The text the general extractor reads from ``content``, and its tool-turn count.
+
+    ``content_to_text``, then the Obsidian frontmatter strip for a Markdown
+    source, then tool-turn marking for a transcript. One
+    function so the extractor and the pipeline decode alike: the delta read
+    compares a prefix decoded here with the whole snapshot decoded
+    here, and maps a stop point in this text back to raw bytes.
+    """
+    text = content_to_text(content)
+    if is_markdown:
+        _, text = _strip_obsidian_frontmatter(text)
+    tool_turns = 0
+    if mark_tools:
+        text, tool_turns = mark_tool_turns(text)
+    return text, tool_turns
+
+
+def source_text_flags(source_type: object) -> tuple[bool, bool]:
+    """``(is_markdown, mark_tools)`` for a source type, as the general extractor reads it."""
+    is_markdown = isinstance(source_type, str) and source_type == "LOCAL_MARKDOWN"
+    mark_tools = isinstance(source_type, str) and (
+        source_type in get_config().extraction.tool_turn_source_types
+    )
+    return is_markdown, mark_tools
 
 
 @dataclass
@@ -764,24 +1178,34 @@ class GeneralExtractor:
         # ``_call_llm``). Threaded down so every LLM path resolves relative dates
         # against the same instant.
         reference_published_at = snapshot.content_published_at
+        # the raw prefix of an APPEND_ONLY snapshot the store has
+        # already extracted, handed over by the pipeline. Only the text paths
+        # read a delta; a binary source says why it did not.
+        prefix_obj = kwargs.get("append_prefix")
+        append_prefix: bytes | None = prefix_obj if isinstance(prefix_obj, bytes) else None
+        # what this extractor could exercise, so a later table can
+        # tell a component this snapshot skipped from one it never knew.
+        declare_components(general_component_table())
+        record_component(ROUTING, routing_component_digest())
         if content.startswith(b"%PDF"):
-            return await self._extract_pdf_paged(
+            _record_path(PATH_PDF_PAGES)
+            result = await self._extract_pdf_paged(
                 content,
                 reference_published_at=reference_published_at,
                 completion_pool=completion_pool,
             )
+            return _binary_fallback(result, append_prefix)
         image_media_type = sniff_image_media_type(content)
         if image_media_type is not None:
-            return await self._extract_image(
+            _record_path(PATH_IMAGE)
+            result = await self._extract_image(
                 content, image_media_type, reference_published_at=reference_published_at
             )
+            return _binary_fallback(result, append_prefix)
         source_type = kwargs.get("source_type")
-        is_markdown = isinstance(source_type, str) and source_type == "LOCAL_MARKDOWN"
         # a transcript's tool turns are relabelled before the model
         # sees them, so tool output is never extracted as the speaker's fact.
-        mark_tools = isinstance(source_type, str) and (
-            source_type in get_config().extraction.tool_turn_source_types
-        )
+        is_markdown, mark_tools = source_text_flags(source_type)
         session_obj = kwargs.get("session")
         session: AsyncSession | None = session_obj if isinstance(session_obj, _Session) else None
         entry_obj = kwargs.get("corpus_entry_id")
@@ -790,7 +1214,14 @@ class GeneralExtractor:
         # marked particles as absent (see extract_with_carry_forward).
         sup_obj = kwargs.get("supersede_ids")
         supersede_ids: frozenset[str] = sup_obj if isinstance(sup_obj, frozenset) else frozenset()
-        return await self._extract_single_pass(
+        # on a partial read's retry, the chunk hashes this
+        # snapshot's own claims carry, which carry-forward skips whatever
+        # extractor version wrote them.
+        resume_obj = kwargs.get("resume_carried")
+        resume_carried: Mapping[str, Sequence[str]] | None = (
+            resume_obj if isinstance(resume_obj, Mapping) else None
+        )
+        result = await self._extract_single_pass(
             content,
             is_markdown=is_markdown,
             mark_tools=mark_tools,
@@ -798,8 +1229,18 @@ class GeneralExtractor:
             corpus_entry_id=corpus_entry_id,
             reference_published_at=reference_published_at,
             completion_pool=completion_pool,
+            resume_carried=resume_carried,
             supersede_ids=supersede_ids,
+            append_prefix=append_prefix,
         )
+        # An agent session's worktree / cwd / branch is true for minutes, never
+        # a durable belief. Filtered here, after every text path returns, so
+        # the single-pass, chunked, and pooled routes are all covered.
+        if isinstance(source_type, str) and (
+            source_type in get_config().extraction.session_state_source_types
+        ):
+            _drop_session_state_candidates(result, content)
+        return result
 
     async def _extract_single_pass(
         self,
@@ -812,6 +1253,8 @@ class GeneralExtractor:
         reference_published_at: datetime | None = None,
         completion_pool: CompletionPool | None = None,
         supersede_ids: frozenset[str] = frozenset(),
+        append_prefix: bytes | None = None,
+        resume_carried: Mapping[str, Sequence[str]] | None = None,
     ) -> ExtractionResult:
         """Single LLM call for non-PDF sources.
 
@@ -820,25 +1263,71 @@ class GeneralExtractor:
         (``---\\nkey: value\\n---\\n``) is stripped from the decoded text
         before extraction so the LLM doesn't manufacture "the source has
         a `tags` field" claims from metadata noise.
-        """
-        cfg = get_config().extraction
 
+        With ``append_prefix`` the text after the decoded prefix
+        is read as a delta, on either side of the chunk threshold; a prefix
+        whose decoding does not prefix this text falls back to the whole read.
+        """
         try:
-            text = content_to_text(content)
+            text, tool_turns = extraction_text(
+                content, is_markdown=is_markdown, mark_tools=mark_tools
+            )
         except Exception as exc:
             return ExtractionResult(quality_notes=[f"Decode error: {exc}"])
 
-        if is_markdown:
-            _, text = _strip_obsidian_frontmatter(text)
+        fallback: str | None = None
+        if append_prefix is not None:
+            from particles.extraction.append_delta import decoded_prefix_length
 
-        tool_turns = 0
-        if mark_tools:
-            text, tool_turns = mark_tool_turns(text)
+            prefix_len, fallback = decoded_prefix_length(
+                append_prefix, text, is_markdown=is_markdown, mark_tools=mark_tools
+            )
+            if prefix_len is not None:
+                return await self._extract_append_delta(
+                    text,
+                    prefix_len,
+                    tool_turns=tool_turns,
+                    session=session,
+                    corpus_entry_id=corpus_entry_id,
+                    reference_published_at=reference_published_at,
+                    completion_pool=completion_pool,
+                    supersede_ids=supersede_ids,
+                    resume_carried=resume_carried,
+                )
 
         if not text.strip():
-            return ExtractionResult(quality_notes=["Empty content"])
+            return ExtractionResult(quality_notes=["Empty content"], append_fallback=fallback)
+
+        result = await self._extract_whole(
+            text,
+            tool_turns=tool_turns,
+            session=session,
+            corpus_entry_id=corpus_entry_id,
+            reference_published_at=reference_published_at,
+            completion_pool=completion_pool,
+            supersede_ids=supersede_ids,
+            resume_carried=resume_carried,
+        )
+        result.append_fallback = fallback
+        return result
+
+    async def _extract_whole(
+        self,
+        text: str,
+        *,
+        tool_turns: int,
+        session: AsyncSession | None,
+        corpus_entry_id: str | None,
+        reference_published_at: datetime | None,
+        completion_pool: CompletionPool | None,
+        supersede_ids: frozenset[str],
+        resume_carried: Mapping[str, Sequence[str]] | None = None,
+    ) -> ExtractionResult:
+        """Today's whole read of ``text``: one call, or chunks above the threshold."""
+        cfg = get_config().extraction
 
         if len(text) > cfg.html_chunk_size:
+            _record_path(PATH_CHUNKED)
             return await self._extract_html_chunked(
                 text,
                 session=session,
@@ -846,8 +1335,11 @@ class GeneralExtractor:
                 reference_published_at=reference_published_at,
                 completion_pool=completion_pool,
                 supersede_ids=supersede_ids,
+                tool_turns=tool_turns,
+                resume_carried=resume_carried,
             )
 
+        _record_path(PATH_SINGLE_PASS)
         log.info("Sending %d characters to extractor model", len(text))
         log.debug("Source text (first 500 chars):\n%s", text[:500])
         if completion_pool is not None:
@@ -859,8 +1351,7 @@ class GeneralExtractor:
                 reference_published_at=reference_published_at,
                 tool_turns_present=tool_turns > 0,
             )
-            results, provider_model = await _pooled_group_complete(completion_pool, [planned])
-            candidates, notes, transient = _finish_llm_call(results[0], provider_model, None)
+            [(candidates, notes, transient)] = await _pooled_extract(completion_pool, [planned])
         # pass the anchor only when set, so the no-anchor call is
         # byte-identical to the pre-0197 signature (see _extract_html_chunked).
         elif reference_published_at is not None:
@@ -890,6 +1381,8 @@ class GeneralExtractor:
         reference_published_at: datetime | None = None,
         completion_pool: CompletionPool | None = None,
         supersede_ids: frozenset[str] = frozenset(),
+        tool_turns: int = 0,
+        resume_carried: Mapping[str, Sequence[str]] | None = None,
     ) -> ExtractionResult:
         """Paragraph-chunked HTML extraction with carry-forward.
 
@@ -905,6 +1398,10 @@ class GeneralExtractor:
         ``session`` and ``corpus_entry_id`` are threaded through from the
         pipeline. When either is None (unit tests driving the extractor
         directly), the helper degrades to a plain per-chunk LLM loop.
+
+        ``tool_turns`` is the count :func:`mark_tool_turns` relabelled in
+        ``text``; when non-zero each chunk carrying a relabelled turn gets the
+        tool-turn rule, as the single-pass call does.
         """
         # Deferred import: incremental imports CandidateParticle from this
         # module; hoisting would create a cycle (legitimate case 1).
@@ -940,13 +1437,100 @@ class GeneralExtractor:
             reference_published_at=reference_published_at,
             completion_pool=completion_pool,
             supersede_ids=supersede_ids,
+            tool_turns_present=tool_turns > 0,
+            resume_carried=resume_carried,
         )
-        result.page_stats = _synthesise_html_page_stats(chunks, result)
-        for stat in result.page_stats:
-            if stat.candidate_count == 0:
-                result.quality_notes.append(
-                    f"ZERO_PAGE_YIELD: chunk {stat.page_number} produced 0 particles"
-                )
+        if tool_turns:
+            # Same disclosure as the single-pass branch.
+            result.quality_notes.append(f"tool output: {tool_turns} turn(s) marked unverified")
+        # a read cut at the call cap stopped where the first
+        # skipped chunk starts. The chunks are cut from the normalised text,
+        # which only ever deletes characters from ``text``, so an offset in it
+        # is a lower bound on the same point in ``text``: the next read may
+        # re-read a few characters, and never skips any.
+        spans = paragraph_spans(normalised, cfg.html_chunk_size)
+        if result.unread_chunk_ids:
+            first = next(i for i, c in enumerate(chunks) if c.chunk_id in result.unread_chunk_ids)
+            result.read_through = spans[first][0]
+        # each chunk's start, in the normalised text it was cut
+        # from, so the pipeline can place a partly failed read's stop.
+        _set_outcome_starts(result, [start for start, _ in spans])
+        _finish_chunk_stats(chunks, result)
+        return result
+
+    async def _extract_append_delta(
+        self,
+        text: str,
+        prefix_len: int,
+        *,
+        tool_turns: int,
+        session: AsyncSession | None,
+        corpus_entry_id: str | None,
+        reference_published_at: datetime | None,
+        completion_pool: CompletionPool | None,
+        supersede_ids: frozenset[str],
+        resume_carried: Mapping[str, Sequence[str]] | None = None,
+    ) -> ExtractionResult:
+        """Read only ``text[prefix_len:]``, the delta, with context before it.
+
+        The delta is split on paragraph boundaries into chunks of at most
+        ``extraction.append_chunk_chars``. Each chunk carries a labelled context
+        section: the last ``extraction.append_context_chars`` of the text
+        before the delta for the first chunk, the end of the chunk before it
+        for every later one, cut back to a paragraph boundary. The chunks go
+        through :func:`extract_with_carry_forward`, so the call cap, the
+        pooled path and carry-forward within the delta behave as on
+        a whole read; each chunk hash covers its context too.
+        """
+        from particles.extraction.append_delta import plan_delta_chunks
+        from particles.extraction.incremental import ChunkUnit, extract_with_carry_forward
+
+        _record_path(PATH_APPEND_DELTA)
+
+        cfg = get_config().extraction
+        planned = plan_delta_chunks(
+            text,
+            prefix_len,
+            chunk_chars=cfg.append_chunk_chars,
+            context_chars=cfg.append_context_chars,
+        )
+        chunks = [
+            ChunkUnit(chunk_id=f"delta_{i}", chunk_text=p.text, context=p.context)
+            for i, p in enumerate(planned, start=1)
+        ]
+        log.info(
+            "GeneralExtractor: append-only delta of %d chars after %d already read, %d chunk(s)",
+            len(text) - prefix_len,
+            prefix_len,
+            len(chunks),
+        )
+        if not chunks:
+            return ExtractionResult(
+                quality_notes=["append-only delta: no new text since the base"],
+                append_delta=True,
+            )
+        # Tool turns are counted over the whole text; a chunk gets the rule only
+        # when its own text or context carries a relabelled turn.
+        result = await extract_with_carry_forward(
+            session=session,
+            chunks=chunks,
+            corpus_entry_id=corpus_entry_id,
+            extractor_id=EXTRACTOR_ID,
+            extractor_version=EXTRACTOR_VERSION,
+            max_llm_calls=cfg.max_llm_calls_per_source,
+            reference_published_at=reference_published_at,
+            completion_pool=completion_pool,
+            supersede_ids=supersede_ids,
+            tool_turns_present=tool_turns > 0,
+            resume_carried=resume_carried,
+        )
+        result.append_delta = True
+        if result.unread_chunk_ids:
+            first = next(i for i, c in enumerate(chunks) if c.chunk_id in result.unread_chunk_ids)
+            result.read_through = planned[first].start
+        # each chunk's start, in the extraction text.
+        _set_outcome_starts(result, [p.start for p in planned])
+        _finish_chunk_stats(chunks, result)
         return result
 
     async def _extract_pdf_paged(
@@ -1019,6 +1603,7 @@ class GeneralExtractor:
                 max_pages,
             )
         transient_errors = 0
+        answered_calls = 0
         prev_tail: list[str] = []
         started = time.monotonic()
 
@@ -1107,6 +1692,8 @@ class GeneralExtractor:
 
             if transient:
                 transient_errors += 1
+            else:
+                answered_calls += 1
             if count == 0:
                 all_notes.append(f"ZERO_PAGE_YIELD: page {page_num} produced 0 particles")
             if notes:
@@ -1128,6 +1715,7 @@ class GeneralExtractor:
             quality_notes=all_notes,
             page_stats=page_stats,
             transient_error_count=transient_errors,
+            answered_calls=answered_calls,
         )
 
     async def _extract_pdf_paged_pooled(
@@ -1285,10 +1873,10 @@ class GeneralExtractor:
             _build_llm_request(p.context, reference_published_at=reference_published_at)
             for p in text_plans
         ]
-        results, provider_model = await _pooled_group_complete(completion_pool, planned_calls)
-        outcome: dict[int, tuple[list[CandidateParticle], list[str], bool]] = {}
-        for plan, raw in zip(text_plans, results, strict=True):
-            outcome[plan.page_number] = _finish_llm_call(raw, provider_model, None)
+        settled = await _pooled_extract(completion_pool, planned_calls)
+        outcome: dict[int, tuple[list[CandidateParticle], list[str], bool]] = {
+            plan.page_number: reply for plan, reply in zip(text_plans, settled, strict=True)
+        }
         for plan in (p for p in plans if not p.skipped and p.images is not None):
             if reference_published_at is not None:
                 outcome[plan.page_number] = await _call_llm(
@@ -1303,6 +1891,7 @@ class GeneralExtractor:
         page_stats: list[PageStat] = []
         all_notes: list[str] = list(head_notes)
         transient_errors = 0
+        answered_calls = 0
         for plan in plans:
             all_notes.extend(plan.parse_notes)
             if plan.skipped:
@@ -1312,6 +1901,8 @@ class GeneralExtractor:
             count = len(candidates)
             if transient:
                 transient_errors += 1
+            else:
+                answered_calls += 1
             if count == 0:
                 all_notes.append(f"ZERO_PAGE_YIELD: page {plan.page_number} produced 0 particles")
             if notes:
@@ -1326,6 +1917,7 @@ class GeneralExtractor:
             quality_notes=all_notes,
             page_stats=page_stats,
             transient_error_count=transient_errors,
+            answered_calls=answered_calls,
         )
 
     async def _extract_image(
@@ -1372,6 +1964,22 @@ class GeneralExtractor:
         )
 
 
+def _drop_session_state_candidates(result: ExtractionResult, content: bytes) -> None:
+    """Remove momentary session-state claims from ``result`` in place.
+
+    Worktree names are read from the raw source bytes, so a kept claim loses a
+    subject named after a worktree even when no dropped claim spelled its path.
+    """
+    filtered = drop_session_state(result.candidates, content.decode("utf-8", errors="replace"))
+    result.candidates = filtered.candidates
+    if filtered.dropped or filtered.subjects_stripped:
+        # Never silent (the disclosure habit).
+        result.quality_notes.append(
+            f"session state: {filtered.dropped} claim(s) dropped,"
+            f" {filtered.subjects_stripped} worktree subject(s) stripped"
+        )
+
+
 def _split_into_chunks(text: str, size: int, overlap_lines: int) -> list[str]:
     """Split text into size-character chunks, breaking at line boundaries.
 
@@ -1413,15 +2021,23 @@ def _split_into_paragraph_chunks(text: str, size: int) -> list[str]:
     chunker, no overlap is prepended: paragraphs are the unit of extraction,
     and overlap would double-hash the same text and defeat carry-forward.
     """
-    chunks: list[str] = []
+    return [text[start:end] for start, end in paragraph_spans(text, size)]
+
+
+def paragraph_spans(text: str, size: int) -> list[tuple[int, int]]:
+    """The ``[start, end)`` spans :func:`_split_into_paragraph_chunks` cuts.
+
+    Each span is its chunk's position in ``text``, whitespace already trimmed,
+    so ``text[start:end]`` is the chunk byte for byte. The delta read
+    needs the positions, not only the texts, to know where a read stopped.
+    """
+    spans: list[tuple[int, int]] = []
     start = 0
     n = len(text)
     while start < n:
         remaining = n - start
         if remaining <= size:
-            tail = text[start:].strip()
-            if tail:
-                chunks.append(tail)
+            _append_trimmed_span(spans, text, start, n)
             break
         window_end = start + size
         # Prefer the last paragraph break inside the window.
@@ -1429,22 +2045,29 @@ def _split_into_paragraph_chunks(text: str, size: int) -> list[str]:
         advance: int
         if cut > start:
             advance = (cut + 2) - start  # skip the "\n\n" separator
-            chunk = text[start:cut]
+            end = cut
         else:
             # Fall back to the last line break.
             nl = text.rfind("\n", start, window_end)
             if nl > start:
                 advance = (nl + 1) - start
-                chunk = text[start:nl]
+                end = nl
             else:
                 # Hard cut.
                 advance = size
-                chunk = text[start:window_end]
-        chunk = chunk.strip()
-        if chunk:
-            chunks.append(chunk)
+                end = window_end
+        _append_trimmed_span(spans, text, start, end)
         start += advance
-    return chunks
+    return spans
+
+
+def _append_trimmed_span(spans: list[tuple[int, int]], text: str, start: int, end: int) -> None:
+    """Append ``text[start:end]`` with its surrounding whitespace trimmed, if any is left."""
+    segment = text[start:end]
+    body = segment.strip()
+    if body:
+        lead = len(segment) - len(segment.lstrip())
+        spans.append((start + lead, start + lead + len(body)))
 
 
 # Patterns intentionally narrow: only remove what is provably cosmetic and
@@ -1484,17 +2107,45 @@ def _synthesise_html_page_stats(
     one row per chunk, so we synthesise the stats post-hoc by attributing
     each candidate back to the chunk whose hash it carries.
     """
-    import hashlib
-
     by_hash: dict[str, int] = {}
     for c in result.candidates:
         if c.chunk_hash:
             by_hash[c.chunk_hash] = by_hash.get(c.chunk_hash, 0) + 1
     stats: list[PageStat] = []
     for i, chunk in enumerate(chunks, start=1):
-        h = hashlib.sha256(chunk.chunk_text.encode("utf-8")).hexdigest()
-        stats.append(PageStat(page_number=i, candidate_count=by_hash.get(h, 0)))
+        stats.append(PageStat(page_number=i, candidate_count=by_hash.get(chunk.prompt_hash, 0)))
     return stats
+
+
+def _set_outcome_starts(result: ExtractionResult, starts: list[int]) -> None:
+    """Fill each chunk outcome's start, in chunk order.
+
+    The outcomes come from ``extract_with_carry_forward`` in the order of the
+    chunks it was handed, so they align with ``starts`` one to one. A count
+    that does not match (an injected caller that chunked differently) leaves
+    the starts unset, and the pipeline then keeps nothing from a failed read.
+    """
+    if len(result.chunk_outcomes) != len(starts):
+        return
+    for outcome, start in zip(result.chunk_outcomes, starts, strict=True):
+        outcome.start = start
+
+
+def _finish_chunk_stats(chunks: list[ChunkUnit], result: ExtractionResult) -> None:
+    """Attach per-chunk stats to a chunked result and note every chunk that yielded nothing."""
+    result.page_stats = _synthesise_html_page_stats(chunks, result)
+    for stat in result.page_stats:
+        if stat.candidate_count == 0:
+            result.quality_notes.append(
+                f"ZERO_PAGE_YIELD: chunk {stat.page_number} produced 0 particles"
+            )
+
+
+def _binary_fallback(result: ExtractionResult, append_prefix: bytes | None) -> ExtractionResult:
+    """Say why a binary source ignored a handed-over prefix (text paths only)."""
+    if append_prefix is not None:
+        result.append_fallback = "not a text source"
+    return result
 
 
 @dataclass
@@ -1532,43 +2183,52 @@ def _build_llm_request(
     *,
     reference_published_at: datetime | None = None,
     tool_turns_present: bool = False,
+    context: str | None = None,
 ) -> _PlannedLLMCall:
-    """Build one extraction request — the pre-network half of ``_call_llm``."""
-    from particles.llm import CompletionRequest, fenced_prompt
+    """Build one extraction request — the pre-network half of ``_call_llm``.
+
+    ``context`` is already-extracted text shown before ``text``
+    on a delta read: it rides the user turn as its own fenced section, and the
+    system turn gains :data:`APPEND_CONTEXT_RULE`. ``None`` leaves the request
+    exactly as before.
+    """
+    from particles.llm import (
+        CompletionRequest,
+        data_fence_instruction,
+        fence,
+        fenced_prompt,
+        make_nonce,
+    )
 
     cfg = get_config().extraction
     _cfg = get_config()
     validity_enabled = _cfg.extraction_validity.enabled
-    template = _build_extract_prompt(
-        scope_enabled=_cfg.extraction_scope.enabled,
-        modality_enabled=_cfg.extraction_modality.enabled,
-        polarity_enabled=_cfg.extraction_polarity.enabled,
-        stance_enabled=_cfg.extraction_stance.enabled,
-        validity_enabled=validity_enabled,
-        structure_enabled=_cfg.structured_claim.enabled,
-        tool_turns_present=tool_turns_present,
+    components = _configured_prompt_components(
+        tool_turns_present=tool_turns_present, context_present=context is not None
     )
-    # fill the validity rule's {reference_date} placeholder with the
-    # source's publication instant (or the extraction wall-clock) so the model
-    # resolves relative boundaries ("tomorrow") to absolute dates. ``str.replace``
-    # (not ``str.format``) — the JSON schema block carries literal braces. A
-    # no-op when validity is disabled (the placeholder is absent).
+    template = assemble_prompt(components)
+    # the one place the prompt is assembled is the one place its
+    # components are recorded, so the stamp names exactly what was sent.
+    record_prompt_components(components)
+    record_component(CODE_PARSE, parse_component_digest())
+    if images:
+        record_component(CHANNEL_VISION, path_component_digests()[CHANNEL_VISION])
+    # Fill the {reference_date} placeholder (the validity rule's, or
+    # _REFERENCE_DATE_RULE's when validity is off) with the source's publication
+    # instant (or the extraction wall-clock) so the model resolves relative time
+    # ("tomorrow", "last month") to absolute dates. ``str.replace`` (not
+    # ``str.format``) — the JSON schema block carries literal braces.
     #
     # prompt caching: the ~1.3k+-token instruction block repeats on
     # every extraction call in a run, so mark its invariant prefix as a cache
     # boundary. The reference_date is the ONE per-source-varying byte in the
     # instructions, so the boundary sits *before* it — everything after (the
     # date, the remaining rules, the schema) stays uncached, so a cache hit
-    # survives across sources. Validity off ⇒ the whole block is invariant and
-    # cached. ``cache_split`` is the offset into the (identical-up-to-here)
-    # system string where caching stops.
-    if validity_enabled and "{reference_date}" in template:
-        cache_split = template.index("{reference_date}")
-        anchor = reference_published_at or datetime.now(UTC)
-        instructions = template.replace("{reference_date}", anchor.date().isoformat())
-    else:
-        instructions = template
-        cache_split = len(instructions.rstrip())
+    # survives across sources. ``cache_split`` is the offset into the
+    # (identical-up-to-here) system string where caching stops.
+    cache_split = template.index("{reference_date}")
+    anchor = reference_published_at or datetime.now(UTC)
+    instructions = template.replace("{reference_date}", anchor.date().isoformat())
     # F3 hardening: the trusted rules/schema go in the ``system`` turn; the
     # untrusted decoded source (and, on the vision path, the rendered page) is
     # the ONLY thing in the user turn, wrapped in a per-call nonce fence so an
@@ -1578,7 +2238,14 @@ def _build_llm_request(
     # pooled sibling requests in one batch never share a fence.
     # The cache split is *within* the system turn,
     # so both halves stay trusted and F3 is unchanged.
-    system, user = fenced_prompt(instructions, text, label="source")
+    if context is None:
+        system, user = fenced_prompt(instructions, text, label="source")
+    else:
+        # Two untrusted segments share one nonce (the multi-segment form
+        # ``fenced_prompt`` documents): the context first, then the source.
+        nonce = make_nonce()
+        system = f"{instructions.rstrip()}\n\n{data_fence_instruction(nonce)}"
+        user = f"{fence(context, nonce, label='context')}\n\n{fence(text, nonce, label='source')}"
     cache_prefix = system[:cache_split] or None
     # the candidate-array schema rides along so a schema-enforcing
     # provider (LocalProvider structured output) can pin the reply shape.
@@ -1600,23 +2267,78 @@ def _build_llm_request(
     )
 
 
-def _finish_llm_call(
+#: The shape of one extraction reply, read off the parse (not off the adapter:
+#: the port returns text only). ``truncated`` is a reply cut at the output
+#: budget whose complete leading claims were salvaged; the claims after the cut
+#: are lost. ``unparsed`` is a reply that yielded no JSON array at all.
+ReplyShape = Literal["complete", "truncated", "unparsed"]
+
+
+@dataclass
+class ReplyTally:
+    """What the extraction replies of one pass did with their output budget.
+
+    Opened by :func:`tally_replies` around one snapshot's extraction and
+    filled at the completion seam, so the aggregating paths (single pass,
+    chunked, PDF pages) need no new plumbing. The first-run audit reads it to
+    tell a fully extracted file from one that was cut short.
+    """
+
+    truncated: int = 0
+    """Replies (after any retry) cut at the output budget: some claims were lost."""
+    retried: int = 0
+    """Replies re-issued once at ``extraction.retry_max_tokens``."""
+
+
+_REPLY_TALLY: ContextVar[ReplyTally | None] = ContextVar("particles_reply_tally", default=None)
+
+
+@contextlib.contextmanager
+def tally_replies() -> Iterator[ReplyTally]:
+    """Collect the :class:`ReplyTally` of every extraction reply in the block."""
+    tally = ReplyTally()
+    token = _REPLY_TALLY.set(tally)
+    try:
+        yield tally
+    finally:
+        _REPLY_TALLY.reset(token)
+
+
+def _record_reply(shape: ReplyShape, *, retried: bool = False) -> None:
+    tally = _REPLY_TALLY.get()
+    if tally is None:
+        return
+    if shape == "truncated":
+        tally.truncated += 1
+    if retried:
+        tally.retried += 1
+
+
+@dataclass
+class _FinishedReply:
+    candidates: list[CandidateParticle]
+    notes: list[str]
+    transient: bool
+    shape: ReplyShape
+
+
+def _finish_llm_reply(
     raw: str | None,
     provider_model: str,
     images: list[VisionImage] | None,
-) -> tuple[list[CandidateParticle], list[str], bool]:
-    """Parse one extraction result — the post-network half of ``_call_llm``.
+) -> _FinishedReply:
+    """Parse one reply and classify its shape; records nothing (see ``_settle_reply``).
 
-    ``raw is None`` is the pooled path's per-request failure (an errored,
-    expired, or unanswered batch entry) and degrades exactly as
-    a sequential API error does: no candidates, an ``API error`` quality
-    note, ``transient_error = True`` so the pipeline's F4.1 machinery resets
-    the snapshot to PENDING.
+    An ``unparsed`` reply is reported as ``transient``: the source is fine and
+    the reply is not, which is the empty-completion case with some text in it.
+    Stamping the snapshot COMPLETE with zero claims would hide it from every
+    retry path (``extract --all-pending``, a re-run audit) and read as a source
+    that holds nothing.
     """
     if raw is None:
-        return [], ["API error: batch result unavailable"], True
+        return _FinishedReply([], ["API error: batch result unavailable"], True, "unparsed")
     log.debug("Raw LLM response (%d chars):\n%s", len(raw), raw)
-    candidates, notes = _parse_extraction_response(raw)
+    candidates, notes, shape = _parse_extraction_reply(raw)
     for candidate in candidates:
         candidate.provider_model = provider_model
     if images:
@@ -1624,7 +2346,7 @@ def _finish_llm_call(
             props = candidate.properties or {}
             props[VISION_SOURCE_MODALITY_KEY] = VISION_SOURCE_MODALITY
             candidate.properties = props
-    return candidates, notes, False
+    return _FinishedReply(candidates, notes, shape == "unparsed", shape)
 
 
 async def _call_llm(
@@ -1633,6 +2355,7 @@ async def _call_llm(
     *,
     reference_published_at: datetime | None = None,
     tool_turns_present: bool = False,
+    context: str | None = None,
 ) -> tuple[list[CandidateParticle], list[str], bool]:
     """Send text to the LLM and return (candidates, notes, transient_error).
 
@@ -1647,11 +2370,12 @@ async def _call_llm(
     source-modality marker.
 
     Composed as build → complete → parse: the pooled extraction
-    path reuses ``_build_llm_request`` / ``_finish_llm_call`` around one
-    merged batch call instead of this per-call middle.
+    path reuses ``_build_llm_request`` and its twin :func:`_pooled_extract`
+    around one merged batch call instead of this per-call middle.
     """
     from particles.llm import (
         AccountLevelLLMError,
+        EmptyCompletionError,
         complete_with_provider_model,
         is_account_level_failure,
     )
@@ -1661,6 +2385,7 @@ async def _call_llm(
         images,
         reference_published_at=reference_published_at,
         tool_turns_present=tool_turns_present,
+        context=context,
     )
     # resolve the provider ONCE and read its pairing here, at
     # the call site. ``get_provider`` reads live config on every call, so a
@@ -1690,15 +2415,84 @@ async def _call_llm(
         if is_account_level_failure(exc):
             log.error("Extraction unavailable (account-level): %s", exc)
             raise AccountLevelLLMError(exc) from exc
-        log.error("Extraction API call failed: %s", exc)
-        return [], [f"API error: {exc}"], True
+        if not isinstance(exc, EmptyCompletionError):
+            log.error("Extraction API call failed: %s", exc)
+            return [], [f"API error: {exc}"], True
+        first: _FinishedReply | None = None
+        first_error: Exception | None = exc
+    else:
+        first = _finish_llm_reply(raw, provider_model, images)
+        first_error = None
+        if first.shape == "complete":
+            return first.candidates, first.notes, first.transient
 
-    return _finish_llm_call(raw, provider_model, images)
+    # A reply with no text, cut at the budget, or unparseable is a budget
+    # failure on this call, and the same call at the same budget tends to
+    # reproduce it (an adaptive-thinking model spends the budget on thinking
+    # first). Re-issue it ONCE at the larger budget, which is a different call.
+    # A billing, network, or refusal failure never reaches here.
+    retry_budget = get_config().extraction.retry_max_tokens
+    if retry_budget <= planned.max_tokens:
+        return _settle_reply(first, first_error, retried=False)
+    log.warning(
+        "Extraction reply at max_tokens=%d was %s; retrying once at %d",
+        planned.max_tokens,
+        "empty" if first is None else first.shape,
+        retry_budget,
+    )
+    try:
+        raw, provider_model = await complete_with_provider_model(
+            "extraction",
+            planned.request.prompt,
+            max_tokens=retry_budget,
+            system=planned.request.system,
+            images=images,
+            response_schema=planned.response_schema,
+            cache_prefix=planned.request.cache_prefix,
+        )
+    except Exception as exc:
+        if is_account_level_failure(exc):
+            log.error("Extraction unavailable (account-level): %s", exc)
+            raise AccountLevelLLMError(exc) from exc
+        log.error("Extraction retry at max_tokens=%d failed: %s", retry_budget, exc)
+        return _settle_reply(first, exc, retried=True)
+    second = _finish_llm_reply(raw, provider_model, images)
+    if first is not None and len(first.candidates) > len(second.candidates):
+        # The retry did worse (a fresh sample can): keep what the first kept.
+        return _settle_reply(first, None, retried=True)
+    return _settle_reply(second, None, retried=True)
+
+
+def _settle_reply(
+    reply: _FinishedReply | None, error: Exception | None, *, retried: bool
+) -> tuple[list[CandidateParticle], list[str], bool]:
+    """Record the final reply of a ``_call_llm`` on the tally and return its triple."""
+    if reply is None:
+        _record_reply("unparsed", retried=retried)
+        return [], [f"API error: {error}"], True
+    _record_reply(reply.shape, retried=retried)
+    if reply.shape == "truncated":
+        log.warning(
+            "Extraction reply was cut at the output-token limit%s; kept %d complete "
+            "claim(s), and the claims after the cut were lost",
+            " after one retry" if retried else "",
+            len(reply.candidates),
+        )
+    notes = list(reply.notes)
+    if retried and reply.shape != "complete":
+        notes.append(
+            f"Reply was still {reply.shape} after one retry at "
+            f"extraction.retry_max_tokens={get_config().extraction.retry_max_tokens}"
+        )
+    return reply.candidates, notes, reply.transient
 
 
 async def _pooled_group_complete(
     pool: CompletionPool,
     planned: list[_PlannedLLMCall],
+    *,
+    max_tokens: int | None = None,
+    failures_out: list[RequestFailure | None] | None = None,
 ) -> tuple[list[str | None], str]:
     """Submit image-less planned calls as one pooled group.
 
@@ -1706,24 +2500,116 @@ async def _pooled_group_complete(
     ``planned``. A job-level failure degrades to all-``None`` (the per-chunk
     transient path) unless it is account-level, which raises
     ``AccountLevelLLMError`` exactly as the sequential ``_call_llm`` does —
-    same classification, same bulk-caller stop.
+    same classification, same bulk-caller stop. ``max_tokens`` overrides the
+    planned budget (the retry wave); ``failures_out`` receives the pool's
+    per-request failure kinds.
     """
-    from particles.llm import AccountLevelLLMError, is_account_level_failure
+    from particles.llm import AccountLevelLLMError, RequestFailure, is_account_level_failure
 
     if not planned:
         return [], ""
     try:
         return await pool.complete_group(
             [p.request for p in planned],
-            max_tokens=planned[0].max_tokens,
+            max_tokens=max_tokens if max_tokens is not None else planned[0].max_tokens,
             response_schema=planned[0].response_schema,
+            failures_out=failures_out,
         )
     except Exception as exc:
         if is_account_level_failure(exc):
             log.error("Extraction unavailable (account-level): %s", exc)
             raise AccountLevelLLMError(exc) from exc
         log.error("Pooled extraction dispatch failed: %s", exc)
+        if failures_out is not None:
+            failures_out.extend([RequestFailure.UNAVAILABLE] * len(planned))
         return [None] * len(planned), ""
+
+
+async def _pooled_extract(
+    pool: CompletionPool,
+    planned: list[_PlannedLLMCall],
+) -> list[tuple[list[CandidateParticle], list[str], bool]]:
+    """The pooled twin of :func:`_call_llm`: build is done, this is complete → parse.
+
+    One ``(candidates, notes, transient_error)`` per planned call, in order.
+    A reply that is cut at the output budget, unparseable, or empty is
+    re-issued once at ``extraction.retry_max_tokens``, exactly as the
+    sequential path does, as a **second pooled group**: the retries of every
+    snapshot in the run park together and ride one follow-up batch, at the
+    batch price. A request that never produced a reply (errored,
+    expired, cancelled) is not retried: it is no budget problem, and a batch
+    that outlived ``llm.batch.max_wait_seconds`` would only outlive it again.
+    The snapshot goes back to PENDING for a later run, as before.
+    """
+    from particles.llm import RequestFailure
+
+    failures: list[RequestFailure | None] = []
+    results, provider_model = await _pooled_group_complete(pool, planned, failures_out=failures)
+    firsts: list[_FinishedReply | None] = []
+    retry_at: list[int] = []
+    for i, raw in enumerate(results):
+        kind = failures[i] if i < len(failures) else None
+        if raw is None:
+            firsts.append(None)
+            # Only an empty reply is a budget failure; an unexplained None is
+            # read as unavailable, which retries nothing.
+            if kind is RequestFailure.EMPTY:
+                retry_at.append(i)
+            continue
+        first = _finish_llm_reply(raw, provider_model, None)
+        firsts.append(first)
+        if first.shape != "complete":
+            retry_at.append(i)
+
+    retry_budget = get_config().extraction.retry_max_tokens
+    seconds: dict[int, _FinishedReply] = {}
+    retry_error: Exception | None = None
+    if retry_at and retry_budget > planned[0].max_tokens:
+        log.warning(
+            "%d pooled extraction repl%s at max_tokens=%d came back cut, empty or "
+            "unparseable; re-issuing them once at %d in a follow-up pooled batch",
+            len(retry_at),
+            "y" if len(retry_at) == 1 else "ies",
+            planned[0].max_tokens,
+            retry_budget,
+        )
+        retry_results, retry_pairing = await _pooled_group_complete(
+            pool, [planned[i] for i in retry_at], max_tokens=retry_budget
+        )
+        for i, raw in zip(retry_at, retry_results, strict=True):
+            if raw is not None:
+                seconds[i] = _finish_llm_reply(raw, retry_pairing, None)
+        if all(r is None for r in retry_results):
+            retry_error = RuntimeError("batch result unavailable")
+    else:
+        retry_at = []
+
+    settled: list[tuple[list[CandidateParticle], list[str], bool]] = []
+    retried = set(retry_at)
+    for i, head in enumerate(firsts):
+        if i not in retried:
+            if head is None:
+                # Unavailable, or empty with no larger budget to retry at:
+                # the per-request transient every aggregation layer propagates.
+                reason = (
+                    "reply carried no text at the output budget"
+                    if i < len(failures) and failures[i] is RequestFailure.EMPTY
+                    else "batch result unavailable"
+                )
+                settled.append(([], [f"API error: {reason}"], True))
+            else:
+                settled.append(_settle_reply(head, None, retried=False))
+            continue
+        second = seconds.get(i)
+        if second is None:
+            # The retry produced nothing: keep what the head reply kept.
+            error = retry_error or RuntimeError("retry result unavailable")
+            settled.append(_settle_reply(head, None if head is not None else error, retried=True))
+        elif head is not None and len(head.candidates) > len(second.candidates):
+            settled.append(_settle_reply(head, None, retried=True))
+        else:
+            settled.append(_settle_reply(second, None, retried=True))
+    return settled
 
 
 def _open_pdfium_for_vision(content: bytes) -> Any:
@@ -1989,7 +2875,21 @@ def _gate_valid_until(
 def _parse_extraction_response(
     raw: str,
 ) -> tuple[list[CandidateParticle], list[str]]:
+    """Parse one extraction reply into candidates and quality notes.
+
+    The shape-blind view of :func:`_parse_extraction_reply`, kept for the
+    callers (and tests) that only need the claims.
+    """
+    candidates, notes, _shape = _parse_extraction_reply(raw)
+    return candidates, notes
+
+
+def _parse_extraction_reply(
+    raw: str,
+) -> tuple[list[CandidateParticle], list[str], ReplyShape]:
+    """Parse one extraction reply and say whether it was whole, cut short, or unusable."""
     notes: list[str] = []
+    shape: ReplyShape = "complete"
     try:
         # Strip markdown code fences if present
         if raw.startswith("```"):
@@ -1999,29 +2899,34 @@ def _parse_extraction_response(
     except json.JSONDecodeError as exc:
         # Response may be truncated mid-array (max_tokens reached). Try to
         # recover complete objects by trimming after the last closing brace.
+        # Whatever followed the cut is lost: nothing re-reads this text, so the
+        # note says so rather than promising a later pass picks it up.
         last_brace = raw.rfind("}")
         if last_brace != -1:
             try:
                 data = json.loads(raw[: last_brace + 1] + "]")
+                shape = "truncated"
                 notes.append(
-                    f"Page hit the model output-token limit; kept {len(data)} complete "
-                    f"claims and dropped a partial trailing one (the rest of the page "
-                    f"continues via carry-forward on the next page)"
+                    f"Reply hit the model output-token limit; kept {len(data)} complete "
+                    f"claims, and any claims after the cut were lost"
                 )
+                # Not yet a loss: the caller may retry this reply at a larger
+                # budget, and the snapshot may still be handed back whole.
+                # ``_settle_reply`` warns once the reply is final.
                 log.info(
-                    "Extraction page hit the token limit; kept %d complete claims, "
-                    "remainder continues on the next page (expected on dense pages)",
+                    "Extraction reply hit the output-token limit; %d complete claim(s) "
+                    "recovered before the cut",
                     len(data),
                 )
             except json.JSONDecodeError:
                 log.warning("Failed to parse extraction response: %s", exc)
-                return [], [f"JSON parse error: {exc}"]
+                return [], [f"JSON parse error: {exc}"], "unparsed"
         else:
             log.warning("Failed to parse extraction response: %s", exc)
-            return [], [f"JSON parse error: {exc}"]
+            return [], [f"JSON parse error: {exc}"], "unparsed"
 
     if not isinstance(data, list):
-        return [], ["Response is not a JSON array"]
+        return [], ["Response is not a JSON array"], "unparsed"
 
     candidates: list[CandidateParticle] = []
     # document-scope classification + mode handling (read once).
@@ -2211,7 +3116,7 @@ def _parse_extraction_response(
             )
         )
 
-    return candidates, notes
+    return candidates, notes, shape
 
 
 def candidate_to_particle(
@@ -2238,7 +3143,9 @@ def candidate_to_particle(
 
     A supplied record whose ``transform`` this SDK will not apply (
     today, every fit predating it) is treated exactly as no record: the
-    particle carries the raw value stamped ``EXTRACTOR_DIRECT``.
+    particle carries the raw value stamped ``EXTRACTOR_DIRECT``. So is a record
+    fitted under an extractor version other than ``extractor_ref.version``,
+    or under an unknown one, when ``extractor_ref`` is given.
 
     A candidate that declares its own ``calibration_source`` (today,
     a migration extractor stamping ``IMPORTED``) overrides both branches: the
@@ -2251,9 +3158,16 @@ def candidate_to_particle(
     # calibration record.
     scaler = None
     if calibration is not None and candidate.calibration_source is None:
-        from particles.extraction.calibration import scaler_for_record
+        from particles.extraction.calibration import scaler_for_record, version_mismatch_reason
 
         scaler = scaler_for_record(calibration)
+        # the pipeline drops a record fitted under another extractor
+        # version before it gets here (one warning per run). This is the
+        # backstop for any other caller that names the running version.
+        if extractor_ref is not None and version_mismatch_reason(
+            calibration, extractor_ref.version
+        ):
+            scaler = None
 
     # the extractor declared where this number came from, and it is
     # not a model output — a migration's flat import floor, not a logit.

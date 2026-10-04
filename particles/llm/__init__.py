@@ -13,6 +13,9 @@ The public surface:
   independent prompts, submitted as one half-price batch when the caller is
   latency-tolerant and the adapter implements :class:`BatchCompletionProvider`,
   and run sequentially otherwise.
+* :func:`track_usage` / :class:`LLMUsage`: per-run token totals by purpose
+  and model, reported by every adapter from the provider's ``usage`` and
+  priced at list price (``render_usage_line`` for the one-line summary).
 * :func:`get_client` / :func:`set_client` — the shared Anthropic SDK client
   and its test seam, re-exported from ``particles/llm/client.py`` so the
   long-standing ``from particles.llm import get_client`` /
@@ -43,6 +46,7 @@ from particles.llm.registry import (
     CompletionRequest,
     EmptyCompletionError,
     LLMPurpose,
+    RequestFailure,
     VisionImage,
     complete,
     complete_many,
@@ -50,6 +54,14 @@ from particles.llm.registry import (
     complete_with_provider_model,
     get_provider,
     override_providers,
+)
+from particles.llm.usage import (
+    LLMUsage,
+    UsageAccumulator,
+    UsageRow,
+    record_usage,
+    render_usage_line,
+    track_usage,
 )
 
 __all__ = [
@@ -62,8 +74,12 @@ __all__ = [
     "CompletionRequest",
     "EmptyCompletionError",
     "LLMPurpose",
+    "LLMUsage",
     "LocalProvider",
     "OpenAICompatProvider",
+    "RequestFailure",
+    "UsageAccumulator",
+    "UsageRow",
     "VisionImage",
     "complete",
     "complete_many",
@@ -77,5 +93,8 @@ __all__ = [
     "is_account_level_failure",
     "make_nonce",
     "override_providers",
+    "record_usage",
+    "render_usage_line",
     "set_client",
+    "track_usage",
 ]

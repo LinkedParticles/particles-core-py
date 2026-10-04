@@ -17,6 +17,7 @@ from __future__ import annotations
 from tests._client_fixtures import (  # noqa: F401
     no_embedding_model,
     no_env_leak,
+    no_live_llm,
     pytest_configure,
     reset_client_state,
     restore_logger_levels,

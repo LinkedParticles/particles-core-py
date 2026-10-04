@@ -55,3 +55,24 @@ def is_account_level_failure(exc: BaseException) -> bool:
         return True
     msg = str(exc).lower()
     return status == 400 and ("credit balance" in msg or "billing" in msg)
+
+
+def describe_account_level_failure(exc: BaseException) -> str:
+    """A short, operator-readable cause class for an account-level failure.
+
+    The raw exception text is a provider's JSON error body, useful in a log and
+    illegible in a report headline. A surface that must say *why* the LLM was
+    unavailable names the class instead: ``credit balance too low`` rather than
+    ``Error code: 400 - {'type': 'error', …}``.
+    """
+    status = getattr(exc, "status_code", None)
+    if status == 401:
+        return "API key rejected"
+    if status == 403:
+        return "API key lacks permission"
+    msg = str(exc).lower()
+    if "credit balance" in msg:
+        return "credit balance too low"
+    if "billing" in msg:
+        return "billing error"
+    return "account-level error"

@@ -171,6 +171,22 @@ def visible(scope: BeliefScope, observer_project: str | None, *, widened: bool =
     return widened or scope.is_global or observer_project in scope.keys
 
 
+def share_an_observer(a: BeliefScope, b: BeliefScope) -> bool:
+    """Whether some reader has both beliefs in view: the disclosure test.
+
+    Not :func:`pair_precondition`'s subset test: reconciliation asks whether
+    one side may retire the other, disclosure asks whether anyone would see
+    both. A global belief is in view everywhere. An unattributed one is a
+    stamping gap, which must not switch disclosure off, exactly as it does not
+    switch reconciliation off. Otherwise the two key sets must meet.
+    """
+    if a.is_global or b.is_global:
+        return True
+    if a.unattributed or b.unattributed:
+        return True
+    return bool(a.keys & b.keys)
+
+
 class PairPrecondition(StrEnum):
     """Whether a (candidate, existing) pair may be reconciled."""
 

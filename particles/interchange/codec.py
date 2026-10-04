@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from particles.core.jsonld_context import CONTEXT_URL as _CONTEXT_URL
 from particles.core.schema import (
     AssertionModality,
     CanonicalForm,
@@ -72,8 +73,10 @@ _LEGACY_PROPERTIES_KEYS = {
     "scope_action": SCOPE_ACTION_KEY,
 }
 
-#: Published JSON-LD context the units reference (term -> IRI mapping).
-CONTEXT_URL = "https://linkedparticles.org/schemas/context.jsonld"
+#: Published JSON-LD context the units reference (term -> IRI mapping). Defined
+#: in ``core`` so the vocabulary codec, which store and ingest read, can name it
+#: without importing this package.
+CONTEXT_URL = _CONTEXT_URL
 
 
 @dataclass

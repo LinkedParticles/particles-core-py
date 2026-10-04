@@ -26,10 +26,11 @@ a back-compat shim re-exporting this module.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 from collections import defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -567,51 +568,236 @@ def is_within_directory(directory: Path, path: Path) -> bool:
         return False
 
 
-def prune_obsolete_markdown(directory: Path, written: set[Path], *, recursive: bool) -> int:
-    """Remove ``.md`` files under ``directory`` that this export run did
-    not write, returning the count removed.
+#: Ownership ledger a one-file-per-subject exporter keeps at its export root
+#:: the root-relative paths of every ``.md`` file its last run wrote.
+EXPORT_MANIFEST_NAME = ".particles-export.json"
+
+#: Append-only journal of files a run has written that its prior manifest did
+#: not list. It is unioned into ownership on the next run, so an export killed
+#: before it could save its manifest still owns what it wrote.
+EXPORT_JOURNAL_NAME = ".particles-export.pending"
+
+
+class ExportTargetNotOwnedError(ValueError):
+    """An export target holds Markdown files the exporter did not write.
+
+    Raised before anything is written, the first time an exporter is pointed
+    at a populated directory, unless the caller passed ``force``. A
+    ``ValueError`` so every surface reports it as a usage error.
+    """
+
+
+def prune_obsolete_markdown(
+    directory: Path, written: set[Path], *, owned: set[Path], recursive: bool
+) -> int:
+    """Remove the ``.md`` files a previous export run wrote that this run did
+    not, returning the count removed.
 
     Shared by every exporter that writes one-file-per-subject
     (Obsidian, Logseq, future flat-markdown exporters) so the
     "subject suppressed / renamed in DB but file lingers on disk"
     case is handled identically across them. Replaces the pre-0.42.4
-    pattern of wiping the entire output directory before writing —
-    that pattern was destructive on interrupt and thrashed file
-    watchers even when nothing changed.
+    pattern of wiping the entire output directory before writing.
 
-    Paths are compared by :meth:`Path.resolve` so the caller doesn't
-    have to worry about relative-vs-absolute / symlink normalisation
-    when seeding ``written``.
+    Only paths in ``owned`` are candidates: the files the exporter provably
+    wrote, from its manifest (see :class:`MarkdownExportLedger`). Before
+    every ``.md`` under ``directory`` was a candidate, so pointing
+    an export at a real vault deleted the user's own notes. A file not in
+    ``owned`` is never touched, whatever its name.
 
-    Also removes subdirectories the prune emptied (so old
-    ``reddit.com/`` / ``github.com/`` shards disappear when their
-    last child is pruned).
+    Paths are compared by :meth:`Path.resolve`. Each candidate must also
+    resolve *inside* ``directory`` (via :func:`is_within_directory`), be a
+    ``.md`` file and, with ``recursive=False``, sit directly in
+    ``directory``, so a tampered manifest or a symlinked shard whose target
+    lies outside the export root is skipped rather than followed.
 
-    Defence-in-depth: each candidate is verified to resolve *inside*
-    ``directory`` (via :func:`is_within_directory`) before it is unlinked,
-    so a symlinked shard whose target lies outside the export root is
-    skipped rather than followed and deleted. Mirrors the containment guard
-    the one-file-per-subject exporters apply on the write path.
+    A subdirectory the prune emptied is removed (so old ``reddit.com/`` /
+    ``github.com/`` shards disappear with their last child); a directory that
+    was already empty, or that holds anything else, is left alone.
     """
+    root = directory.resolve()
     resolved_written = {p.resolve() for p in written}
     files_pruned = 0
-    iterator = directory.rglob("*.md") if recursive else directory.glob("*.md")
-    for existing in iterator:
-        if not is_within_directory(directory, existing):
-            # A symlink (or other path) that resolves outside the export
-            # root is not ours to delete — skip it.
+    emptied: set[Path] = set()
+    for candidate in sorted({p.resolve() for p in owned} - resolved_written):
+        if candidate.suffix != ".md" or not candidate.is_file():
             continue
-        if existing.resolve() not in resolved_written:
-            existing.unlink()
-            files_pruned += 1
-    # Empty-directory cleanup. Iterating reverse-sorted means children
-    # are checked before parents — so a directory whose only entries
-    # were just pruned is found empty here. The flat case never
-    # creates subdirectories but the call is cheap.
-    for d in sorted(directory.rglob("*"), reverse=True):
-        if d.is_dir() and not any(d.iterdir()):
+        if not is_within_directory(root, candidate):
+            continue
+        if not recursive and candidate.parent != root:
+            continue
+        candidate.unlink()
+        files_pruned += 1
+        emptied.add(candidate.parent)
+    # Children before parents, and never the export root itself.
+    for d in sorted(emptied, key=lambda p: len(p.parts), reverse=True):
+        while d != root and d.is_relative_to(root):
+            if not d.is_dir() or any(d.iterdir()):
+                break
             d.rmdir()
+            d = d.parent
     return files_pruned
+
+
+class MarkdownExportLedger:
+    """Which ``.md`` files under an export target the exporter owns.
+
+    A one-file-per-subject export prunes the notes of subjects that left its
+    target set, and is pointed at directories users also write in (an
+    Obsidian vault, a Logseq graph's ``pages/``). The ledger is what keeps
+    the two apart. Ownership is the manifest at ``root`` naming every file
+    the last run wrote, unioned with the journal of an interrupted run. An
+    export written before the manifest existed is adopted through
+    ``legacy_marker``, a predicate over a file's text, when no manifest is
+    present.
+
+    The lifecycle is :meth:`claim`, then :meth:`write` for every file, then
+    :meth:`finish`, which prunes and saves the manifest. :meth:`claim`
+    refuses a target that holds files it does not own and has never been
+    exported to, unless ``force``. :meth:`write` never overwrites a file it
+    does not own unless ``force``; it skips it and reports ``False``.
+    """
+
+    def __init__(
+        self,
+        root: Path,
+        scope: Path,
+        *,
+        exporter: str,
+        recursive: bool,
+        force: bool,
+        owned: set[Path],
+    ) -> None:
+        self.root = root
+        self.scope = scope
+        self.exporter = exporter
+        self.recursive = recursive
+        self.force = force
+        self.owned = owned
+        self.written: set[Path] = set()
+        self.skipped: list[Path] = []
+
+    @classmethod
+    def claim(
+        cls,
+        root: Path,
+        *,
+        exporter: str,
+        scope: Path | None = None,
+        recursive: bool,
+        force: bool = False,
+        legacy_marker: Callable[[str], bool] | None = None,
+    ) -> MarkdownExportLedger:
+        """Load ownership for ``exporter`` at ``root`` and vet the target.
+
+        ``scope`` is the directory whose ``.md`` files the exporter writes and
+        prunes (default ``root``). Raises :class:`ExportTargetNotOwnedError`
+        when the target has no manifest from this exporter, holds ``.md``
+        files it does not own, and ``force`` is false. Writes nothing.
+        """
+        scope = scope if scope is not None else root
+        manifest = _read_export_manifest(root, exporter)
+        journal = _read_export_journal(root)
+        owned = {p for p in (manifest or set()) | journal if _ownable(scope, p, recursive)}
+        present = _markdown_files(scope, recursive)
+        if manifest is None and legacy_marker is not None:
+            for path in present - owned:
+                try:
+                    text = path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    continue
+                if legacy_marker(text):
+                    owned.add(path)
+        foreign = sorted(present - owned)
+        if foreign and manifest is None and not journal and not force:
+            shown = ", ".join(str(p.relative_to(scope.resolve())) for p in foreign[:5])
+            more = f" and {len(foreign) - 5} more" if len(foreign) > 5 else ""
+            raise ExportTargetNotOwnedError(
+                f"{scope} holds {len(foreign)} Markdown file(s) this {exporter} export "
+                f"did not write ({shown}{more}). Export into an empty directory or a "
+                f"folder of its own, or pass --force to export alongside them. The "
+                f"export never deletes a file it did not write; with --force it "
+                f"overwrites one whose path a note it writes takes."
+            )
+        return cls(root, scope, exporter=exporter, recursive=recursive, force=force, owned=owned)
+
+    def write(self, path: Path, content: str) -> bool:
+        """Write ``path`` atomically unless it is a file this exporter does not own.
+
+        Returns ``False``, and writes nothing, for an existing file that is
+        neither owned nor written earlier this run, unless ``force``.
+        """
+        resolved = path.resolve()
+        if (
+            not self.force
+            and resolved.exists()
+            and resolved not in self.owned
+            and resolved not in self.written
+        ):
+            self.skipped.append(resolved)
+            return False
+        atomic_write_text(path, content)
+        if resolved not in self.owned and resolved not in self.written:
+            _append_export_journal(self.root, resolved)
+        self.written.add(resolved)
+        return True
+
+    def finish(self) -> int:
+        """Prune owned files this run did not write, save the manifest, clear
+        the journal; return the number pruned."""
+        pruned = prune_obsolete_markdown(
+            self.scope, self.written, owned=self.owned, recursive=self.recursive
+        )
+        root = self.root.resolve()
+        files = sorted(p.relative_to(root).as_posix() for p in self.written)
+        manifest = {"exporter": self.exporter, "version": 1, "files": files}
+        atomic_write_text(self.root / EXPORT_MANIFEST_NAME, json.dumps(manifest, indent=1) + "\n")
+        with contextlib.suppress(FileNotFoundError):
+            (self.root / EXPORT_JOURNAL_NAME).unlink()
+        return pruned
+
+
+def _markdown_files(scope: Path, recursive: bool) -> set[Path]:
+    if not scope.is_dir():
+        return set()
+    iterator = scope.rglob("*.md") if recursive else scope.glob("*.md")
+    return {p.resolve() for p in iterator if p.is_file() and is_within_directory(scope, p)}
+
+
+def _ownable(scope: Path, path: Path, recursive: bool) -> bool:
+    """A manifest entry is honoured only for a ``.md`` path inside ``scope``."""
+    if path.suffix != ".md" or not is_within_directory(scope, path):
+        return False
+    return recursive or path.parent == scope.resolve()
+
+
+def _read_export_manifest(root: Path, exporter: str) -> set[Path] | None:
+    """The resolved paths ``exporter``'s manifest at ``root`` lists, or ``None``
+    when there is none (or it belongs to another exporter, or is unreadable)."""
+    try:
+        data = json.loads((root / EXPORT_MANIFEST_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("exporter") != exporter:
+        return None
+    files = data.get("files")
+    if not isinstance(files, list):
+        return None
+    return {(root / f).resolve() for f in files if isinstance(f, str)}
+
+
+def _read_export_journal(root: Path) -> set[Path]:
+    try:
+        lines = (root / EXPORT_JOURNAL_NAME).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return set()
+    return {(root / line).resolve() for line in lines if line.strip()}
+
+
+def _append_export_journal(root: Path, path: Path) -> None:
+    rel = path.relative_to(root.resolve()).as_posix()
+    with (root / EXPORT_JOURNAL_NAME).open("a", encoding="utf-8") as fh:
+        fh.write(rel + "\n")
 
 
 _SEVERITY_CALLOUT: dict[str, str] = {
@@ -885,6 +1071,28 @@ def format_memory_bullet(
     return f"- {flat} `p-{short_id}`"
 
 
+#: One memory-index bullet as :func:`format_memory_bullet` writes it: the
+#: contested bases when the badge named them, and the closing short-id handle.
+_MEMORY_BULLET_RE = re.compile(
+    r"^- (?:⚠ contested(?: \((?P<bases>[^)]*)\))? — )?.*`p-(?P<id>[0-9A-Za-z-]+)`\s*$"
+)
+
+
+def parse_memory_bullet(line: str) -> tuple[str, list[str]] | None:
+    """Read back a :func:`format_memory_bullet` line: ``(short_id, contested_bases)``.
+
+    Returns ``None`` for a line that is not a memory bullet. A line flagged
+    contested without named bases (the pre-badge inconsistency-only form)
+    yields an empty basis list, as does an uncontested one.
+    """
+    match = _MEMORY_BULLET_RE.match(line)
+    if match is None:
+        return None
+    raw = match.group("bases")
+    bases = [b.strip() for b in raw.split(",") if b.strip()] if raw else []
+    return match.group("id"), bases
+
+
 @dataclass(frozen=True)
 class DigestEntry:
     """One belief's pre-gathered data for the session-start digest.
@@ -931,8 +1139,28 @@ def render_digest(
     entries: list[DigestEntry],
     total_active: int,
     observer: ObserverScopeNote | None = None,
+    spend_line: str | None = None,
 ) -> str:
     """Render a store's ACTIVE beliefs as a terse session-start digest.
+
+    The text of :func:`render_digest_located`, which documents the format.
+    """
+    return render_digest_located(store, entries, total_active, observer, spend_line)[0]
+
+
+def render_digest_located(
+    store: str,
+    entries: list[DigestEntry],
+    total_active: int,
+    observer: ObserverScopeNote | None = None,
+    spend_line: str | None = None,
+) -> tuple[str, list[int]]:
+    """Render the digest, and where each entry's line starts in it.
+
+    Returns ``(markdown, offsets)``: ``offsets[i]`` is the character offset in
+    ``markdown`` at which ``entries[i]``'s line begins. A caller that cuts the
+    text to a prefix can tell which entries survived the cut from these alone,
+    whatever the entries' content holds.
 
     The ``MEMORY.md`` analog: one line per belief, **already ordered by the
     caller** (effective confidence, descending). An index, not a dump —
@@ -949,6 +1177,10 @@ def render_digest(
     scope, and how many the store holds. With no observer the output is
     byte-identical to before.
 
+    ``spend_line`` is the store's recorded LLM spend, rendered by
+    the caller; it closes the digest as one italic line. ``None`` (no run has
+    recorded usage yet) leaves the output byte-identical to before.
+
     Pure: no session and no clock — ``asserted_at`` renders as its date, and
     recency is already folded into the effective-confidence ordering, so the
     output is deterministic for a given input.
@@ -961,9 +1193,13 @@ def render_digest(
             if observer is not None and observer.engaged
             else f"in `{store}`"
         )
-        return "\n".join([header, "", *scope_lines, f"_No ACTIVE beliefs {where}._"]) + "\n"
+        empty = [header, "", *scope_lines, f"_No ACTIVE beliefs {where}._"]
+        if spend_line is not None:
+            empty += ["", f"_{spend_line}_"]
+        return "\n".join(empty) + "\n", []
 
     shown = len(entries)
+    entry_rows: list[int] = []
     lines = [
         header,
         "",
@@ -984,6 +1220,7 @@ def render_digest(
             contested = f" · contested by `{e.contested}`"
         else:
             contested = ""
+        entry_rows.append(len(lines))
         lines.append(
             f"- **{e.effective_confidence:.2f}** {e.content}{subjects} · "
             f"{e.asserted_at.date().isoformat()}{contested}"
@@ -994,7 +1231,16 @@ def render_digest(
             f"_Showing the top {shown} of {total_active} by effective confidence; "
             f"{total_active - shown} not shown._",
         ]
-    return "\n".join(lines) + "\n"
+    if spend_line is not None:
+        lines += ["", f"_{spend_line}_"]
+    # Each line is joined by one "\n", so a line starts after the lengths of
+    # every line before it plus their separators.
+    starts: list[int] = []
+    pos = 0
+    for line in lines:
+        starts.append(pos)
+        pos += len(line) + 1
+    return "\n".join(lines) + "\n", [starts[row] for row in entry_rows]
 
 
 def render_lint_finding(finding: LintFinding) -> str:

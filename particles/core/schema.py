@@ -92,14 +92,17 @@ class UncertaintyNature(StrEnum):
 
 
 class AssertionModality(StrEnum):
-    """What *kind* of assertion a particle makes: its truth-aptness.
+    """What *kind* of assertion a particle makes: the default for its adjudicability.
 
     Orthogonal to ``uncertainty_nature`` (which presupposes a fact of the
-    matter) and to scope (which lives in ``properties``). The Core
-    engine applies truth-semantics (the §6.4 conflict ladder, L-SEM-01,
-    L-IDX-01) only to ``FALSIFIABLE`` particles (see :func:`is_truth_apt`);
-    the other modalities co-exist and are never contradiction-checked or
-    trust-arbitrated. Default ``FALSIFIABLE`` keeps every existing particle
+    matter) and to scope (which lives in ``properties``). The write
+    path arbitrates (the §6.6 conflict ladder, L-SEM-01, L-IDX-01) only pairs
+    of ``FALSIFIABLE`` particles (see :func:`is_truth_apt`); the other
+    modalities co-exist and are never contradiction-checked or
+    trust-arbitrated. The value is a regenerable default, not a property of
+    the claim: it is stamped with the classifier that set it, an operator may
+    correct it, and a lens may read it differently at read time only.
+    Default ``FALSIFIABLE`` keeps every existing particle
     unchanged. Closed enum: adding a modality is an additive minor change.
     """
 
@@ -149,6 +152,7 @@ class SourceType(StrEnum):
     BLOG = "BLOG"
     TAXONOMY_DEFINITION = "TAXONOMY_DEFINITION"  # Extension C.2
     TRUST_LENS_DEFINITION = "TRUST_LENS_DEFINITION"  # Extension B
+    VOCABULARY_DOCUMENT = "VOCABULARY_DOCUMENT"  # predicate vocabulary
 
 
 class Mutability(StrEnum):
@@ -200,6 +204,7 @@ class ResolutionAction(StrEnum):
     PREFER_B = "PREFER_B"
     BOTH_VALID = "BOTH_VALID"
     DEFER = "DEFER"
+    DISCARD = "DISCARD"  # neither side is kept; no trust verdict
 
 
 class AudienceHint(StrEnum):
@@ -828,6 +833,23 @@ class ExtractorCalibration(BaseModel):
             ``calibration_source=EXTRACTOR_DIRECT``. ``None`` is a legacy record
             (fitted before this key existed); it is treated as the historical
             default ``anthropic:claude-sonnet-4-6``.
+        heldout_suite_id: Benchmark suite(s) whose recorded runs the fit was
+            scored on out of sample, ``+``-joined like
+            ``benchmark_suite_id``. ``None`` on a record persisted before the
+            held-out check existed, which was never checked out of sample.
+        heldout_sample_size: Recorded claims the held-out check scored.
+        heldout_error_before: ECE of those claims' raw stated confidences.
+        heldout_error_after: ECE of the same claims with ``temperature``
+            applied. Never above ``heldout_error_before`` on a record written
+            by ``extractor calibrate``, which refuses such a fit.
+        extractor_version: The ``EXTRACTOR_VERSION`` the fit ran under.
+            A prompt change can reverse what a temperature does,
+            so the pipeline applies the record only when this equals the
+            running extractor's version; on mismatch the pairing mints
+            ``EXTRACTOR_DIRECT`` and ``extractor calibrations`` lists the record
+            as ``NOT APPLIED``. ``None`` is a record persisted before this key
+            existed, fitted under an unknown version, and is never applied.
+            See :func:`particles.extraction.calibration.version_mismatch_reason`.
     """
 
     temperature: float = Field(gt=0.0)
@@ -838,6 +860,11 @@ class ExtractorCalibration(BaseModel):
     calibration_error_before: float = Field(ge=0.0, le=1.0)
     calibration_error_after: float = Field(ge=0.0, le=1.0)
     provider_model: str | None = None
+    heldout_suite_id: str | None = None
+    heldout_sample_size: int | None = Field(default=None, ge=1)
+    heldout_error_before: float | None = Field(default=None, ge=0.0, le=1.0)
+    heldout_error_after: float | None = Field(default=None, ge=0.0, le=1.0)
+    extractor_version: str | None = None
 
 
 class ExtractorRecord(BaseModel):
@@ -1049,6 +1076,38 @@ class TrustLensUtilityRule(BaseModel):
         return self
 
 
+class TrustLensModalityRule(BaseModel):
+    """One portable override of the adjudicability default carried by a lens.
+
+    ``assertion_modality`` is the extraction-time default for whether a claim
+    may be arbitrated against another; a lens may read it differently for its
+    observer. The rule applies to the claims ``scope`` + ``pattern`` select:
+
+    - ``particle``: ``pattern`` is a particle id;
+    - ``subject``: ``pattern`` is a subject id the claim is about;
+    - ``url_pattern``: ``pattern`` is a regex searched in the claim's source
+      URIs (the trust-rule regex shape);
+    - ``source_type``: ``pattern`` is an exact ``source_type`` string.
+
+    ``when``, if set, limits the rule to claims whose stored default is that
+    modality. Particle and subject ids are store-local: an interchange import
+    mints fresh ids, so such a rule ports only to a faithful restore of its own
+    store, and elsewhere matches nothing, which leaves the stored default.
+
+    Read-time only. A rule decides what renders contested and what the lint
+    queue names for the operator; it never reaches a write, ranking, or
+    ``effective_confidence``, and an operator verdict always wins over it.
+    Within one lens the most specific matching rule decides that lens's
+    reading; across adopted lenses abstention (a non-``FALSIFIABLE`` reading)
+    wins at any scope, so adopting a lens can only withdraw adjudication.
+    """
+
+    scope: Literal["particle", "subject", "url_pattern", "source_type"]
+    pattern: str = Field(min_length=1)
+    modality: AssertionModality
+    when: AssertionModality | None = None
+
+
 class TrustLensDefinition(BaseModel):
     """A depositable corpus artefact bundling portable trust policy.
 
@@ -1070,6 +1129,11 @@ class TrustLensDefinition(BaseModel):
     into an additive rank-lift on the projection / digest ranking path
     only. A lens silent about utility leaves the store's local ``utility`` config
     untouched; with no utility evidence the bonus is ``+0`` (cold-start).
+
+    A lens may also carry ``modality_rules``: a per-observer reading
+    of the adjudicability default, applied at read time to the contested badge
+    and the lint queue only. A lens silent about modality reads every claim as
+    its stored default.
     """
 
     kind: Literal["TrustLensDefinition"] = "TrustLensDefinition"
@@ -1083,6 +1147,7 @@ class TrustLensDefinition(BaseModel):
     extractor_weights: dict[str, float] = Field(default_factory=dict)
     decay_rules: list[TrustLensDecayRule] = Field(default_factory=list)
     utility_rules: list[TrustLensUtilityRule] = Field(default_factory=list)
+    modality_rules: list[TrustLensModalityRule] = Field(default_factory=list)
     corpus_entry_id: str | None = None  # set after deposit
 
     @model_validator(mode="after")
@@ -1171,6 +1236,14 @@ class QueryRequest(BaseModel):
     # extension parameter, deliberately not part of the specified request shape:
     # the predicate's inputs (corpus-entry tags) are an SDK convention.
     observer_project: str | None = Field(default=None, min_length=1)
+    # compose a grounded answer, where every sentence cites the
+    # retrieved particle ids it rests on and an uncited sentence is labelled
+    # the composer's own ``inference`` or ``background`` (the response carries
+    # the labels in ``answer_attribution``). ``None`` defers to
+    # ``config.query.grounded_answers``. Response-level attribution only:
+    # nothing the composer contributes is ever written to the store. An SDK
+    # extension parameter, like ``observer_project``.
+    grounded: bool | None = None
     # structural claim filters over the annotation.
     # With a question they prefilter the semantic candidate set (ranking
     # untouched); without one they select the deterministic
@@ -1197,6 +1270,10 @@ class QueryRequest(BaseModel):
     # count — the discovery surface for the exact-string predicate filter.
     # A standalone mode: combines with no question, filter, or aggregate.
     list_predicates: bool = False
+    # the read-time vocabulary report — ``list_predicates`` grouped
+    # by canonical predicate, with object shapes, subject-class co-occurrence,
+    # alignment, and a store header. Standalone like ``list_predicates``.
+    list_vocabulary: bool = False
 
     @property
     def claim_filter_flags(self) -> tuple[str | None, ...]:
@@ -1225,6 +1302,7 @@ class QueryRequest(BaseModel):
         modes three and four)."""
         return (
             self.list_predicates
+            or self.list_vocabulary
             or self.is_aggregate
             or (self.question is None and self.has_claim_filters)
         )
@@ -1234,8 +1312,8 @@ class QueryRequest(BaseModel):
         if self.question is None and not self.is_structural_mode:
             raise ValueError(
                 "a query needs a question, a structural claim filter "
-                "(predicate / object_*), an aggregate (count / group_by), or "
-                "list_predicates"
+                "(predicate / object_*), an aggregate (count / group_by), "
+                "list_predicates, or list_vocabulary"
             )
         if self.is_aggregate and self.question is not None:
             raise ValueError(
@@ -1249,6 +1327,16 @@ class QueryRequest(BaseModel):
             raise ValueError(
                 "list_predicates is a standalone vocabulary listing; combine it "
                 "with no question, filter, or aggregate"
+            )
+        if self.list_vocabulary and (
+            self.question is not None
+            or self.has_claim_filters
+            or self.is_aggregate
+            or self.list_predicates
+        ):
+            raise ValueError(
+                "list_vocabulary is a standalone report; combine it with no "
+                "question, filter, aggregate, or list_predicates"
             )
         if self.min_effective_confidence is not None and not self.is_aggregate:
             raise ValueError(
@@ -1463,6 +1551,62 @@ class RelevanceNote(BaseModel):
     below_floor: bool
 
 
+class AttributionKind(StrEnum):
+    """Where one sentence of a grounded answer came from.
+
+    * ``CITED`` — the composer cited at least one retrieved particle id for
+      it, and the parser found that id in the set the composer was given.
+    * ``INFERENCE`` — uncited; the composer declared it an inference drawn
+      over the cited claims.
+    * ``BACKGROUND`` — uncited; the composer declared it its own background,
+      drawn from nothing in the store.
+    * ``UNATTRIBUTED`` — the composer neither cited a retrieved id nor
+      declared it, either by omitting the tag or by citing only ids it was
+      never given. Recorded, never dropped, and never guessed into one of
+      the other three.
+    """
+
+    CITED = "cited"
+    INFERENCE = "inference"
+    BACKGROUND = "background"
+    UNATTRIBUTED = "unattributed"
+
+
+class AttributedSentence(BaseModel):
+    """One attributed unit of a grounded answer.
+
+    ``text`` is the unit with its tag removed. ``cited_ids`` are full particle
+    ids, each validated against the particles the composer was given;
+    ``invalid_citations`` keeps what the composer wrote for a citation that
+    matched none of them.
+    """
+
+    text: str
+    kind: AttributionKind
+    cited_ids: list[str] = Field(default_factory=list)
+    invalid_citations: list[str] = Field(default_factory=list)
+
+
+class AnswerAttribution(BaseModel):
+    """Per-sentence attribution of a grounded answer.
+
+    A **response model, not particle substrate**: parsed from the composer's
+    tags at read time and never stored. The composer's own contribution is
+    labelled, not removed: every unit of the answer appears here, in order.
+    """
+
+    sentences: list[AttributedSentence] = Field(default_factory=list)
+
+    def count(self, kind: AttributionKind) -> int:
+        """Units of ``kind``."""
+        return sum(1 for s in self.sentences if s.kind is kind)
+
+    @property
+    def invalid_citation_count(self) -> int:
+        """Citations, across every unit, that named no retrieved particle."""
+        return sum(len(s.invalid_citations) for s in self.sentences)
+
+
 class AnswerFailureCause(StrEnum):
     """Why NL answer generation failed, for a caller that must tell them apart.
 
@@ -1495,6 +1639,124 @@ class PredicateInfo(BaseModel):
     value: str
     kind: TermKind
     claim_count: int
+
+
+class ObjectShape(StrEnum):
+    """The form of a structured claim's object, as the vocabulary report counts it.
+
+    A reading of *form*, for datatype induction: ``NUMERIC`` and ``DATED``
+    count a literal whose lexical form parses as a number or an ISO-8601 date,
+    typed or not. The comparison rule is unchanged and stays
+    typed-only; this enum never feeds a filter.
+    """
+
+    TEXT = "text"
+    NUMERIC = "numeric"
+    DATED = "dated"
+    URI = "uri"
+    TOKEN = "token"
+
+
+class LinkBand(StrEnum):
+    """Which confidence band one external link falls in.
+
+    ``ASSERTED`` is confidence 1.0 (a structured extractor or an operator
+    asserted it); ``UNSCORED`` is the 0.5 sentinel for a link no content
+    could score; ``SCORED`` is any other value at or above
+    ``subjects.wikidata_link_suppress_threshold``; ``SUPPRESSED`` is below it,
+    stored but hidden from export and query output.
+    """
+
+    ASSERTED = "asserted"
+    SCORED = "scored"
+    UNSCORED = "unscored"
+    SUPPRESSED = "suppressed"
+
+
+class VocabularySurfaceForm(BaseModel):
+    """One predicate term as stored, under its canonical form."""
+
+    value: str
+    kind: TermKind
+    claim_count: int
+
+
+class VocabularyClassCount(BaseModel):
+    """A subject class and how many claims or subjects carry it.
+
+    ``(unclassed)`` names a resolved subject with no class, and
+    ``(unresolved)`` a claim whose subject term resolved to no Subject.
+    """
+
+    subject_class: str
+    count: int
+
+
+class VocabularyPredicate(BaseModel):
+    """One canonical predicate of the vocabulary report.
+
+    ``canonical`` is the normalised form (an inflectional stem, so
+    ``moved to`` and ``moves to`` share ``mov to``); a ``URI`` predicate is its
+    own canonical form. ``label`` is the commonest surface form, for reading.
+    ``alignments`` lists what the adopted vocabulary documents say the form
+    is: the term a document mints or aliases for it, then that term's outward
+    alignments, each naming its subject class. Empty while the store adopts
+    no document.
+    """
+
+    canonical: str
+    label: str
+    claim_count: int
+    surface_forms: list[VocabularySurfaceForm]
+    object_shapes: dict[ObjectShape, int]
+    subject_classes: list[VocabularyClassCount]
+    alignments: list[str] = Field(default_factory=list)
+
+
+class NamespaceAlignment(BaseModel):
+    """Subjects aligned to one external namespace, by link band.
+
+    A subject with several links in one namespace counts once, in the band of
+    its most confident link.
+    """
+
+    namespace: str
+    subjects: int
+    bands: dict[LinkBand, int]
+
+
+class VocabularyReport(BaseModel):
+    """The read-time vocabulary report: the evidence an ontology is built from.
+
+    Computed on every call and never stored. The predicate rows and the claim
+    counts follow the request's candidate set, observer included.
+    The subject header and the modelling-decision counts are store-wide:
+    subjects and operator events are not beliefs a project observes. With
+    ``as_of`` the header counts the Subjects created by then, as
+    they stand now, and the decisions recorded by then;
+    ``structured_claims_total`` stays the current store's.
+    """
+
+    subjects_total: int
+    subjects_aligned: int
+    aligned_by_namespace: list[NamespaceAlignment]
+    link_suppress_threshold: float
+    subjects_classed: int
+    classed_by_class: list[VocabularyClassCount]
+    classed_by_namespace: list[VocabularyClassCount]
+    structured_claims_total: int
+    claims_in_view: int
+    object_kinds: dict[TermKind, int]
+    object_shapes: dict[ObjectShape, int]
+    predicates_distinct: int
+    predicates_canonical: int
+    modelling_decisions: dict[str, int]
+    alignment_source: str | None = None
+    as_of: datetime | None = None
+    predicates: list[VocabularyPredicate] = Field(default_factory=list)
+    # set when the request named an ``observer_project``; the
+    # predicate rows and claim counts were read through it. Disclosure only.
+    observer_scope: ObserverScopeNote | None = None
 
 
 class ClaimCoverage(BaseModel):
@@ -1621,6 +1883,9 @@ class QueryResponse(BaseModel):
     # the predicate-vocabulary listing; empty outside the
     # list_predicates mode.
     predicate_vocabulary: list[PredicateInfo] = Field(default_factory=list)
+    # the read-time vocabulary report; None outside the
+    # list_vocabulary mode. Computed per call, never stored.
+    vocabulary_report: VocabularyReport | None = None
     # the question-level relevance disclosure — max raw cosine over
     # the rendered top-k vs. ``config.query.relevance_floor``. When
     # ``below_floor``, ``answer`` is a deterministic no-LLM refusal and the
@@ -1659,6 +1924,13 @@ class QueryResponse(BaseModel):
     # to widen top_k under a refusal is incoherent). Disclosure only — never
     # feeds ranking or ``effective_confidences``.
     answer_refused: bool = False
+    # the per-sentence attribution of a grounded answer — each unit
+    # cited (with the retrieved particle ids it rests on), the composer's own
+    # inference, its background, or unattributed. ``answer`` then carries the
+    # same labels inline. None when the answer was not grounded, and on every
+    # path that composes no answer (a refusal, a failed generation, the
+    # structural modes). Disclosure only — never stored, never fed to ranking.
+    answer_attribution: AnswerAttribution | None = None
 
 
 class GraphParticleInfo(BaseModel):
@@ -1807,6 +2079,86 @@ class CalibrationBucket(BaseModel):
     fraction: float
 
 
+class StoreLLMSpend(BaseModel):
+    """A store's cumulative LLM spend, summed from its recorded run events.
+
+    Read-time view over the append-only ``CONSOLIDATION_RUN`` and
+    ``EXTRACT_RUN`` events that carry measured usage (derived, never
+    stored as a counter). The dollar figure is list price from recorded token
+    counts, never a billing API, and runs made before usage was recorded are
+    not in it, so it is a figure *since* ``since``.
+    """
+
+    #: Sum of the priced runs' list prices in US$.
+    cost_usd: float
+    #: Runs that recorded at least one LLM call.
+    runs: int
+    #: When the earliest of those runs was recorded.
+    since: datetime
+    #: Runs whose usage named a model with no ``llm.price_per_mtok`` entry;
+    #: counted in ``runs`` but not in ``cost_usd``.
+    unpriced_runs: int = 0
+
+
+class CurationPrecisionKind(BaseModel):
+    """How one card kind fared with the operator over a window.
+
+    ``acted``, ``dismissed`` and ``snoozed`` count cards by the strongest
+    gesture or ruling recorded on them in the window; ``open`` and ``expired``
+    count cards the retained collections hold that got no gesture at all.
+    ``precision`` is ``acted / (acted + dismissed)``: of the cards the operator
+    ruled on, the share that were real. ``acted_means`` and
+    ``dismissed_means`` say what those two outcomes mean for this kind, since a
+    dismissed duplicate pair (the finder was wrong) and a dismissed expiry
+    (not worth a ruling) are different findings.
+    """
+
+    kind: str
+    #: Cards in the denominator: decided + snoozed + open + expired.
+    offered: int
+    acted: int
+    dismissed: int
+    snoozed: int
+    #: In the current collection, untouched in the window.
+    open: int
+    #: Left a retained collection, or was closed by the system, untouched.
+    expired: int
+    #: ``acted / (acted + dismissed)``; ``None`` when nothing was decided.
+    precision: float | None
+    acted_means: str
+    dismissed_means: str
+
+
+class CurationPrecision(BaseModel):
+    """Queue precision: how often the curation queue was right.
+
+    A read-time view over the operator event log and the retained curation
+    collections for one window, never stored. Per card kind, the
+    share of cards the operator acted on, dismissed, snoozed or never touched,
+    with the denominator shown. ``precision`` is over decided cards only:
+    ``acted / (acted + dismissed)``. ``unattributed_events`` counts resolving
+    events in the window (a retraction, a supersession) that named no card the
+    store still holds, so the acted figure is a floor.
+    """
+
+    since: datetime
+    until: datetime
+    kinds: list[CurationPrecisionKind] = Field(default_factory=list)
+    offered: int = 0
+    acted: int = 0
+    dismissed: int = 0
+    snoozed: int = 0
+    open: int = 0
+    expired: int = 0
+    precision: float | None = None
+    #: Events in the window that were read for gestures and rulings.
+    events_read: int = 0
+    unattributed_events: int = 0
+    #: Retained collections the open / expired counts were read from.
+    snapshots_read: int = 0
+    snapshot_built_at: datetime | None = None
+
+
 class QualityReport(BaseModel):
     """Extraction quality dashboard snapshot (Appendix B §8).
 
@@ -1835,6 +2187,12 @@ class QualityReport(BaseModel):
     # ``"<structurizer_id>@<version>"``.
     structured_claims: int = 0
     structured_claims_by_structurizer: dict[str, int] = Field(default_factory=dict)
+    # Cumulative LLM spend from the store's recorded runs; ``None``
+    # when no run has recorded usage yet.
+    llm_spend: StoreLLMSpend | None = None
+    # Queue precision over the default window; ``None`` when the
+    # store has no curation collection and no gesture to measure.
+    curation_precision: CurationPrecision | None = None
 
 
 class LintFinding(BaseModel):
@@ -1868,7 +2226,15 @@ class LintFinding(BaseModel):
     # structurally (the ``detail`` prose truncates it to 8 chars) so a client
     # can link straight to the contradiction's evidence — the
     # ``scope=inconsistency`` graph render — without parsing prose.
+    # On an ``OPEN_INCONSISTENCY`` finding it is the record itself, which is
+    # also the finding's ``particle_id``.
     inconsistency_id: str | None = None
+    # The members of the open INCONSISTENCY record an ``OPEN_INCONSISTENCY``
+    # finding reports, by side: ``[[A, *further_a], [B, *further_b]]``, in the
+    # order ``review`` names them. A census record may name more
+    # than one claim per side; every other record names one.
+    # ``None`` on every other finding type.
+    conflict_sides: list[list[str]] | None = None
 
 
 class LintReport(BaseModel):

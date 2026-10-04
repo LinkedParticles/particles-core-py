@@ -34,6 +34,11 @@ from particles.core._resources import schemas_dir
 
 log = logging.getLogger(__name__)
 
+#: The published JSON-LD context's IRI: what an interchange unit and
+#: a vocabulary document name as their ``@context``. Served at the
+#: apex; ``particles.interchange.codec`` re-exports it.
+CONTEXT_URL = "https://linkedparticles.org/schemas/context.jsonld"
+
 #: A term maps a prefix only when its value is a plain IRI string ending in a
 #: gen-delim (JSON-LD 1.1 §4.1.5 — a simple term definition is usable as a
 #: prefix when its value ends in a gen-delim). Terms carrying an expanded

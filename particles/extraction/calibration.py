@@ -82,7 +82,8 @@ class FitDiagnostics:
     A temperature is a one-parameter regression of stated confidence onto
     observed correctness. It is identified only when **both** variables vary,
     and the result is worth storing only if it actually improves anything.
-    Four conditions each return a number while measuring nothing:
+    Four conditions each return a number while measuring nothing, and a fifth
+    asks whether the number survives contact with prose the fit never saw:
 
     * **Degenerate labels** — no outcome contrast; every label the
       same. NLL is monotone in T, so the optimizer walks to whichever bound
@@ -98,8 +99,12 @@ class FitDiagnostics:
       but spread is a property of the extractor's output.
     * **Non-improving** — ``ece_after >= ece_before``. A calibration
       that does not reduce calibration error is not a calibration. This is the
-      only condition about the fit's *quality* rather than its input *shape*,
+      first condition about the fit's *quality* rather than its input *shape*,
       and it needs the caller to supply both figures via :meth:`with_ece`.
+    * **Held-out regression** — the fit raises ECE on recorded
+      pairs it was not fitted on, or a check was required and found none
+      (:attr:`heldout_missing`). Opt-in through :meth:`with_heldout`; the
+      ``extractor calibrate`` persistence path always opts in.
 
     Reported separately because the operator's next move differs for each: a
     degenerate label set means the suite's gold coverage is total (author a
@@ -122,6 +127,26 @@ class FitDiagnostics:
     temperature: float
     ece_before: float | None = None
     ece_after: float | None = None
+    heldout_n: int | None = None
+    """Held-out pairs the fit was scored on; ``None`` when no check was asked for."""
+    heldout_ece_before: float | None = None
+    heldout_ece_after: float | None = None
+
+    def with_heldout(self, check: HeldOutCheck) -> FitDiagnostics:
+        """Return a copy carrying an out-of-sample check.
+
+        Separate from :meth:`with_ece` because the two answer different
+        questions. The in-sample pair asks whether the fit calibrates its own
+        training data; this pair asks whether it calibrates prose it never saw.
+        A ``check`` with ``n == 0`` records that a check was required and found
+        nothing to score, which :attr:`heldout_missing` refuses.
+        """
+        return replace(
+            self,
+            heldout_n=check.n,
+            heldout_ece_before=check.ece_before,
+            heldout_ece_after=check.ece_after,
+        )
 
     def with_ece(self, before: float, after: float) -> FitDiagnostics:
         """Return a copy carrying the ECE pair the non-improvement check needs.
@@ -156,6 +181,18 @@ class FitDiagnostics:
         return self.ece_after >= self.ece_before
 
     @property
+    def heldout_missing(self) -> bool:
+        """True when a held-out check was required and had no pairs to score."""
+        return self.heldout_n == 0
+
+    @property
+    def heldout_worsens(self) -> bool:
+        """True when the fit raised calibration error on the held-out pairs."""
+        if not self.heldout_n or self.heldout_ece_before is None or self.heldout_ece_after is None:
+            return False
+        return self.heldout_ece_after > self.heldout_ece_before
+
+    @property
     def is_trustworthy(self) -> bool:
         """True when nothing disqualifies the fit."""
         return not (
@@ -163,6 +200,8 @@ class FitDiagnostics:
             or self.hit_bound
             or self.predictor_degenerate
             or self.non_improving
+            or self.heldout_missing
+            or self.heldout_worsens
         )
 
     def reasons(self) -> list[str]:
@@ -205,7 +244,71 @@ class FitDiagnostics:
                 "error is not a calibration. This figure is in-sample, so failing it here "
                 "means it would fail a held-out estimate a fortiori."
             )
+        if self.heldout_missing:
+            out.append(
+                "no held-out check: no recorded benchmark run matches this extractor, "
+                "its version and the extraction provider:model, so nothing shows the "
+                "fit transfers beyond the prose it was fitted on. Run `particles "
+                "extractor benchmark <id> --runs 3` under the same configuration, then "
+                "re-run this command."
+            )
+        if self.heldout_worsens:
+            assert self.heldout_ece_before is not None and self.heldout_ece_after is not None
+            out.append(
+                f"held-out regression: on {self.heldout_n} benchmark claim(s) the fit "
+                "never saw, calibration error would go from "
+                f"{self.heldout_ece_before:.4f} to {self.heldout_ece_after:.4f}. An "
+                "in-sample improvement does not show that a temperature transfers to "
+                "sources it was not fitted on."
+            )
         return out
+
+
+@dataclass(frozen=True)
+class HeldOutCheck:
+    """A fitted temperature scored on pairs it was not fitted on.
+
+    The in-sample guard is one-sided: a fit that fails it would
+    fail out of sample too, but one that passes it says nothing about prose of
+    another kind. Measured 2026-10-01, every general-extractor fit on the
+    hedged calibration suite cleared all four in-sample guards and raised ECE
+    on the flatly stated benchmark suite, including the production
+    calibration. This is the check that would have refused them.
+    """
+
+    n: int
+    """Held-out pairs scored. ``0`` means there was nothing to score."""
+    ece_before: float
+    """ECE of the raw stated confidences over the held-out pairs."""
+    ece_after: float
+    """ECE of the same pairs with the temperature applied."""
+
+
+def heldout_check(temperature: float, raw_values: list[float], correct: list[bool]) -> HeldOutCheck:
+    """Score ``temperature`` on recorded ``(raw, correct)`` pairs it was not fitted on.
+
+    Pure: no I/O and no fit. The pairs are the raw stated confidences a
+    benchmark run recorded (the harness never applies a stored calibration)
+    and their labels. Saturated values are kept, exactly as the in-sample
+    figures keep them, because the apply leaves them in place and the store
+    would hold them.
+
+    Args:
+        temperature: The fitted T to evaluate.
+        raw_values: Recorded raw confidences, never the output of a scaler.
+        correct: Labels for ``raw_values``; ``extractor calibrate`` passes
+            semantic match, the calibration label.
+    """
+    if len(raw_values) != len(correct):
+        raise ValueError("raw_values and correct must have the same length")
+    if not raw_values:
+        return HeldOutCheck(n=0, ece_before=0.0, ece_after=0.0)
+    scaled = TemperatureScaler(temperature=temperature).calibrate_batch(raw_values)
+    return HeldOutCheck(
+        n=len(raw_values),
+        ece_before=expected_calibration_error(raw_values, correct),
+        ece_after=expected_calibration_error(scaled, correct),
+    )
 
 
 @dataclass
@@ -356,6 +459,36 @@ def scaler_for_record(calibration: ExtractorCalibration) -> TemperatureScaler | 
     if calibration.transform != TRANSFORM_LOGIT:
         return None
     return TemperatureScaler(temperature=calibration.temperature)
+
+
+def version_mismatch_reason(calibration: ExtractorCalibration, running_version: str) -> str | None:
+    """Why a stored calibration must not be applied at ``running_version``, or None.
+
+    A record applies only to the extractor version it was fitted under. The
+    temperature is a property of the prompt as much as of the model: measured
+    2026-10-01 on recorded general-extractor runs, the prompt change between
+    0.15.0 and 0.16.0 moved raw ECE from 0.030 to 0.100, and a temperature
+    fitted on 0.16.0 runs, which improves held-out 0.16.0 runs in 4 of 4 folds,
+    raises 0.15.0's ECE from 0.021 to 0.096. A fit that inverts is worse than
+    none, and the confidence it writes is immutable, so a mismatch is
+    a refusal rather than a warning (the pattern, not the one).
+
+    A record with no ``extractor_version`` was persisted before the key
+    existed, so nothing says which prompt it was fitted against; it is refused
+    too. The one such record known in the field is the production
+    general-extractor fit, measured to hurt at both versions.
+
+    The returned phrase completes ``NOT APPLIED (…)`` and is the same in the
+    extract log, the snapshot's quality note and ``extractor calibrations``.
+    The caller falls back to ``calibration_source=EXTRACTOR_DIRECT`` and keeps
+    the record: refitting under the running version replaces it, and
+    ``extractor calibration-forget`` retires it.
+    """
+    if calibration.extractor_version is None:
+        return f"fitted under an unknown extractor version, running {running_version}"
+    if calibration.extractor_version != running_version:
+        return f"fitted under {calibration.extractor_version}, running {running_version}"
+    return None
 
 
 def fitted_suite_ids(benchmark_suite_id: str) -> set[str]:

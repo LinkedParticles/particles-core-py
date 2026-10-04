@@ -33,10 +33,9 @@ extractors both route their chunked-extraction work through it.
 
 from __future__ import annotations
 
-import functools
 import hashlib
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
@@ -45,12 +44,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from particles.extraction.general import (
     CandidateParticle,
+    ChunkOutcome,
     ExtractionResult,
     _build_llm_request,
     _call_llm,
-    _finish_llm_call,
-    _pooled_group_complete,
+    _pooled_extract,
 )
+from particles.extraction.tool_turns import TOOL_TURN_LABEL
 
 if TYPE_CHECKING:
     from particles.llm import CompletionPool
@@ -92,14 +92,84 @@ class ChunkUnit:
             anywhere persistent.
         chunk_text: Exact text the LLM would see. The SHA-256 of this
             string is the cache key.
+        context: Already-extracted text shown before ``chunk_text`` on an
+            append-only delta read, as its own labelled section
+            that the model extracts nothing from. ``None`` on every other
+            chunk. When set, the cache key covers it too.
     """
 
     chunk_id: str
     chunk_text: str
+    context: str | None = None
+
+    @property
+    def prompt_text(self) -> str:
+        """The exact text this chunk puts in front of the model, nonce aside.
+
+        ``chunk_text`` alone for an ordinary chunk; the context section and
+        the chunk, each under its label, for a delta chunk.
+        A gist chunk is hashed with its header the same way.
+        """
+        if self.context is None:
+            return self.chunk_text
+        return f"[context]\n{self.context}\n\n[source]\n{self.chunk_text}"
+
+    @property
+    def prompt_hash(self) -> str:
+        """SHA-256 of :attr:`prompt_text`: the chunk's carry-forward key and ``chunk_hash``."""
+        return _hash_chunk(self.prompt_text)
+
+
+def _own_carried(
+    chunk_hash: str,
+    resume_carried: Mapping[str, Sequence[str]] | None,
+    supersede_ids: frozenset[str],
+) -> list[str]:
+    """The ids of this snapshot's own claims carrying ``chunk_hash``, if any.
+
+    The fallback when the version-matched lookup found nothing: on a partial
+    read's retry, a chunk an earlier attempt already wrote is carried forward
+    whatever extractor version wrote it.
+    """
+    if not resume_carried:
+        return []
+    return [pid for pid in resume_carried.get(chunk_hash, ()) if pid not in supersede_ids]
 
 
 def _hash_chunk(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _chunk_has_tool_turns(chunk: ChunkUnit, tool_turns_present: bool) -> bool:
+    """Whether this chunk's prompt needs the tool-turn rule.
+
+    Gated on the caller's flag so a non-transcript source that merely quotes
+    the label never gets the rule, then narrowed per chunk so a chunk with no
+    relabelled turn keeps the no-tool-turn prompt byte-identical. A delta
+    chunk's context counts, since the model reads it too.
+    """
+    return tool_turns_present and TOOL_TURN_LABEL in chunk.prompt_text
+
+
+def _llm_kwargs(
+    chunk: ChunkUnit, reference_published_at: datetime | None, tool_turns_present: bool
+) -> dict[str, Any]:
+    """The optional keywords one chunk's default ``_call_llm`` carries, each only when set.
+
+    The reference anchor when the source exposes a publication instant,
+    the tool-turn flag when this chunk carries a relabelled turn,
+    the context section of a delta chunk. The
+    common call stays byte-identical to the bare one, and no test double sees
+    a keyword it did not ask for.
+    """
+    kwargs: dict[str, Any] = {}
+    if reference_published_at is not None:
+        kwargs["reference_published_at"] = reference_published_at
+    if _chunk_has_tool_turns(chunk, tool_turns_present):
+        kwargs["tool_turns_present"] = True
+    if chunk.context is not None:
+        kwargs["context"] = chunk.context
+    return kwargs
 
 
 async def extract_with_carry_forward(
@@ -113,6 +183,8 @@ async def extract_with_carry_forward(
     reference_published_at: datetime | None = None,
     completion_pool: CompletionPool | None = None,
     supersede_ids: frozenset[str] = frozenset(),
+    tool_turns_present: bool = False,
+    resume_carried: Mapping[str, Sequence[str]] | None = None,
 ) -> ExtractionResult:
     """Run chunked LLM extraction with chunk-hash-based carry-forward.
 
@@ -151,15 +223,29 @@ async def extract_with_carry_forward(
             is defeated by the cache — the chunk text and
             extractor version are unchanged by design, so every in-scope
             particle would cache-hit and keep its old model's output.
+        tool_turns_present: The caller relabelled tool turns in the source.
+            Each chunk that carries the label gets the
+            tool-turn rule in its prompt, on both the sequential and the
+            pooled path. Ignored for an injected ``call_llm``, which owns its
+            own prompt.
+        resume_carried: On the retry of a snapshot holding a partial read,
+            the chunk hashes its own ACTIVE claims carry, each with those
+            claims' ids. A chunk whose hash is here is carried
+            forward even when the version match finds nothing: the claims came
+            from an earlier attempt at this same snapshot, possibly under an
+            older extractor version, and re-reading the chunk would write them
+            a second time. Ids in ``supersede_ids`` never count.
 
     Returns:
         An ``ExtractionResult`` whose ``candidates`` are newly LLM-extracted
         CandidateParticles (each stamped with its chunk's hash) and whose
         ``carry_forward_ids`` are existing particle IDs eligible for
-        carry-forward. Caller is responsible for the usual downstream
-        processing (subject resolution, conflict resolution, persistence)
-        on candidates and for honouring ``carry_forward_ids`` during
-        supersession.
+        carry-forward. ``chunk_outcomes`` holds one entry per chunk, in
+        order, saying whether it was carried, answered, failed or capped;
+        the caller fills in each chunk's start. Caller is
+        responsible for the usual downstream processing (subject resolution,
+        conflict resolution, persistence) on candidates and for honouring
+        ``carry_forward_ids`` during supersession.
     """
     if completion_pool is not None and call_llm is None:
         # the chunk calls are a set, not a chain — the per-chunk
@@ -175,31 +261,19 @@ async def extract_with_carry_forward(
             reference_published_at=reference_published_at,
             completion_pool=completion_pool,
             supersede_ids=supersede_ids,
+            tool_turns_present=tool_turns_present,
+            resume_carried=resume_carried,
         )
 
+    outcomes: list[ChunkOutcome] = []
     new_candidates: list[CandidateParticle] = []
     carry_forward_ids: list[str] = []
+    unread: list[str] = []
     notes: list[str] = []
     transient_errors = 0
     llm_calls_made = 0
-    # bind the reference anchor onto the DEFAULT ``_call_llm`` only
-    # when the source exposes a publication instant, so relative validity
-    # boundaries resolve against it. When there is no anchor (the common case)
-    # the default ``_call_llm`` is used bare — byte-identical to the pre-0197
-    # call, so no existing caller or test double sees a new keyword. The partial
-    # is created here at call time so a patched ``incremental._call_llm`` is
-    # captured. An injected ``call_llm`` (the journal extractor) is
-    # used verbatim — it owns its own prompt and takes no anchor.
-    llm_call: ChunkLLMCall
-    if call_llm is not None:
-        llm_call = call_llm
-    elif reference_published_at is not None:
-        llm_call = functools.partial(_call_llm, reference_published_at=reference_published_at)
-    else:
-        llm_call = _call_llm
-
     for chunk in chunks:
-        h = _hash_chunk(chunk.chunk_text)
+        h = chunk.prompt_hash
         # Skip the cache lookup when carry-forward is unregistered (pure Client,
         # store-free), when we have no session (e.g. unit tests that drive the
         # helper directly), or no corpus entry yet (importer-time extraction
@@ -220,30 +294,45 @@ async def extract_with_carry_forward(
             # Particles the caller is replacing (the reindex supersede set)
             # must not satisfy the cache — see the supersede_ids docstring.
             existing = [p for p in existing if p.id not in supersede_ids]
-        if existing:
+        carried = [p.id for p in existing] or _own_carried(h, resume_carried, supersede_ids)
+        if carried:
             log.info(
                 "Carry-forward: chunk %s (hash %s…) reuses %d existing particle(s)",
                 chunk.chunk_id,
                 h[:8],
-                len(existing),
+                len(carried),
             )
-            carry_forward_ids.extend(p.id for p in existing)
+            carry_forward_ids.extend(carried)
             notes.append(
                 f"CHUNK_CARRY_FORWARD: {chunk.chunk_id} "
-                f"reused {len(existing)} particles (hash {h[:8]}…)"
+                f"reused {len(carried)} particles (hash {h[:8]}…)"
             )
+            outcomes.append(ChunkOutcome(chunk.chunk_id, h, "carried"))
             continue
 
         if max_llm_calls is not None and llm_calls_made >= max_llm_calls:
             notes.append(
                 f"CHUNK_TRUNCATION: {chunk.chunk_id} skipped (LLM call cap {max_llm_calls} reached)"
             )
+            unread.append(chunk.chunk_id)
+            outcomes.append(ChunkOutcome(chunk.chunk_id, h, "capped"))
             continue
 
-        candidates, chunk_notes, transient = await llm_call(chunk.chunk_text)
+        if call_llm is not None:
+            # An injected caller (the journal extractor) owns its own
+            # prompt and takes no anchor or tool-turn flag.
+            candidates, chunk_notes, transient = await call_llm(chunk.chunk_text)
+        else:
+            # ``_call_llm`` is looked up here, at call time, so a patched
+            # ``incremental._call_llm`` is the one called.
+            candidates, chunk_notes, transient = await _call_llm(
+                chunk.chunk_text,
+                **_llm_kwargs(chunk, reference_published_at, tool_turns_present),
+            )
         llm_calls_made += 1
         if transient:
             transient_errors += 1
+        outcomes.append(ChunkOutcome(chunk.chunk_id, h, "failed" if transient else "answered"))
         for c in candidates:
             c.chunk_hash = h
         new_candidates.extend(candidates)
@@ -263,6 +352,9 @@ async def extract_with_carry_forward(
         quality_notes=notes,
         carry_forward_ids=carry_forward_ids,
         transient_error_count=transient_errors,
+        answered_calls=llm_calls_made - transient_errors,
+        unread_chunk_ids=unread,
+        chunk_outcomes=outcomes,
     )
 
 
@@ -277,6 +369,8 @@ async def _extract_chunks_pooled(
     reference_published_at: datetime | None,
     completion_pool: CompletionPool,
     supersede_ids: frozenset[str] = frozenset(),
+    tool_turns_present: bool = False,
+    resume_carried: Mapping[str, Sequence[str]] | None = None,
 ) -> ExtractionResult:
     """Pooled-batch twin of the sequential chunk loop.
 
@@ -288,12 +382,14 @@ async def _extract_chunks_pooled(
     keep chunk order, so the output is ordered as the sequential path's.
     """
     carry_forward_ids: list[str] = []
+    unread: list[str] = []
     notes_by_chunk: list[list[str]] = []
+    outcomes: list[ChunkOutcome] = []
     pending: list[tuple[int, ChunkUnit, str]] = []
     llm_calls_planned = 0
 
     for chunk in chunks:
-        h = _hash_chunk(chunk.chunk_text)
+        h = chunk.prompt_hash
         chunk_notes_slot: list[str] = []
         notes_by_chunk.append(chunk_notes_slot)
         # Same lookup guard as the sequential loop: skip when carry-forward is
@@ -313,41 +409,53 @@ async def _extract_chunks_pooled(
             )
             # Same supersede-set exclusion as the sequential loop.
             existing = [p for p in existing if p.id not in supersede_ids]
-        if existing:
+        carried = [p.id for p in existing] or _own_carried(h, resume_carried, supersede_ids)
+        if carried:
             log.info(
                 "Carry-forward: chunk %s (hash %s…) reuses %d existing particle(s)",
                 chunk.chunk_id,
                 h[:8],
-                len(existing),
+                len(carried),
             )
-            carry_forward_ids.extend(p.id for p in existing)
+            carry_forward_ids.extend(carried)
             chunk_notes_slot.append(
                 f"CHUNK_CARRY_FORWARD: {chunk.chunk_id} "
-                f"reused {len(existing)} particles (hash {h[:8]}…)"
+                f"reused {len(carried)} particles (hash {h[:8]}…)"
             )
+            outcomes.append(ChunkOutcome(chunk.chunk_id, h, "carried"))
             continue
 
         if max_llm_calls is not None and llm_calls_planned >= max_llm_calls:
             chunk_notes_slot.append(
                 f"CHUNK_TRUNCATION: {chunk.chunk_id} skipped (LLM call cap {max_llm_calls} reached)"
             )
+            unread.append(chunk.chunk_id)
+            outcomes.append(ChunkOutcome(chunk.chunk_id, h, "capped"))
             continue
 
-        pending.append((len(notes_by_chunk) - 1, chunk, h))
+        outcomes.append(ChunkOutcome(chunk.chunk_id, h, "answered"))
+        pending.append((len(outcomes) - 1, chunk, h))
         llm_calls_planned += 1
 
     planned = [
-        _build_llm_request(chunk.chunk_text, reference_published_at=reference_published_at)
+        _build_llm_request(
+            chunk.chunk_text,
+            reference_published_at=reference_published_at,
+            tool_turns_present=_chunk_has_tool_turns(chunk, tool_turns_present),
+            context=chunk.context,
+        )
         for _, chunk, _ in pending
     ]
-    results, provider_model = await _pooled_group_complete(completion_pool, planned)
+    settled = await _pooled_extract(completion_pool, planned)
 
     new_candidates: list[CandidateParticle] = []
     transient_errors = 0
-    for (slot, chunk, h), raw in zip(pending, results, strict=True):
-        candidates, chunk_notes, transient = _finish_llm_call(raw, provider_model, None)
+    for (slot, chunk, h), (candidates, chunk_notes, transient) in zip(
+        pending, settled, strict=True
+    ):
         if transient:
             transient_errors += 1
+            outcomes[slot].status = "failed"
         for c in candidates:
             c.chunk_hash = h
         new_candidates.extend(candidates)
@@ -366,4 +474,7 @@ async def _extract_chunks_pooled(
         quality_notes=[note for slot in notes_by_chunk for note in slot],
         carry_forward_ids=carry_forward_ids,
         transient_error_count=transient_errors,
+        answered_calls=len(pending) - transient_errors,
+        unread_chunk_ids=unread,
+        chunk_outcomes=outcomes,
     )

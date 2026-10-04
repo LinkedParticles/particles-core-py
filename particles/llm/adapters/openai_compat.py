@@ -29,6 +29,15 @@ mis-configured endpoint just as it does for a hosted provider. Budget
 exhaustion — ``finish_reason: length``, an HTTP 200 whose text stops mid-token
 — is named as truncation rather than handed to the call site as unexplained
 malformed JSON; see :func:`_extract_text`.
+
+The Anthropic SDK's non-streaming ceiling (a ``max_tokens`` above ~21333 is
+refused unless streamed) has no counterpart here: raw ``httpx``
+sends any budget, so this adapter never streams. Two different bounds apply
+instead. The entry's ``timeout_seconds`` is a wall-clock limit on the whole
+non-streaming reply, so a long reply must finish within it, and a vendor that
+caps output below the requested budget rejects the request (usually HTTP 400).
+Both are operator configuration: raise ``timeout_seconds``, or lower
+``extraction.max_tokens`` for such a vendor.
 """
 
 from __future__ import annotations
@@ -45,7 +54,13 @@ from typing import Any
 import httpx
 from opentelemetry import metrics, trace
 
-from particles.llm.registry import CompletionError, EmptyCompletionError, VisionImage
+from particles.llm.registry import (
+    CompletionError,
+    EmptyCompletionError,
+    VisionImage,
+    budget_hint,
+)
+from particles.llm.usage import record_usage
 
 log = logging.getLogger(__name__)
 
@@ -108,10 +123,12 @@ _RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 # answer, so a prompt that fit comfortably under 8192 on a non-reasoning model
 # can spend the whole budget before the answer starts. Observed live 2026-08
 # across DeepSeek-V4 flash/pro and Kimi K3; 16384 cleared all three.
-_TRUNCATION_HINT = (
-    "for reasoning models the thinking spends from the same budget as the "
-    "answer — raise extraction.max_tokens (or the call site's budget)"
-)
+def _truncation_hint() -> str:
+    """The fix for a truncated reply, naming the budget of the purpose in flight."""
+    return (
+        "for reasoning models the thinking spends from the same budget as the "
+        f"answer; {budget_hint()}"
+    )
 
 
 def _budget_phrase(max_tokens: int | None) -> str:
@@ -475,6 +492,9 @@ def _extract_text(
                         content = raw.strip()
 
     truncated = finish_reason == "length"
+    # Billed whether or not the reply carries text, so counted before the
+    # empty-reply raise below.
+    _record_payload_usage(payload, provider_model, truncated=truncated)
     if truncated:
         # The span opened by ``complete()`` is still current here, so the fact
         # reaches telemetry as well as the log (no-op without an OTel SDK).
@@ -487,7 +507,7 @@ def _extract_text(
                 "the text stops mid-token and will not parse — %s.",
                 provider_model,
                 _budget_phrase(max_tokens),
-                _TRUNCATION_HINT,
+                _truncation_hint(),
             )
         return content
 
@@ -495,7 +515,37 @@ def _extract_text(
         raise EmptyCompletionError(
             f"LLM endpoint {provider_model} returned an empty reply truncated "
             f"at {_budget_phrase(max_tokens)} (finish_reason=length): the whole "
-            f"budget was spent before any answer text — {_TRUNCATION_HINT}"
+            f"budget was spent before any answer text — {_truncation_hint()}"
         )
     detail = f" (finish_reason={finish_reason})" if finish_reason is not None else ""
     raise EmptyCompletionError(f"LLM endpoint response carried no text content{detail}")
+
+
+def _token_count(mapping: object, name: str) -> int:
+    """One non-negative token count off a ``usage`` mapping; 0 when absent."""
+    if not isinstance(mapping, dict):
+        return 0
+    value = mapping.get(name)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def _record_payload_usage(payload: object, provider_model: str, *, truncated: bool) -> None:
+    """Report a ``chat/completions`` reply's ``usage`` to the open usage scopes.
+
+    ``usage`` is optional on many OpenAI-compatible servers; a reply without
+    it still counts as a call, with zero tokens. ``prompt_tokens`` includes any
+    cached prefix, reported separately as
+    ``prompt_tokens_details.cached_tokens``, so the cached share is moved out
+    of the input count to match the Anthropic meaning of ``input_tokens``.
+    """
+    usage = payload.get("usage") if isinstance(payload, dict) else None
+    prompt = _token_count(usage, "prompt_tokens")
+    details = usage.get("prompt_tokens_details") if isinstance(usage, dict) else None
+    cached = min(_token_count(details, "cached_tokens"), prompt)
+    record_usage(
+        provider_model,
+        input_tokens=prompt - cached,
+        output_tokens=_token_count(usage, "completion_tokens"),
+        cache_read_tokens=cached,
+        hit_max_tokens=truncated,
+    )

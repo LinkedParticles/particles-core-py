@@ -55,6 +55,10 @@ class StatusReason(StrEnum):
     # claim retired by a strictly newer, contradicting claim from the same source
     # lineage — a record that the world changed, not a verdict on the value, so it
     # is deliberately outside the judgment set (a later revert re-mints)
+    SUPERSEDED_BY_REANCHOR = "SUPERSEDED_BY_REANCHOR"  #  a claim whose
+    # meaning relied on a state an update retired, replaced by a dated restatement
+    # anchored to that state. Records that its referent moved, not that it was
+    # wrong, so it is outside the judgment set as well
     DUPLICATE_MERGED = "DUPLICATE_MERGED"  # redundant byte-identical copy folded
     # into its group's survivor by exact-duplicate auto-merge. Deliberately distinct from
     # EXPLICIT_SUPERSESSION so a revert can select precisely auto-merge's own writes.

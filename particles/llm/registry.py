@@ -31,11 +31,15 @@ import logging
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any, Literal, Protocol, runtime_checkable
+
+from particles.llm.batch_budget import current_batch_wait_budget
+from particles.llm.usage import current_purpose, purpose_scope
 
 log = logging.getLogger(__name__)
 
-# The six completion purposes. The string values match the field names on
+# The completion purposes. The string values match the field names on
 # ``LLMConfig`` so ``LLMConfig.for_purpose`` is a plain ``getattr``.
 # ``benchmark_answer`` is the memory-benchmark *answering* model —
 # distinct from ``benchmark`` (the judge) so the two can be routed and pinned
@@ -49,6 +53,9 @@ LLMPurpose = Literal[
     "benchmark",
     "benchmark_answer",
     "abstraction",
+    "verification",
+    "subject_resolution",
+    "use_judge",
 ]
 
 
@@ -80,6 +87,24 @@ class EmptyCompletionError(CompletionError):
     at. The memory benchmark's excluded-call disclosure splits its two counts
     on exactly this distinction.
     """
+
+
+class RequestFailure(StrEnum):
+    """Why one request of a :func:`complete_many` set came back ``None``.
+
+    The many-request twin of the split between :class:`CompletionError` and
+    :class:`EmptyCompletionError`. A caller that retries a budget failure at a
+    larger budget must not retry everything that came back ``None``: an
+    errored or expired batch entry is not a budget problem, and re-submitting
+    it re-buys the wait that already failed.
+    """
+
+    UNAVAILABLE = "unavailable"
+    """No reply: the request errored, expired or was cancelled, or the call failed."""
+    EMPTY = "empty"
+    """The model replied with no text: a reply that spent its whole ``max_tokens``
+    before the answer (a thinking model), or a refusal. The same request at the
+    same budget tends to reproduce it."""
 
 
 @dataclass(frozen=True)
@@ -204,6 +229,12 @@ class BatchCompletionProvider(Protocol):
         *job* could not be run at all — a submission the provider rejected, an
         expired credential. A job that ran but whose individual requests failed
         reports those as ``None`` entries, not as an exception.
+
+        An adapter that can tell *why* a request failed accepts a
+        ``failures_out: list[RequestFailure | None]`` keyword and extends it
+        positionally (``None`` for a request that returned text). One that
+        cannot leaves it alone, and the caller reads every ``None`` as
+        :attr:`RequestFailure.UNAVAILABLE`, the reading that retries nothing.
         """
         ...
 
@@ -285,6 +316,36 @@ def override_providers(
         yield
     finally:
         _OVERRIDES.reset(token)
+
+
+#: The config knob that sets a purpose's output budget, where one exists. Every
+#: other purpose's call sites pass a budget fixed in code.
+_BUDGET_KNOBS: Mapping[str, str] = {
+    "extraction": "extraction.max_tokens",
+    "query_response": "query.answer_max_tokens",
+    "verification": "audit.verify_max_tokens",
+    "subject_resolution": "subjects.wikidata_judge_max_tokens",
+}
+
+
+def budget_hint() -> str:
+    """How to raise the output budget of the completion in flight, named by its purpose.
+
+    An adapter appends this to its truncation warning. The purpose is the one
+    the registry's entry points scoped the call with (:func:`purpose_scope`),
+    so a truncated contradiction probe no longer tells the operator to raise
+    ``extraction.max_tokens``.
+    """
+    purpose = current_purpose()
+    if purpose is None:
+        return "raise the call site's token budget"
+    knob = _BUDGET_KNOBS.get(purpose)
+    if knob is not None:
+        return f"raise {knob} (llm purpose {purpose})"
+    return (
+        f"the llm purpose {purpose} call site sets this budget in code, not in "
+        f"config; a model that writes past it needs a larger call-site budget"
+    )
 
 
 def get_provider(purpose: LLMPurpose) -> CompletionProvider:
@@ -390,16 +451,18 @@ async def complete_with_provider_model(
     invisible here.
     """
     provider = get_provider(purpose)
-    text = await provider.complete(
-        prompt,
-        max_tokens=max_tokens,
-        system=system,
-        temperature=temperature,
-        images=images,
-        response_schema=response_schema,
-        cache_prefix=cache_prefix,
-        **opts,
-    )
+    # The adapter reports the response's usage; this tags it with the purpose.
+    with purpose_scope(purpose):
+        text = await provider.complete(
+            prompt,
+            max_tokens=max_tokens,
+            system=system,
+            temperature=temperature,
+            images=images,
+            response_schema=response_schema,
+            cache_prefix=cache_prefix,
+            **opts,
+        )
     return text, provider.provider_model
 
 
@@ -453,6 +516,7 @@ async def complete_many_with_provider_model(
     temperature: float | None = None,
     response_schema: dict[str, Any] | None = None,
     latency_tolerant: bool = False,
+    failures_out: list[RequestFailure | None] | None = None,
 ) -> tuple[list[str | None], str]:
     """Run many independent completions and report the pairing that served them.
 
@@ -464,26 +528,75 @@ async def complete_many_with_provider_model(
     single-call variant: config can reload mid-pass, so re-resolving to ask
     "who served that?" could disagree with the calls it claims to describe.
     An empty request set returns ``([], "")`` without resolving a provider.
-    """
-    from particles.config import get_config
 
+    ``failures_out``, when given, is extended with one entry per request,
+    aligned with the results: ``None`` where text came back, otherwise the
+    :class:`RequestFailure` that says whether a larger budget could help.
+    """
     if not requests:
         return [], ""
 
-    provider = get_provider(purpose)
+    with purpose_scope(purpose):
+        results, provider_model, failures = await _complete_many_scoped(
+            get_provider(purpose),
+            purpose,
+            requests,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            response_schema=response_schema,
+            latency_tolerant=latency_tolerant,
+        )
+    if failures_out is not None:
+        failures_out.extend(failures)
+    return results, provider_model
+
+
+async def _complete_many_scoped(
+    provider: CompletionProvider,
+    purpose: LLMPurpose,
+    requests: Sequence[CompletionRequest],
+    *,
+    max_tokens: int,
+    temperature: float | None,
+    response_schema: dict[str, Any] | None,
+    latency_tolerant: bool,
+) -> tuple[list[str | None], str, list[RequestFailure | None]]:
+    """The body of :func:`complete_many_with_provider_model`, inside its purpose scope.
+
+    Returns ``(results, provider_model, failures)``, all three aligned.
+    """
+    from particles.config import get_config
+
     batch_cfg = get_config().llm.batch
-    if (
+    batchable = (
         latency_tolerant
         and batch_cfg.enabled
         and len(requests) >= batch_cfg.min_requests
         and isinstance(provider, BatchCompletionProvider)
-    ):
+    )
+    budget = current_batch_wait_budget()
+    if batchable and budget is not None and not budget.can_submit():
+        # The run's batch-wait budget is spent: serve this set the
+        # way ``llm.batch.enabled: false`` would, and say so once per set.
+        log.info(
+            "Batch-wait budget spent (%.0fs of %.0fs); %d %s request(s) run "
+            "sequentially at full price.",
+            budget.spent_seconds,
+            budget.budget_seconds,
+            len(requests),
+            purpose,
+        )
+        budget.record_sequential(len(requests))
+        batchable = False
+    if batchable and isinstance(provider, BatchCompletionProvider):
+        reported: list[RequestFailure | None] = []
         try:
             results = await provider.complete_many(
                 requests,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 response_schema=response_schema,
+                failures_out=reported,
             )
         except Exception as exc:
             # The *job* could not be run (submission rejected, SDK too old to
@@ -511,9 +624,37 @@ async def complete_many_with_provider_model(
                 results = [*results[: len(requests)]] + [None] * max(
                     0, len(requests) - len(results)
                 )
-            return results, provider.provider_model
+            return results, provider.provider_model, _align_failures(results, reported)
 
+    out, failures = await run_sequential(
+        provider,
+        requests,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        response_schema=response_schema,
+    )
+    return out, provider.provider_model, failures
+
+
+async def run_sequential(
+    provider: CompletionProvider,
+    requests: Sequence[CompletionRequest],
+    *,
+    max_tokens: int,
+    temperature: float | None,
+    response_schema: dict[str, Any] | None,
+) -> tuple[list[str | None], list[RequestFailure | None]]:
+    """Serve ``requests`` one ``complete()`` call at a time, aligned results and failures.
+
+    The sequential path every batching decision falls back to: the registry's
+    own (batching off, below ``min_requests``, a refused job, a spent batch-wait
+    budget) and a batch adapter's when that budget runs out between chunks.
+    An
+    account-level failure re-raises on the first call so the breaker
+    trips once; any other failure is that one request's ``None``.
+    """
     out: list[str | None] = []
+    failures: list[RequestFailure | None] = []
     for request in requests:
         try:
             out.append(
@@ -526,6 +667,7 @@ async def complete_many_with_provider_model(
                     cache_prefix=request.cache_prefix,
                 )
             )
+            failures.append(None)
         except Exception as exc:
             from particles.llm.errors import is_account_level_failure
 
@@ -536,4 +678,28 @@ async def complete_many_with_provider_model(
                 raise
             log.info("Completion failed for one request of %d: %s", len(requests), exc)
             out.append(None)
-    return out, provider.provider_model
+            failures.append(
+                RequestFailure.EMPTY
+                if isinstance(exc, EmptyCompletionError)
+                else RequestFailure.UNAVAILABLE
+            )
+    return out, failures
+
+
+def _align_failures(
+    results: Sequence[str | None], reported: Sequence[RequestFailure | None]
+) -> list[RequestFailure | None]:
+    """One failure kind per result, trusting an adapter's report only where it fits.
+
+    Text is never a failure, and a ``None`` the adapter did not explain (it
+    reports nothing, or reports short) reads as ``UNAVAILABLE``: the kind that
+    retries nothing, so a silent adapter cannot buy a re-submission.
+    """
+    aligned: list[RequestFailure | None] = []
+    for i, result in enumerate(results):
+        if result is not None:
+            aligned.append(None)
+            continue
+        kind = reported[i] if i < len(reported) else None
+        aligned.append(kind if kind is not None else RequestFailure.UNAVAILABLE)
+    return aligned

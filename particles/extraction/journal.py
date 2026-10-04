@@ -53,12 +53,30 @@ from particles.core.schema import (
     Snapshot,
     UncertaintyNature,
 )
+from particles.extraction.components import (
+    ComponentTable,
+    PromptComponent,
+    assemble_prompt,
+    component_digest,
+    declare_components,
+    record_component,
+    record_prompt_components,
+)
 from particles.extraction.general import (
+    PATH_CHUNKED,
+    PATH_SINGLE_PASS,
+    PROMPT_REFERENCE,
+    REFERENCE_RULE,
+    ROUTING,
     CandidateParticle,
     ExtractionResult,
     _split_into_paragraph_chunks,
     _strip_obsidian_frontmatter,
+    candidate_to_particle,
     content_to_text,
+    path_component_digests,
+    routing_component_digest,
+    source_text,
 )
 from particles.extraction.subject_scope import SUBJECT_SCOPE_KEY, SUBJECT_SCOPE_SELF
 
@@ -66,6 +84,13 @@ log = logging.getLogger(__name__)
 
 SOURCE_TYPE = "JOURNAL"
 EXTRACTOR_ID = "journal-extractor"
+# 0.5.0: reference resolution, shared with general-extractor 0.16.0: a deictic
+#        or relative reference ("my flat", "last month") is replaced with what
+#        the same entry says it is, a locating claim the entry implies is
+#        emitted, and relative wording stays when the entry does not resolve it.
+#        No reference date is passed, so relative time resolves only against a
+#        date the entry states for itself. `reindex --extractor-version 0.4.0`
+#        re-extracts.
 # 0.4.0: the `subjects` instruction no longer says "[] for statements
 #        only about the author's own inner state *or actions*", which suppressed
 #        real subjects ("The author lost eight runs" is about the game); and each
@@ -88,7 +113,7 @@ EXTRACTOR_ID = "journal-extractor"
 #        (a dense entry whose JSON output hit the model token limit previously
 #        yielded 0 particles). Output differs for those cases, so the
 #        version-mismatch rule lets `reindex` re-extract them.
-EXTRACTOR_VERSION = "0.4.0"
+EXTRACTOR_VERSION = "0.5.0"
 # Free-text prose, same provenance trust as the general extractor.
 DEFAULT_TRUST_WEIGHT = 0.70
 APPLICABILITY = [
@@ -171,8 +196,66 @@ Return ONLY a JSON object. No prose before or after:
 }"""
 
 
+#: Component names of the journal prompt. ``prompt.reference`` is
+#: the general extractor's name for the rule both prompts share.
+PROMPT_JOURNAL_RULES = "prompt.journal.rules"
+PROMPT_JOURNAL_SCHEMA = "prompt.journal.schema"
+CODE_JOURNAL_PARSE = "code.journal.parse"
+
+
+def journal_prompt_components() -> list[PromptComponent]:
+    """The journal prompt's components, in prompt order.
+
+    The schema carries no per-rule fields, so it is one component with no
+    ``field`` text.
+    """
+    return [
+        PromptComponent(PROMPT_JOURNAL_RULES, _JOURNAL_RULES),
+        PromptComponent(PROMPT_REFERENCE, REFERENCE_RULE),
+        PromptComponent(PROMPT_JOURNAL_SCHEMA, _JOURNAL_SCHEMA),
+    ]
+
+
 def _build_journal_prompt() -> str:
-    return _JOURNAL_RULES + _JOURNAL_SCHEMA
+    return assemble_prompt(journal_prompt_components())
+
+
+def journal_parse_digest() -> str:
+    """The digest of the journal's reply-to-claim code (see ``parse_component_digest``)."""
+    return component_digest(
+        *(
+            source_text(f)
+            for f in (
+                content_to_text,
+                _strip_obsidian_frontmatter,
+                _parse_journal_response,
+                _salvage_claim_objects,
+                _salvage_narrative_label,
+                _subject_scope_properties,
+                candidate_to_particle,
+            )
+        )
+    )
+
+
+def journal_component_table() -> ComponentTable:
+    """Every component the journal extractor could exercise.
+
+    The whole prompt, the reply-to-claim code and the routing settings are on
+    every extraction; the path depends on the entry's length.
+    """
+    prompt = journal_prompt_components()
+    paths = path_component_digests()
+    digests = {c.name: c.digest for c in prompt}
+    digests.update({name: paths[name] for name in (PATH_SINGLE_PASS, PATH_CHUNKED)})
+    digests[CODE_JOURNAL_PARSE] = journal_parse_digest()
+    digests[ROUTING] = routing_component_digest()
+    always = {c.name for c in prompt} | {CODE_JOURNAL_PARSE, ROUTING}
+    return ComponentTable(digests=digests, always=frozenset(always))
+
+
+def _record_journal_path(name: str) -> None:
+    record_component(name, path_component_digests()[name])
 
 
 class JournalExtractor:
@@ -219,6 +302,8 @@ class JournalExtractor:
         # marked particles as absent (see extract_with_carry_forward).
         sup_obj = kwargs.get("supersede_ids")
         supersede_ids: frozenset[str] = sup_obj if isinstance(sup_obj, frozenset) else frozenset()
+        declare_components(journal_component_table())
+        record_component(ROUTING, routing_component_digest())
         text = self._normalise_text(content, is_markdown=is_markdown)
         if not text.strip():
             return ExtractionResult(quality_notes=["Empty content"])
@@ -255,12 +340,14 @@ class JournalExtractor:
         """
         cfg = get_config().extraction
         if len(text) > cfg.html_chunk_size:
+            _record_journal_path(PATH_CHUNKED)
             return await self._extract_chunked(
                 text,
                 session=session,
                 corpus_entry_id=corpus_entry_id,
                 supersede_ids=supersede_ids,
             )
+        _record_journal_path(PATH_SINGLE_PASS)
         candidates, notes, transient = await _call_journal_llm(text)
         return ExtractionResult(
             candidates=candidates,
@@ -337,7 +424,10 @@ async def _call_journal_llm(text: str) -> tuple[list[CandidateParticle], list[st
     # journal entry alone in the user turn behind a per-call nonce fence (was:
     # rules + "JOURNAL ENTRY:" + raw entry in one user message). Mirrors the
     # general extractor's ``_call_llm``.
-    system, user = fenced_prompt(_build_journal_prompt(), text, label="journal_entry")
+    components = journal_prompt_components()
+    record_prompt_components(components)
+    record_component(CODE_JOURNAL_PARSE, journal_parse_digest())
+    system, user = fenced_prompt(assemble_prompt(components), text, label="journal_entry")
     # the journal extractor's own completion seam; stamped
     # here for the same reason as ``general.py::_call_llm``.
     provider_model = ""

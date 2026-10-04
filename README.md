@@ -51,9 +51,9 @@ p = Particle(
     asserted_by="iau-2006",
 )
 
-validate_particle_dict(p.model_dump(mode="json"))   # []: valid against the normative JSON Schema
-unit = to_unit(p, [])                               # JSON-LD interchange unit
-from_unit(unit)                                     # …and back again
+validate_particle_dict(p.model_dump(mode="json"))  # []: valid against the normative JSON Schema
+unit = to_unit(p, [])  # JSON-LD interchange unit
+from_unit(unit)  # …and back again
 ```
 
 ```json

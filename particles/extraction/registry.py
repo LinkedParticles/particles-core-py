@@ -107,11 +107,13 @@ def _make_extractors() -> list[ExtractorPlugin]:
     from particles.extraction.reddit import RedditExtractor
     from particles.extraction.taxonomy import TaxonomyExtractor
     from particles.extraction.trust_lens import TrustLensExtractor
+    from particles.extraction.vocabulary import VocabularyExtractor
     from particles.extraction.wikidata import WikidataExtractor
 
     return [
         TaxonomyExtractor(),
         TrustLensExtractor(),
+        VocabularyExtractor(),  # VOCABULARY_DOCUMENT
         NumistaCoinExtractor(),
         NumistaIssuerExtractor(),
         NumistaListingExtractor(),

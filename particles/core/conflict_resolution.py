@@ -40,7 +40,7 @@ Ladder (normative, applied in order — §6.4, rung for rung):
      document replaces that one" is an *editorial* fact that does not depend on
      either claim's truth-aptness, so it must reach a superseded
      ``CONSTITUTIVE`` definition that the truth engine cannot see. It sits
-     *above* the truth-apt gate and the trust rung but *below* the ALEATORY
+     *above* the adjudicability gate and the trust rung but *below* the ALEATORY
      exclusion (rung 1). Single-trust-order stores only in v1 (matching
      rung 2). The
      ``has_contradiction_signal`` flag is **reframed** on this path as a
@@ -55,6 +55,12 @@ Ladder (normative, applied in order — §6.4, rung for rung):
      nothing to adjudicate; return CORROBORATES. This gate's *scope* is narrowed:
      it no longer blocks the editorial supersession prior above it,
      only the truth-engine rungs below.
+     Beside it sits the **genericity guard** (:func:`is_generic_instance_pair`):
+     a generic claim ("most mammals bear live young") and an
+     instance claim ("the platypus lays eggs") are not an adjudicable pair, so
+     the truth engine returns CORROBORATES for them as well. Two generics, or
+     two instance claims, still reach the rungs below. The guard is its own
+     function so the two gates stay separable.
   2. **Source trust check** (§6.4 rung 2, Extension B) — caller passes
      pre-resolved trust scores. When ``|score_new - score_existing| >=
      trust_differential_threshold``, the higher-trust side wins:
@@ -90,6 +96,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from particles.core.generics import is_generic_claim
 from particles.core.observer_scope import PairPrecondition
 from particles.core.schema import (
     SCHEMA_VERSION,
@@ -151,6 +158,46 @@ class ConflictVerdict(StrEnum):
     """Pair is not in conflict at all (e.g. below caller's similarity floor)."""
 
 
+def is_generic_instance_pair(a: Particle, b: Particle) -> bool:
+    """Whether exactly one side of the pair is a generic claim.
+
+    A quantified or generic claim ("most mammals bear live young", "Xs
+    typically Y") and an instance claim ("the platypus lays eggs") are **not an
+    adjudicable pair**. An exception does not falsify "most", so the truth
+    engine must never pit them against each other: no contradiction probe
+    verdict, no trust-differential supersession, no update supersession, no
+    INCONSISTENCY manufactured from the pair, and no co-evidential suggestion.
+    Two generics about one kind ("most X are Y" against "most X are not Y")
+    remain adjudicable, and so do two instance claims; only the
+    generic-against-instance pairing is excluded. A universal ("all mammals
+    bear live young") is read the same way: source prose uses *all* loosely,
+    and the substrate cannot tell a strict universal from a loose one, so a
+    counterexample is the reader's to weigh, not the ladder's.
+
+    Genericity is read from each side's text by the deterministic detector
+    (:func:`particles.core.generics.generic_quantifier`), the one the
+    abstraction pass uses to keep promoted text premise-scoped.
+    No LLM call is made.
+    The detector leans toward flagging, and here a false flag costs only a
+    pair left unadjudicated with both claims ACTIVE.
+
+    **Recorded no: the substrate never infers an instance property from a
+    generic.** Default inheritance in the Cyc style (the platypus is a mammal,
+    mammals bear live young, therefore the platypus bears live young) is the
+    operation that turns a statistical claim about a group into an assertion
+    about a member, and it stays out of the substrate. If it ever exists, it is
+    a per-reference-class lens opt-in whose default is never. A sourced generic
+    is otherwise stored neutrally like any claim, with its provenance, stance
+    holder and observer scope. There is no ``EXCEPTION_TO`` relation and no
+    generic representation in the schema; this guard is the whole of the rule.
+
+    Kept separate from :func:`~particles.core.schema.is_truth_apt` on purpose:
+    that gate reads a claim-level default (assertion modality), while this one
+    reads a property of the pair. Each can change without the other.
+    """
+    return is_generic_claim(a.content) != is_generic_claim(b.content)
+
+
 def resolve_conflict(
     existing: Particle,
     new: Particle,
@@ -194,7 +241,7 @@ def resolve_conflict(
             ``new``'s provenance corpus entry (transitively) supersedes
             ``existing``'s — an authored editorial "this document replaces that
             one". The caller resolves it from the corpus supersession relation.
-            This branch runs **above the truth-apt gate** and is
+            This branch runs **above the adjudicability gate** and is
             **modality-independent**, so it retires a superseded ``CONSTITUTIVE``
             definition the truth engine would otherwise never see — but only when
             ``has_contradiction_signal`` (the replacement signal) is ``True`` and
@@ -202,7 +249,7 @@ def resolve_conflict(
         existing_supersedes_new: Rung 1.5 input — the mirror direction.
             ``True`` when ``existing``'s document supersedes ``new``'s. Both
             ``True`` (a supersession cycle) fires neither branch and falls
-            through to the truth-apt gate / trust rung.
+            through to the adjudicability gate / trust rung.
         trust_score_existing: Pre-resolved trust score for ``existing``.
             ``None`` skips the trust rung (the ALEATORY exclusion still applies).
         trust_score_new: Pre-resolved trust score for ``new``. Same treatment.
@@ -244,12 +291,12 @@ def resolve_conflict(
         or new.uncertainty_nature == UncertaintyNature.ALEATORY
     )
 
-    # Rung 1.5 (cap. 2 — ABOVE the truth-apt gate,
+    # Rung 1.5 (cap. 2 — ABOVE the adjudicability gate,
     # modality-independent): document-supersession prior. An explicit, authored
     # "this document replaces that one" is an *editorial* fact — it does not
     # depend on either claim's truth-aptness, so it must reach a superseded
     # CONSTITUTIVE definition that the truth engine (rung 1.7 onward) cannot see.
-    # It therefore runs ABOVE the truth-apt gate. ``has_contradiction_signal`` is
+    # It therefore runs ABOVE the adjudicability gate. ``has_contradiction_signal`` is
     # reframed here as a *replacement signal* ("does the superseding claim
     # replace, not merely restate, the superseded one?"); a False signal keeps
     # both claims (the default-safe direction), preserving the
@@ -263,16 +310,29 @@ def resolve_conflict(
         if existing_supersedes_new and not new_supersedes_existing:
             return ConflictVerdict.DOCUMENT_SUPERSEDED_BY_EXISTING
 
-    # Rung 1.7 (the truth-apt gate, kept BELOW supersession):
-    # truth-semantics apply only to FALSIFIABLE particles. If either side is
-    # non-truth-apt (an opinion, feeling, or a document's constitutive rule), the
-    # truth engine has no shared truth to adjudicate — co-exist, never contradict
-    # or trust-supersede. The editorial supersession prior already ran above;
-    # this gate now governs only the truth-engine rungs below it. Defense in
-    # depth: the pipeline's intra-entry ``_find_conflict`` already declines to
+    # Rung 1.7, the adjudicability gate, kept BELOW supersession.
+    # The write path arbitrates only pairs whose stored default is FALSIFIABLE on
+    # both sides. If either side is not adjudicable by default (an opinion, a
+    # feeling, or a document's constitutive rule), two sources' disagreement
+    # cannot be settled by weighing them: co-exist, never contradict or
+    # trust-supersede. Only the stored default is read here; a lens's reading is
+    # read-time and never reaches this gate. The editorial supersession
+    # prior already ran above; this gate governs only the rungs below it. Defense
+    # in depth: the pipeline's intra-entry ``_find_conflict`` already declines to
     # pair non-truth-apt particles; the cross-entry supersession sweep
     # is the path that deliberately pairs them, and it reaches rung 1.5 above.
     if not (is_truth_apt(existing) and is_truth_apt(new)):
+        return ConflictVerdict.CORROBORATES
+
+    # The genericity guard, beside the adjudicability gate and governing the same
+    # truth-engine rungs: a generic and an instance claim are not an
+    # adjudicable pair, since an exception does not falsify "most". Co-exist,
+    # never contradict or supersede. Pairs of two generics or two instance
+    # claims pass through unchanged. The pair selectors (the pipeline's
+    # ``_find_conflict`` and subject pool, ``enumerate_candidate_pairs``, the
+    # update sweep's gather) already decline these pairs before a probe is
+    # spent; this is defense in depth.
+    if is_generic_instance_pair(existing, new):
         return ConflictVerdict.CORROBORATES
 
     # Contradiction-signal gate (pre-ladder, not a numbered rung): high
@@ -346,6 +406,76 @@ class LadderOutcome:
     """Declined and the signal is set: the pair is recorded as a divergence."""
 
 
+class SlotVerdict(StrEnum):
+    """The update probe's verdict on a confirmed contradiction.
+
+    A confirmed contradiction is not yet an update. The update probe says
+    whether the two claims fill one slot and, when they do, what kind of slot
+    it is, because only one kind is replaced by a later value.
+    """
+
+    DIFFERENT = "different"
+    """The claims fill different slots: not an update."""
+    CHANGES = "changes"
+    """One slot that holds one value at a time and changes over time (where
+    someone lives, their employer, the price a service charges now, a count
+    that grows): the later value replaces the earlier one, rung 2.5."""
+    FIXED = "fixed"
+    """One slot whose value, once true, stays true (who wrote a book, a page
+    count, a release date, a product's price as stated at one time): two values
+    are a contradiction neither date settles, so the pair goes to review at
+    rung 3 and nothing is retired."""
+
+
+def admits_update(slot: SlotVerdict | None) -> bool:
+    """Whether rung 2.5 may act on a pair with this verdict.
+
+    Only a slot that changes over time is updated by a later value. A missing
+    verdict (the probe did not run or did not complete) and a fixed slot both
+    keep rung 2.5 off the pair: every tie breaks toward keeping.
+    """
+    return slot is SlotVerdict.CHANGES
+
+
+def offers_subject_pair(slot: SlotVerdict | None) -> bool:
+    """Whether a confirmed subject-pool pair is offered to the ladder.
+
+    The subject-keyed search exists to find updates, so a pair the update probe
+    says fills different slots is not offered and both claims stay ACTIVE. A
+    same-slot pair is offered whatever the slot's kind: one that changes over
+    time reaches rung 2.5, and a fixed one, whose two values contradict,
+    reaches rung 3. A pair the probe gave no verdict on is offered,
+    as before the probe existed; the ladder then keeps rung 2.5 off it.
+    """
+    return slot is not SlotVerdict.DIFFERENT
+
+
+class SweepAction(StrEnum):
+    """What the update sweep does with one confirmed contradiction."""
+
+    DEMOTE = "demote"
+    """Rung 2.5: the older claim is retired ``SUPERSEDED_BY_UPDATE``."""
+    REVIEW = "review"
+    """Rung 3: an INCONSISTENCY record names both claims, which stay ACTIVE."""
+    KEEP = "keep"
+    """Nothing is written: the claims fill different slots, or no verdict."""
+
+
+def sweep_action(slot: SlotVerdict | None) -> SweepAction:
+    """The update sweep's action on a pair the contradiction probe confirmed.
+
+    The sweep is a maintenance pass over claims already in recall, so its
+    rung 3 is disclosure: the record is opened for review and no status
+    changes, as at the nightly census. A pair the slot probe did
+    not answer is kept unchanged.
+    """
+    if admits_update(slot):
+        return SweepAction.DEMOTE
+    if slot is SlotVerdict.FIXED:
+        return SweepAction.REVIEW
+    return SweepAction.KEEP
+
+
 class UpdateOrderSource(StrEnum):
     """Which rung 2.5 input the caller gathers for a pair."""
 
@@ -402,14 +532,23 @@ def update_order_source(
     allow_update: bool,
     allow_own_assertion: bool,
     forced: bool,
+    slot: SlotVerdict | None,
 ) -> UpdateOrderSource | None:
     """Which rung 2.5 input applies, if any.
 
     ``allow_update`` is extraction's door with the config switch already folded
     in; ``allow_own_assertion`` the assertion pathway's narrower one.
     A forced ``INCONSISTENT`` consults neither.
+
+    ``slot`` is the update probe's verdict on the pair. A contradiction alone
+    is not an update, so neither door opens unless both claims fill one slot
+    (the same attribute of the same subject) and the later one states a new
+    value for it, and that slot holds one value at a time and
+    changes over time. A fixed slot (an author, a page count) given two values
+    is a contradiction no date settles, and falls through to rung 3 like a
+    different-slot pair.
     """
-    if forced:
+    if forced or not admits_update(slot):
         return None
     if allow_update:
         return UpdateOrderSource.UPDATE
@@ -450,13 +589,23 @@ def decide_ladder(
          incomplete probe included.
       2. a forced ``INCONSISTENT`` (:func:`forces_inconsistent`): the rungs are
          skipped.
+
+    Neither override manufactures anything for a generic-against-instance
+    pair (:func:`is_generic_instance_pair`): a declined one records
+    no divergence, and a forced one is ``CORROBORATES``.
       3. otherwise :func:`resolve_conflict` on the signal and the rung inputs.
     """
     signal = ladder_signal(probe, fail_closed=fail_closed)
+    # A generic and an instance claim are not an adjudicable pair:
+    # neither override may record a divergence or force an INCONSISTENCY for
+    # it. A forced pair corroborates outright rather than reaching the rungs,
+    # so a failed probe never feeds the supersession prior either.
+    adjudicable = not is_generic_instance_pair(existing, new)
     if precondition is PairPrecondition.DECLINE:
-        return LadderOutcome(verdict=None, record_divergence=signal)
+        return LadderOutcome(verdict=None, record_divergence=signal and adjudicable)
     if forces_inconsistent(probe, fail_closed=fail_closed, precondition=precondition):
-        return LadderOutcome(verdict=ConflictVerdict.INCONSISTENT, record_divergence=False)
+        verdict = ConflictVerdict.INCONSISTENT if adjudicable else ConflictVerdict.CORROBORATES
+        return LadderOutcome(verdict=verdict, record_divergence=False)
     inputs = rung_inputs if rung_inputs is not None else RungInputs()
     verdict = resolve_conflict(
         existing,

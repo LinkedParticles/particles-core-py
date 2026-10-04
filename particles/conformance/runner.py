@@ -94,7 +94,7 @@ def _eq(name: str, got: object, expected: object) -> CheckResult:
 def _ladder_particle(stub: LadderParticleStub) -> Particle:
     """Materialise the minimal Particle the §6.4 ladder reads.
 
-    The vector carries only ``assertion_modality`` (the truth-apt gate) and
+    The vector carries only ``assertion_modality`` (the adjudicability gate) and
     ``uncertainty_nature`` (the ALEATORY exclusion); every other field here is
     inert filler required by the schema, chosen so it cannot influence the
     verdict. Keeping the vector to those two fields is what makes it portable

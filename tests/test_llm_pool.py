@@ -20,7 +20,7 @@ from typing import Any
 
 import pytest
 
-from particles.llm import CompletionPool, CompletionRequest
+from particles.llm import CompletionPool, CompletionRequest, RequestFailure
 from particles.llm import pool as pool_mod
 
 
@@ -35,6 +35,7 @@ def _install_fake_many(
     *,
     pairing: str = "anthropic:test-model",
     fail_with: Exception | None = None,
+    empty_prompts: frozenset[str] = frozenset(),
 ) -> list[dict[str, Any]]:
     """Patch the pool's dispatch seam; returns the recorded call list."""
     calls: list[dict[str, Any]] = []
@@ -47,6 +48,7 @@ def _install_fake_many(
         temperature: float | None = None,
         response_schema: dict[str, Any] | None = None,
         latency_tolerant: bool = False,
+        failures_out: list[RequestFailure | None] | None = None,
     ) -> tuple[list[str | None], str]:
         calls.append(
             {
@@ -58,7 +60,13 @@ def _install_fake_many(
         )
         if fail_with is not None:
             raise fail_with
-        return [f"reply:{r.prompt}" for r in requests], pairing
+        if failures_out is not None:
+            failures_out.extend(
+                RequestFailure.EMPTY if r.prompt in empty_prompts else None for r in requests
+            )
+        return [
+            None if r.prompt in empty_prompts else f"reply:{r.prompt}" for r in requests
+        ], pairing
 
     monkeypatch.setattr(pool_mod, "complete_many_with_provider_model", fake)
     return calls
@@ -221,3 +229,69 @@ async def test_job_level_failure_raises_in_every_parked_group(
 
     outcomes = await asyncio.gather(worker("a"), worker("b"))
     assert outcomes == ["credit balance is too low", "credit balance is too low"]
+
+
+@pytest.mark.asyncio
+async def test_a_second_wave_waits_for_every_answered_participant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Participants that re-park after a wave (a retry) share ONE second dispatch.
+
+    A participant answered by wave 1 but not yet resumed is no longer parked. It
+    used to count as parked until its task ran, so the first participant to
+    re-park dispatched its retry alone.
+    """
+    calls = _install_fake_many(monkeypatch)
+    pool = CompletionPool("extraction", expected_participants=2)
+
+    async def worker(prefix: str) -> None:
+        async with pool.participant():
+            await pool.complete_group(_requests(prefix, 1), max_tokens=64)
+            await pool.complete_group(_requests(f"{prefix}-retry", 1), max_tokens=128)
+
+    await asyncio.gather(worker("a"), worker("b"))
+
+    assert [sorted(c["prompts"]) for c in calls] == [
+        ["a 0", "b 0"],
+        ["a-retry 0", "b-retry 0"],
+    ]
+    assert [c["max_tokens"] for c in calls] == [64, 128]
+
+
+@pytest.mark.asyncio
+async def test_idle_hook_wraps_every_wait_and_failures_slice_per_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The idle hook is entered before parking and left once the answer is in,
+    and each group gets its own slice of the failure kinds."""
+    from contextlib import asynccontextmanager
+
+    _install_fake_many(monkeypatch, empty_prompts=frozenset({"b 1"}))
+    pool = CompletionPool("extraction", expected_participants=2)
+    events: list[str] = []
+
+    def idle_for(name: str) -> Any:
+        @asynccontextmanager
+        async def idle() -> Any:
+            events.append(f"{name} idle")
+            yield
+            events.append(f"{name} resumed")
+
+        return idle
+
+    async def worker(prefix: str, count: int) -> list[RequestFailure | None]:
+        failures: list[RequestFailure | None] = []
+        async with pool.participant(idle=idle_for(prefix)):
+            await pool.complete_group(
+                _requests(prefix, count), max_tokens=64, failures_out=failures
+            )
+        return failures
+
+    a_failures, b_failures = await asyncio.gather(worker("a", 1), worker("b", 2))
+
+    assert a_failures == [None]
+    assert b_failures == [None, RequestFailure.EMPTY]
+    assert sorted(events) == ["a idle", "a resumed", "b idle", "b resumed"]
+    # Both went idle before either was answered: the hook covers the whole wait.
+    assert events.index("a resumed") > events.index("b idle")
+    assert events.index("b resumed") > events.index("a idle")

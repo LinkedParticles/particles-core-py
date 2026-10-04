@@ -27,6 +27,11 @@ request per wave. There is no deadlock by construction: the write
 lock is never held across an LLM call (``ingest/pipeline.py`` holds it around
 the write phase only), so a participant waiting on the lock always finishes
 its DB work and either parks or deregisters.
+
+A participant may name what it gives back while it waits (``idle``). The
+consolidation extract pass uses it to end its session's transaction before a
+batch wait of minutes to an hour, so no pooled database connection is held
+across it, and to bound how many tasks touch the store at once.
 """
 
 from __future__ import annotations
@@ -34,14 +39,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import AsyncIterator, Sequence
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Callable, Sequence
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from typing import Any
 
 from particles.llm.registry import (
     CompletionRequest,
     LLMPurpose,
+    RequestFailure,
     complete_many_with_provider_model,
 )
 
@@ -49,6 +56,18 @@ log = logging.getLogger(__name__)
 
 #: What a parked group resolves to: (positionally aligned results, pairing).
 GroupResult = tuple[list[str | None], str]
+
+#: What a participant enters while parked: an async context manager factory,
+#: called once per park (a participant may park more than once).
+IdleHook = Callable[[], AbstractAsyncContextManager[object]]
+
+# The enclosing participant's idle hook, keyed by the pool it registered on.
+# A ContextVar because the parking call is made deep inside the worker (the
+# extractor), which knows the pool but not the participant around it; each
+# asyncio task carries its own copy, so sibling workers never see each other's.
+_IDLE: ContextVar[tuple[CompletionPool, IdleHook] | None] = ContextVar(
+    "particles_pool_idle", default=None
+)
 
 
 @dataclass
@@ -61,6 +80,7 @@ class _ParkedGroup:
     temperature: float | None
     response_schema: dict[str, Any] | None
     future: asyncio.Future[GroupResult]
+    failures: list[RequestFailure | None] = field(default_factory=list)
 
 
 class CompletionPool:
@@ -106,13 +126,12 @@ class CompletionPool:
         self._purpose: LLMPurpose = purpose
         self._unstarted = expected_participants
         self._participants = 0
-        self._parked_participants = 0
         self._parked: list[_ParkedGroup] = []
         # Strong refs so in-flight dispatch tasks cannot be garbage-collected.
         self._dispatch_tasks: set[asyncio.Task[None]] = set()
 
     @asynccontextmanager
-    async def participant(self) -> AsyncIterator[None]:
+    async def participant(self, *, idle: IdleHook | None = None) -> AsyncIterator[None]:
         """Register the enclosing task as a pool participant.
 
         The pool waits for every registered participant before dispatching a
@@ -120,13 +139,22 @@ class CompletionPool:
         may itself trigger the dispatch the remaining parked participants are
         waiting on. The trigger is synchronous, so it is safe from this
         ``finally`` even while a cancellation is propagating.
+
+        ``idle`` is entered around every wait in :meth:`complete_group`, before
+        the group parks and until its result arrives: the participant's chance
+        to give back what the wait must not hold. Its exit may itself wait (to
+        re-acquire), which is safe because the participant is no longer
+        counted as parked by then, so it cannot hold a wave open.
         """
         if self._unstarted > 0:
             self._unstarted -= 1
         self._participants += 1
+        token = _IDLE.set((self, idle)) if idle is not None else None
         try:
             yield
         finally:
+            if token is not None:
+                _IDLE.reset(token)
             self._participants -= 1
             self._maybe_dispatch()
 
@@ -137,6 +165,7 @@ class CompletionPool:
         max_tokens: int,
         temperature: float | None = None,
         response_schema: dict[str, Any] | None = None,
+        failures_out: list[RequestFailure | None] | None = None,
     ) -> GroupResult:
         """Submit this participant's whole request set and await the wave.
 
@@ -149,6 +178,11 @@ class CompletionPool:
 
         An empty request set returns ``([], "")`` immediately without
         parking — no work is not a reason to hold the wave open.
+
+        ``failures_out`` is extended with this group's slice of the per-request
+        failure kinds (:class:`~particles.llm.registry.RequestFailure`), aligned
+        with the results, so a caller can retry a budget failure without
+        re-submitting a request that merely expired.
         """
         if not requests:
             return [], ""
@@ -161,17 +195,21 @@ class CompletionPool:
             response_schema=response_schema,
             future=future,
         )
-        self._parked.append(group)
-        self._parked_participants += 1
-        try:
-            self._maybe_dispatch()
-            return await future
-        finally:
-            self._parked_participants -= 1
-            # Cancelled before dispatch: withdraw the group so a later wave
-            # does not try to resolve a dead future's requests.
-            if group in self._parked:
-                self._parked.remove(group)
+        registered = _IDLE.get()
+        idle = registered[1] if registered is not None and registered[0] is self else None
+        async with idle() if idle is not None else nullcontext():
+            self._parked.append(group)
+            try:
+                self._maybe_dispatch()
+                result = await future
+            finally:
+                # Cancelled before dispatch: withdraw the group so a later wave
+                # does not try to resolve a dead future's requests.
+                if group in self._parked:
+                    self._parked.remove(group)
+        if failures_out is not None:
+            failures_out.extend(group.failures)
+        return result
 
     @staticmethod
     def _kwargs_key(
@@ -187,16 +225,19 @@ class CompletionPool:
     def _maybe_dispatch(self) -> None:
         """Fire the wave iff every live participant is parked (quiescence).
 
+        "Parked" means a group still awaiting dispatch: a participant's one
+        group leaves ``_parked`` the moment its wave is taken, not when its
+        task next runs. Counting until the task resumed let the first
+        participant to re-park after a wave (a retry group) find its answered
+        but not-yet-resumed siblings still "parked" and dispatch alone, so
+        retries that should share one follow-up batch went out one by one.
+
         Synchronous by design: callable from ``finally`` blocks and from the
         parking path without suspending. The dispatch itself runs in its own
         task, so a participant that exits mid-cancellation never carries the
         batch call in its dying frame.
         """
-        if (
-            self._unstarted > 0
-            or not self._parked
-            or self._parked_participants < self._participants
-        ):
+        if self._unstarted > 0 or not self._parked or len(self._parked) < self._participants:
             return
         groups, self._parked = self._parked, []
         task = asyncio.get_running_loop().create_task(self._dispatch(groups))
@@ -225,6 +266,7 @@ class CompletionPool:
                 len(key_groups),
                 self._purpose,
             )
+            failures: list[RequestFailure | None] = []
             try:
                 results, provider_model = await complete_many_with_provider_model(
                     self._purpose,
@@ -233,6 +275,7 @@ class CompletionPool:
                     temperature=first.temperature,
                     response_schema=first.response_schema,
                     latency_tolerant=True,
+                    failures_out=failures,
                 )
             except Exception as exc:  # noqa: BLE001 — routed into every group's future
                 for group in key_groups:
@@ -242,6 +285,7 @@ class CompletionPool:
             offset = 0
             for group in key_groups:
                 count = len(group.requests)
+                group.failures = failures[offset : offset + count]
                 if not group.future.done():
                     group.future.set_result((results[offset : offset + count], provider_model))
                 offset += count

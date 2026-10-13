@@ -23,10 +23,13 @@ must remain pure (see ``particles/core/AGENTS.md``).
 Ladder (normative, applied in order — §6.4, rung for rung):
 
   1. **ALEATORY exclusion** (§6.4 rung 1, lifted to the top) — if
-     either particle has ``UncertaintyNature.ALEATORY`` the pair is irreducibly
-     inconsistent: skip *both* the supersession prior and trust resolution and
-     fall through to INCONSISTENCY. An irreducible disagreement is never retired
-     by an editorial relation or a trust differential.
+     either particle has ``UncertaintyNature.ALEATORY`` the pair skips *both*
+     the supersession prior and trust resolution. An irreducible disagreement
+     is never retired by an editorial relation or a trust differential, since
+     both rungs pick a winner between two sources. Rung 2.5 reads the newer
+     claim only (:func:`newer_is_settled`): a settled report from the
+     same lineage retires an earlier aleatory claim, and a newer aleatory claim
+     retires nothing.
   1.5. **Document-supersession prior** — §6.4 rung 1.5 (cap. 2,
      re-ordered). The caller passes ``new_supersedes_existing`` /
      ``existing_supersedes_new``, resolved from the corpus supersession
@@ -198,6 +201,29 @@ def is_generic_instance_pair(a: Particle, b: Particle) -> bool:
     return is_generic_claim(a.content) != is_generic_claim(b.content)
 
 
+def newer_is_settled(existing: Particle, new: Particle, update_order: int) -> bool:
+    """Rung 2.5's ALEATORY condition: the newer claim of the pair is not ALEATORY.
+
+    Rungs 1.5 and 2 pick a winner between two sources, so an ALEATORY claim on
+    either side keeps them off the pair. Rung 2.5 picks no winner between
+    sources: it acts on one lineage whose newer claim gives a slot a new value.
+    When that newer claim is EPISTEMIC the source now states the matter as
+    settled ("I'm not going back"), which is how aleatory uncertainty is
+    resolved, so an older ALEATORY claim (a plan, a schedule) may be retired.
+    When the newer claim is itself ALEATORY (a revised forecast), nothing has
+    been settled and nothing is retired.
+
+    "Newer" follows the sign of ``update_order`` as :func:`resolve_conflict`
+    reads it: positive when ``new`` is the newer claim, negative when
+    ``existing`` is. Every route rung 2.5 runs on calls this one function: the
+    extraction ladder and the assertion door (through :func:`resolve_conflict`),
+    the extras (``ingest.pair_selection.plan_update_extras``), and the backlog
+    sweep.
+    """
+    newer = new if update_order > 0 else existing
+    return newer.uncertainty_nature is not UncertaintyNature.ALEATORY
+
+
 def resolve_conflict(
     existing: Particle,
     new: Particle,
@@ -210,6 +236,7 @@ def resolve_conflict(
     trust_differential_threshold: float = 0.15,
     single_trust_order: bool = True,
     update_order: int | None = None,
+    same_slot_update: bool = False,
 ) -> ConflictVerdict:
     """Apply the §6.4 ladder and return the verdict for one (existing, new) pair.
 
@@ -269,12 +296,20 @@ def resolve_conflict(
             ``get_config().reconciliation.store_mode == "single"``.
         update_order: Rung 2.5 input. ``+1`` when the pair is a
             same-lineage update and ``new`` is strictly newer, ``-1`` when
-            ``existing`` is, ``None`` when rung 2.5 does not apply (the caller
-            found the sides distinguishable to trust, not both
-            extractor-asserted, undated, equal-dated, or the rung disabled).
+            ``existing`` is, ``None`` when rung 2.5 does not apply. The rung
+            fires only when the newer side is not ALEATORY
+            (:func:`newer_is_settled`). The caller passes ``None``
+            when it found the sides distinguishable to trust, not both
+            extractor-asserted, undated, or equal-dated, or the rung disabled.
             Deliberately **not** gated on ``single_trust_order``: a single
             lineage updating itself is not the cross-contributor arbitration
             ``multi`` stores forbid (the same-holder analogue).
+        same_slot_update: Rung 2.5's own evidence: the update probe
+            settled ``CHANGES`` on a pair the caller admitted to the update
+            question first. With no contradiction signal, such a pair still
+            resolves by rung 2.5 when ``update_order`` is set and the newer
+            claim is settled; every other unsignalled pair corroborates, as
+            before. With a signal it changes nothing.
 
     Returns:
         ConflictVerdict — see the enum docstrings for the caller's required
@@ -283,7 +318,8 @@ def resolve_conflict(
     # Rung 1 (lifted to the top): ALEATORY exclusion. An irreducibly
     # aleatory pair is never retired by an editorial supersession relation nor by
     # a trust differential; it skips the supersession prior (rung 1.5) and the
-    # trust rung (rung 2) and falls through to INCONSISTENCY. ALEATORY is an
+    # trust rung (rung 2), both of which pick a winner between sources. Rung 2.5
+    # reads the newer side only (``newer_is_settled``). ALEATORY is an
     # ``uncertainty_nature``, orthogonal to modality — this is the ONE exclusion
     # that sits above the supersession prior.
     aleatory = (
@@ -337,8 +373,16 @@ def resolve_conflict(
 
     # Contradiction-signal gate (pre-ladder, not a numbered rung): high
     # similarity is not enough on its own. If the caller's probe said the pair is
-    # not a contradiction, treat it as corroboration and write both as ACTIVE.
+    # not a contradiction, treat it as corroboration and write both as ACTIVE,
+    # unless the update probe settled the pair as an update: two
+    # claims that give one slot successive values can both be true at their own
+    # times, so rung 2.5 rests on the same-slot check, not on the probe.
+    # Trust (rung 2) never runs without a signal: it picks between sources.
     if not has_contradiction_signal:
+        if same_slot_update and update_order and newer_is_settled(existing, new, update_order):
+            if update_order > 0:
+                return ConflictVerdict.UPDATE_SUPERSEDES
+            return ConflictVerdict.UPDATE_SUPERSEDED_BY_EXISTING
         return ConflictVerdict.CORROBORATES
 
     # Rung 2: trust resolution (single-trust-order stores only).
@@ -362,13 +406,14 @@ def resolve_conflict(
     # the two sides apart (rung 2 did not fire), so the strictly newer claim
     # wins. The caller computes ``update_order`` only when the pair shares every
     # trust key but the entry, both are extractor-asserted, and both are
-    # strictly ordered by source date. ALEATORY and non-truth-apt pairs never
-    # reach here (they returned above).
-    if not aleatory and update_order is not None:
+    # strictly ordered by source date. Non-truth-apt pairs never reach here
+    # (they returned above). The ALEATORY exclusion reads the newer claim only:
+    # an older aleatory claim (a plan) is retired by a newer
+    # settled one, and a newer aleatory claim retires nothing.
+    if update_order and newer_is_settled(existing, new, update_order):
         if update_order > 0:
             return ConflictVerdict.UPDATE_SUPERSEDES
-        if update_order < 0:
-            return ConflictVerdict.UPDATE_SUPERSEDED_BY_EXISTING
+        return ConflictVerdict.UPDATE_SUPERSEDED_BY_EXISTING
 
     # Rung 3: default — INCONSISTENCY particle.
     return ConflictVerdict.INCONSISTENT
@@ -461,6 +506,22 @@ class SweepAction(StrEnum):
     """Nothing is written: the claims fill different slots, or no verdict."""
 
 
+def sweep_action_first(slot: SlotVerdict | None) -> SweepAction | None:
+    """The sweep's action on a pair asked the update question first.
+
+    A settled ``CHANGES`` demotes with no contradiction probe: rung 2.5 rests
+    on that answer. ``FIXED`` returns ``None``: only the contradiction probe
+    can say whether the fixed slot's two values disagree, so the caller asks
+    it and opens a review on a YES (:func:`sweep_action` then reads the slot
+    as before). Anything else keeps the pair, with no contradiction probe.
+    """
+    if admits_update(slot):
+        return SweepAction.DEMOTE
+    if slot is SlotVerdict.FIXED:
+        return None
+    return SweepAction.KEEP
+
+
 def sweep_action(slot: SlotVerdict | None) -> SweepAction:
     """The update sweep's action on a pair the contradiction probe confirmed.
 
@@ -514,17 +575,22 @@ def forces_inconsistent(
 
 
 def needs_rung_inputs(
-    probe: bool | None, *, fail_closed: bool, precondition: PairPrecondition
+    probe: bool | None,
+    *,
+    fail_closed: bool,
+    precondition: PairPrecondition,
+    same_slot_update: bool = False,
 ) -> bool:
     """Whether the caller should gather :class:`RungInputs` for the pair.
 
-    Only a set signal reaches the rungs, and a declined pair reaches none. A
-    forced ``INCONSISTENT`` still gathers: the domain read alongside the trust
-    scores is the INCONSISTENCY record's ``domain_hint``.
+    Only a set signal reaches the rungs, or a settled same-slot update (rung
+    2.5's own evidence), and a declined pair reaches none. A forced
+    ``INCONSISTENT`` still gathers: the domain read alongside the trust scores
+    is the INCONSISTENCY record's ``domain_hint``.
     """
     if precondition is PairPrecondition.DECLINE:
         return False
-    return ladder_signal(probe, fail_closed=fail_closed)
+    return same_slot_update or ladder_signal(probe, fail_closed=fail_closed)
 
 
 def update_order_source(
@@ -577,6 +643,7 @@ def decide_ladder(
     rung_inputs: RungInputs | None,
     single_trust_order: bool,
     trust_differential_threshold: float,
+    same_slot_update: bool = False,
 ) -> LadderOutcome:
     """The §6.6 ladder for one pair, with every override applied in order.
 
@@ -593,7 +660,8 @@ def decide_ladder(
     Neither override manufactures anything for a generic-against-instance
     pair (:func:`is_generic_instance_pair`): a declined one records
     no divergence, and a forced one is ``CORROBORATES``.
-      3. otherwise :func:`resolve_conflict` on the signal and the rung inputs.
+      3. otherwise :func:`resolve_conflict` on the signal, the rung inputs and
+         ``same_slot_update``.
     """
     signal = ladder_signal(probe, fail_closed=fail_closed)
     # A generic and an instance claim are not an adjudicable pair:
@@ -618,6 +686,7 @@ def decide_ladder(
         trust_differential_threshold=trust_differential_threshold,
         single_trust_order=single_trust_order,
         update_order=inputs.update_order,
+        same_slot_update=same_slot_update,
     )
     return LadderOutcome(verdict=verdict, record_divergence=False)
 

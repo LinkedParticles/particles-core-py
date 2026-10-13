@@ -32,6 +32,7 @@ from typing import Any
 import numpy as np
 from opentelemetry import trace
 
+from particles import egress
 from particles.config import get_config
 
 log = logging.getLogger(__name__)
@@ -197,6 +198,15 @@ class _TracingEmbeddingModel(EmbeddingModel):
 
 
 _embedding_model: EmbeddingModel | None = None
+# Set when an offline load failed: the model is not cached and the
+# posture refuses the Hub, so retrying on every call would only repeat it.
+_offline_load_failed = False
+
+
+def _hub_refused() -> bool:
+    """Whether ``network.egress`` refuses the Hugging Face Hub."""
+    policy = egress.current_policy()
+    return policy.refusing and not policy.allows(*egress.HUGGINGFACE_HOST)
 
 
 def _toggle_progress_bars(module_name: str, enable: str, disable: str, show: bool) -> None:
@@ -244,8 +254,13 @@ def get_embedding_model() -> EmbeddingModel | None:
     runs under an ``embed.load`` span — it is multi-second on first
     call and was previously invisible to the trace.
     """
-    global _embedding_model
+    global _embedding_model, _offline_load_failed
     if _embedding_model is None:
+        # Under a posture that refuses the Hub, load from the local cache only:
+        # no download, and no per-file probe of the Hub on every process start.
+        offline = _hub_refused()
+        if offline and _offline_load_failed:
+            return None
         try:
             from sentence_transformers import (
                 SentenceTransformer,  # type: ignore[import-untyped,unused-ignore]
@@ -254,10 +269,23 @@ def get_embedding_model() -> EmbeddingModel | None:
             _apply_progress_bar_config()
             with _tracer.start_as_current_span("embed.load") as span:
                 span.set_attribute("embed.model_id", EMBEDDING_MODEL_ID)
-                inner = SentenceTransformer(EMBEDDING_MODEL_ID)  # type: ignore[no-untyped-call,unused-ignore]
+                if offline:
+                    inner = SentenceTransformer(EMBEDDING_MODEL_ID, local_files_only=True)  # type: ignore[no-untyped-call,unused-ignore]
+                else:
+                    inner = SentenceTransformer(EMBEDDING_MODEL_ID)  # type: ignore[no-untyped-call,unused-ignore]
             _embedding_model = _TracingEmbeddingModel(inner)
             log.info("Loaded embedding model %s", EMBEDDING_MODEL_ID)
         except Exception as exc:
+            if offline:
+                _offline_load_failed = True
+                log.warning(
+                    "Could not load embedding model %s from the local cache, and "
+                    "network.egress refuses huggingface.co: semantic features are "
+                    "disabled for this process (%s)",
+                    EMBEDDING_MODEL_ID,
+                    exc,
+                )
+                return None
             log.warning("Could not load embedding model: %s — semantic search disabled", exc)
             return None
     return _embedding_model
@@ -265,5 +293,6 @@ def get_embedding_model() -> EmbeddingModel | None:
 
 def set_embedding_model(model: EmbeddingModel | None) -> None:
     """Override the embedding model (for testing)."""
-    global _embedding_model
+    global _embedding_model, _offline_load_failed
     _embedding_model = model
+    _offline_load_failed = False

@@ -716,6 +716,10 @@ class TestFixtureSelection:
         for plugin in get_extractors():
             if plugin.EXTRACTOR_ID == "general-extractor":
                 continue
+            # A plugin routing never picks reads anything and is routed nothing
+            # (the agent extractor); the rule does not concern it.
+            if getattr(plugin, "ROUTED", True) is False:
+                continue
             routed = select_fixtures(plugin, corpus)
             accepted = select_fixtures(plugin, corpus, all_accepted=True)
             assert routed == accepted, f"{plugin.EXTRACTOR_ID} routed != accepted"

@@ -16,6 +16,9 @@ The public surface:
 * :func:`track_usage` / :class:`LLMUsage`: per-run token totals by purpose
   and model, reported by every adapter from the provider's ``usage`` and
   priced at list price (``render_usage_line`` for the one-line summary).
+* :func:`replay_scope` / :class:`ReplayMode`: a run-scoped record/replay cache
+  over every completion, for benchmark ablations that re-send byte-identical
+  prompts.
 * :func:`get_client` / :func:`set_client` — the shared Anthropic SDK client
   and its test seam, re-exported from ``particles/llm/client.py`` so the
   long-standing ``from particles.llm import get_client`` /
@@ -46,6 +49,7 @@ from particles.llm.registry import (
     CompletionRequest,
     EmptyCompletionError,
     LLMPurpose,
+    PurposeRefused,
     RequestFailure,
     VisionImage,
     complete,
@@ -54,7 +58,9 @@ from particles.llm.registry import (
     complete_with_provider_model,
     get_provider,
     override_providers,
+    purpose_allowed,
 )
+from particles.llm.replay import ReplayMode, ReplayStats, render_replay_line, replay_scope
 from particles.llm.usage import (
     LLMUsage,
     UsageAccumulator,
@@ -77,6 +83,9 @@ __all__ = [
     "LLMUsage",
     "LocalProvider",
     "OpenAICompatProvider",
+    "PurposeRefused",
+    "ReplayMode",
+    "ReplayStats",
     "RequestFailure",
     "UsageAccumulator",
     "UsageRow",
@@ -93,8 +102,11 @@ __all__ = [
     "is_account_level_failure",
     "make_nonce",
     "override_providers",
+    "purpose_allowed",
     "record_usage",
+    "render_replay_line",
     "render_usage_line",
+    "replay_scope",
     "set_client",
     "track_usage",
 ]

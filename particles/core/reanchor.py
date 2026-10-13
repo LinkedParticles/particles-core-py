@@ -42,6 +42,17 @@ from particles.core.status import Status
 REANCHOR_ACTOR = "consolidation:reanchor"
 
 
+def is_reanchor_restatement(particle: Particle) -> bool:
+    """Whether the re-anchor pass wrote ``particle``: its contributor entry says so.
+
+    A restatement is dated history by construction, so rung 2.5
+    never takes one as either side of a pair: a later value does not replace
+    what held while a retired state held, and the restatement gives no slot a
+    new value of its own (guard 1).
+    """
+    return any(ref.id == REANCHOR_ACTOR for ref in particle.contributors or ())
+
+
 class DependencyVerdict(StrEnum):
     """The probe's verdict on one candidate claim."""
 
@@ -116,30 +127,81 @@ def parse_json_object(reply: str | None) -> dict[str, Any] | None:
     start, end = text.find("{"), text.rfind("}")
     if start == -1 or end < start:
         return None
+    candidate = text[start : end + 1]
+    # Not strict: a raw newline or tab inside a string is read as itself rather
+    # than failing the reply (and masking an unterminated string after it).
+    decoder = json.JSONDecoder(strict=False)
     try:
-        raw: Any = json.loads(text[start : end + 1])
-    except (ValueError, TypeError):
-        return None
+        raw: Any = decoder.decode(candidate)
+    except json.JSONDecodeError as exc:
+        repaired = _close_unterminated_string(candidate, exc)
+        if repaired is None:
+            return None
+        try:
+            raw = decoder.decode(repaired)
+        except json.JSONDecodeError:
+            return None
     return raw if isinstance(raw, dict) else None
 
 
-def parse_probe_reply(reply: str | None, labels: dict[str, str]) -> list[ProbeVerdict] | None:
+def _close_unterminated_string(candidate: str, exc: json.JSONDecodeError) -> str | None:
+    """``candidate`` with the closing quote its last string value lost, or ``None``.
+
+    claude-sonnet-5-5 sometimes ends its last value without the quote, as in
+    ``"reason": "… adding anything else.}`` (1 of 33 second readings,
+    2026-10-11, at ``end_turn`` with no thinking). The decoder then reads the
+    closing brackets as part of the string. The quote goes back before the
+    trailing brackets, and only when the string the decoder reported started
+    before them. A reply that still does not parse stays unusable.
+    """
+    if not exc.msg.startswith("Unterminated string"):
+        return None
+    closers = len(candidate) - len(candidate.rstrip("}] \t\r\n"))
+    cut = len(candidate) - closers
+    if cut <= exc.pos:
+        return None
+    return candidate[:cut] + '"' + candidate[cut:]
+
+
+def _label_key(text: str) -> str:
+    """A label as the probe may echo it (``c1``, ``C1``, ``c1:``, ``[c1]``), normalised."""
+    return "".join(ch for ch in text.casefold() if ch.isalnum())
+
+
+def _claim_key(text: str) -> str:
+    """A claim's text as the probe may echo it, normalised for an exact match."""
+    return " ".join(text.casefold().split()).rstrip(".")
+
+
+def parse_probe_reply(
+    reply: str | None,
+    labels: dict[str, str],
+    contents: dict[str, str] | None = None,
+) -> list[ProbeVerdict] | None:
     """The probe's per-claim verdicts, keyed back to particle ids.
 
     ``labels`` maps the short label each candidate was shown under (``c1``,
-    ``c2``, …) to its particle id. A line naming an unknown label, or carrying
-    an unknown verdict, is dropped: that candidate simply gets no verdict this
-    run. ``None`` means the reply was unusable as a whole.
+    ``c2``, …) to its particle id, and ``contents`` maps each id to the claim's
+    text. An item is matched by its label, written any way the model echoes it
+    (``C1``, ``c1:``), and failing that by the claim's exact text: a model that
+    puts the claim where the label belongs has still answered it (observed on
+    claude-sonnet-5, 2026-10-04, where every item was dropped before). An item
+    matching neither, or carrying an unknown verdict, is dropped: that
+    candidate gets no verdict, which the pass then reports. ``None`` means the
+    reply was unusable as a whole.
     """
     data = parse_json_object(reply)
     if data is None or not isinstance(data.get("claims"), list):
         return None
+    by_label = {_label_key(label): pid for label, pid in labels.items()}
+    by_text = {_claim_key(text): pid for pid, text in (contents or {}).items()}
     out: list[ProbeVerdict] = []
     seen: set[str] = set()
     for item in data["claims"]:
         if not isinstance(item, dict):
             continue
-        pid = labels.get(str(item.get("claim", "")).strip())
+        echoed = str(item.get("claim", "")).strip()
+        pid = by_label.get(_label_key(echoed)) or by_text.get(_claim_key(echoed))
         if pid is None or pid in seen:
             continue
         try:
@@ -202,6 +264,26 @@ def decide_write(*, duplicate_of: str | None, conflict: bool) -> Outcome:
     if conflict:
         return Outcome.UNRESTATED
     return Outcome.RESTATED
+
+
+def exempts_winner(restatement_date: str | None, winner_date: datetime | None) -> bool:
+    """Whether the no-side-effects check skips the claim that retired the anchor.
+
+    A restatement says what held while the retired claim R held, dated to R's
+    passage; the winner W says R stopped holding, from a later date. A
+    restatement dated strictly before W's source date cannot contradict W, so
+    the check does not ask about that pair. When either date is unknown or the
+    restatement's is not earlier, W is checked like any standing claim: this is
+    what keeps a misdated restatement (failure) from the exemption.
+    ``restatement_date`` is the ISO date both re-anchor calls are given.
+    """
+    if restatement_date is None or winner_date is None:
+        return False
+    try:
+        anchored = datetime.fromisoformat(restatement_date).date()
+    except ValueError:
+        return False
+    return anchored < winner_date.date()
 
 
 def is_before_or_at(candidate_date: datetime | None, retired_date: datetime | None) -> bool:

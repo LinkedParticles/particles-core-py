@@ -850,6 +850,10 @@ class ExtractorCalibration(BaseModel):
             as ``NOT APPLIED``. ``None`` is a record persisted before this key
             existed, fitted under an unknown version, and is never applied.
             See :func:`particles.extraction.calibration.version_mismatch_reason`.
+        breakpoints: The isotonic map, as ``(stated, observed hit rate)``
+            pairs in ascending order, when ``transform`` is ``"isotonic"``.
+            ``temperature`` is then 1.0 and unused. ``None`` on
+            every temperature record.
     """
 
     temperature: float = Field(gt=0.0)
@@ -865,6 +869,7 @@ class ExtractorCalibration(BaseModel):
     heldout_error_before: float | None = Field(default=None, ge=0.0, le=1.0)
     heldout_error_after: float | None = Field(default=None, ge=0.0, le=1.0)
     extractor_version: str | None = None
+    breakpoints: list[tuple[float, float]] | None = None
 
 
 class ExtractorRecord(BaseModel):
@@ -2249,6 +2254,9 @@ class LintReport(BaseModel):
     # unavailable (account-level failure, circuit breaker open). A client
     # surfaces this rather than mistaking the missing semantic findings for a clean bill.
     semantic_skipped: bool = False
+    # Why: "llm_unavailable" (the breaker is open) or "egress" (the
+    # network.egress posture refuses the semantic_lint endpoint).
+    semantic_skipped_reason: str | None = None
 
 
 # Categories whose findings the orchestrator can auto-resolve via status transition

@@ -56,6 +56,17 @@ def get_anthropic_api_key_optional() -> str | None:
     return os.environ.get("ANTHROPIC_API_KEY") or None
 
 
+def get_anthropic_base_url_optional() -> str | None:
+    """Return ``ANTHROPIC_BASE_URL`` or ``None`` if unset.
+
+    Not a secret: the Anthropic SDK reads this variable itself to override its
+    endpoint. It is read here, at the module that owns the environment
+    boundary, so the no-egress pre-check and posture report name the
+    host the SDK will really connect to.
+    """
+    return os.environ.get("ANTHROPIC_BASE_URL") or None
+
+
 def get_github_api_key_optional() -> str | None:
     """Return ``GITHUB_API_KEY`` or ``None`` if unset.
 

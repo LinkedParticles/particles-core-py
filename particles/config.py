@@ -99,6 +99,67 @@ class HttpConfig(BaseModel):
     max_bytes: int = 100 * 1024 * 1024
 
 
+class EgressAllowEntry(BaseModel):
+    """One destination the no-egress posture permits.
+
+    ``host`` is an IP literal, a CIDR block, or an exact host name. Nothing is
+    inferred from the address: ``localhost`` and ``127.0.0.1`` are different
+    entries, and a private range is not local unless it is listed.
+    """
+
+    host: str
+    # None permits any port on that host.
+    port: int | None = Field(default=None, ge=1, le=65535)
+
+    @field_validator("host")
+    @classmethod
+    def _host_is_literal_cidr_or_name(cls, value: str) -> str:
+        value = value.strip().lower()
+        if not value:
+            raise ValueError("network.allow entry needs a host")
+        if "/" in value:
+            try:
+                ipaddress.ip_network(value, strict=False)
+            except ValueError as exc:
+                raise ValueError(f"network.allow host {value!r} is not a CIDR block") from exc
+            return value
+        if any(ch in value for ch in "*? :@") and not _is_ip_literal(value):
+            raise ValueError(
+                f"network.allow host {value!r} is not an IP literal, a CIDR block or an "
+                "exact host name (wildcards are not supported; put the port in 'port')"
+            )
+        return value
+
+
+def _is_ip_literal(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value.strip("[]"))
+    except ValueError:
+        return False
+    return True
+
+
+class NetworkConfig(BaseModel):
+    """The no-egress posture.
+
+    ``open`` (the default) runs no check. ``none`` refuses every outbound TCP
+    connection and name lookup the engine makes, loopback included.
+    ``allowlist`` refuses everything except the destinations in ``allow``.
+    """
+
+    egress: Literal["open", "none", "allowlist"] = "open"
+    allow: list[EgressAllowEntry] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _posture_is_unambiguous(self) -> NetworkConfig:
+        if self.egress == "none" and self.allow:
+            raise ValueError(
+                "network.egress is 'none' but network.allow lists destinations; "
+                "use egress: allowlist to permit them, or empty the list"
+            )
+        return self
+
+
 class ApiConfig(BaseModel):
     """FastAPI app tunables (defense-in-depth limits for the HTTP surface).
 
@@ -393,6 +454,13 @@ class OpenAICompatProviderConfig(BaseModel):
     # models that reject non-default values (OpenAI reasoning models). Call
     # sites keep passing what they pass; the adapter drops it at the wire.
     send_temperature: bool = True
+    # Dialect knob: when set, sent as ``reasoning_effort`` on every request to
+    # this entry. Unset (the default) sends nothing, so the request is
+    # unchanged. "none" turns thinking off on a hybrid reasoning model served
+    # by Ollama (qwen3), whose thinking otherwise spends the completion budget
+    # and fills any requested log-probabilities; OpenAI's reasoning
+    # models take "minimal" / "low" / "medium" / "high".
+    reasoning_effort: str | None = None
     # The registered adapter kind that instantiates this entry.
     # Validated against the adapter registry at first resolution (a config →
     # llm import would mint a subpackage cycle; see LLMConfig's validator).
@@ -480,7 +548,10 @@ class TokenPrice(BaseModel):
 # Anthropic first-party list prices (US$ per MTok) that ship as the
 # ``llm.price_per_mtok`` defaults, checked against
 # https://platform.claude.com/docs/en/about-claude/pricing on 2026-09-17
-# (``claude-sonnet-5-5`` added 2026-10-01 at the same price as Sonnet 5). A
+# (``claude-sonnet-5-5`` added 2026-10-01 at the same price as Sonnet 5;
+# ``claude-haiku-5-5`` added 2026-10-08 at its price for prompts of up to
+# 100,000 tokens, since a single input/output pair cannot hold its higher
+# long-prompt tier and every call site here sends far shorter prompts). A
 # cost estimate is the first thing a new user reads before spending, so the
 # default models are priced out of the box; every rendered estimate prints the
 # per-MTok figure it used, which keeps a stale entry visible rather than
@@ -496,6 +567,7 @@ _LIST_PRICES_PER_MTOK: dict[str, tuple[float, float]] = {
     "claude-sonnet-5-5": (2.00, 10.00),
     "claude-sonnet-5": (2.00, 10.00),
     "claude-sonnet-4-6": (3.00, 15.00),
+    "claude-haiku-5-5": (0.10, 0.50),
     "claude-haiku-4-5": (1.00, 5.00),
 }
 
@@ -1294,6 +1366,23 @@ class UpdateSupersessionConfig(BaseModel):
     subject_floor: float = Field(default=0.45, ge=0.0, le=1.0)
     # Probes per extracted claim from the subject-scoped search, at most.
     max_candidates: int = Field(default=3, ge=1)
+    # the paraphrases pass. When rung 2.5 retires a claim R in favour
+    # of U, each ACTIVE claim of R's about-subject at this content cosine to R
+    # or above (the normalised scale, as subject_floor) is a candidate
+    # other phrasing of the retired value, put to the update probe against U.
+    # 0.70 is set from the trip-versus-move case: 0.785 for the surviving
+    # phrasing, 0.64 for the next nearest claim about the user.
+    paraphrase_floor: float = Field(default=0.70, ge=0.0, le=1.0)
+    # Candidates put to the update probe per retirement, highest cosine first.
+    # 0 turns the pass off.
+    max_paraphrases: int = Field(default=3, ge=0)
+    # rung 2.5 rests on the update probe's settled CHANGES. A pair
+    # rung 2.5 could act on is asked the update question first, whatever the
+    # contradiction probe would say, unless its older claim records a past
+    # value (core.past_value), which keeps the contradiction probe in front.
+    # false restores the contradiction probe in front of every pair (the
+    # behaviour before 1.187.0), kept so a benchmark can run both gates.
+    same_slot_admits: bool = True
 
 
 class ReconciliationConfig(BaseModel):
@@ -1693,8 +1782,13 @@ class SubjectsConfig(BaseModel):
     # resolve with no model call at all.
     wikidata_candidate_selection: Literal["top_hit", "best_description", "llm_judge"] = "llm_judge"
     # Output budget of one `llm_judge` call. The reply is one short
-    # JSON object; a model that thinks before answering needs more.
-    wikidata_judge_max_tokens: int = Field(default=200, gt=0)
+    # JSON object, but `subject_resolution` falls back to `llm.default`, which
+    # can route to a model that thinks by default, and its thinking spends from
+    # this budget: at the old 200 such a model can return no text, and the name
+    # then takes the top hit. The default is the shared probe budget, a literal here
+    # because config cannot import `particles.llm`;
+    # tests/test_probe_budget.py pins the two equal.
+    wikidata_judge_max_tokens: int = Field(default=4096, gt=0)
     # How many Wikidata search hits the `llm_judge` is shown. The
     # ambiguity gate and every other selection value read the first five, as
     # before, so which names reach the model and how a name resolves without it
@@ -1788,6 +1882,18 @@ class SubjectsConfig(BaseModel):
     # form never goes to a live authority, whichever route reached the fold.
     # An empty list keys the fold on source type alone, as before 1.159.2.
     persona_source_tags: list[str] = Field(default_factory=lambda: ["memory-file"])
+    # the speaker references a first-person claim may open on. A
+    # candidate from a persona source (never JOURNAL, whose author stays behind
+    # the gate) that opens on one of these, or on
+    # `persona_canonical_name`, and lists no name that folds to the persona gains
+    # the reference as a subject (§1). A claim that opens on one and carries the
+    # persona Subject is also keyed on the persona for update supersession (§2).
+    # A list of its own rather than `persona_aliases`: bare aliases head ordinary
+    # noun phrases ("User accounts ...") and "I" / "me" never open a third-person
+    # claim. An opener counts only when it is also a persona alias, so the name
+    # §1 appends always folds onto the persona Subject. Add the house terms your
+    # extractor uses ("the owner") to both lists. An empty list turns the rule off.
+    persona_openers: list[str] = Field(default_factory=lambda: ["the user", "the speaker"])
 
     @model_validator(mode="after")
     def _abstain_at_most_suppress(self) -> SubjectsConfig:
@@ -2574,6 +2680,57 @@ class ClaudeCodeHarvestConfig(BaseModel):
     catchup_limit: int = Field(default=5, ge=0)
 
 
+class AgentExtractionConfig(BaseModel):
+    """Agent-side extraction at a Stop hook.
+
+    The in-session agent extracts a span of its own deposited transcript, so a
+    Claude Code user needs no API key for extraction. The ask defaults below
+    come from the 2026-10-09 offline replay and store query
+    (``docs/benchmarks/agent-extraction-defaults-2026-10-09.md``); the
+    agent-dependent ones are confirmed by a shadow week before ``on`` becomes
+    the keyless default.
+    """
+
+    # off: nothing asks. shadow: ask and verify, write and mark nothing, log
+    # what would have happened. on: ask, verify, and write.
+    mode: Literal["off", "shadow", "on"] = "off"
+    # Ask only when the distilled transcript has grown this much past what was
+    # extracted. Replay: 8000 gives about 1.7 asks per active hour.
+    min_new_chars: int = Field(default=8000, ge=1)
+    # Seconds between asks in one session.
+    min_interval_seconds: int = Field(default=600, ge=0)
+    # Waive the interval while more than one span is owed (catch-up asks), and
+    # only after an answer that moved the ask's start.
+    # Replay: recovers a quarter to two fifths of the backlog.
+    catch_up: bool = True
+    # Cap on asks per session, applied only where a background extractor can
+    # take the rest. A keyless install is never capped: a cap there leaves
+    # everything after the last ask unextracted (replay: 35 to 51 % uncovered).
+    max_asks_per_session: int | None = Field(default=6, ge=1)
+    # Largest span one ask carries, in bytes of distilled text. The span's text
+    # rides in the ask, so this bounds the context one ask costs.
+    max_span_chars: int = Field(default=40_000, ge=1000)
+    # An ask unanswered after this many seconds is expired.
+    ask_ttl_seconds: int = Field(default=900, ge=60)
+    # A submission covers its span only with at least this many accepted claims
+    # per 1000 characters. 2.7 is the 10th percentile of the general
+    # extractor's own transcript deltas in the maintainers' store.
+    min_claims_per_kchar: float = Field(default=2.7, ge=0.0)
+    # ...and with no more than this share of candidates dropped for evidence
+    # not found in the span. Placeholder until the shadow week measures it.
+    max_evidence_drop_ratio: float = Field(default=0.5, ge=0.0, le=1.0)
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def _yaml_booleans(cls, value: object) -> object:
+        """Read YAML's unquoted ``on`` / ``off``, which parse as booleans, as the modes."""
+        if value is True:
+            return "on"
+        if value is False:
+            return "off"
+        return value
+
+
 class ClaudeCodeConfig(BaseModel):
     """Claude Code hook integration.
 
@@ -2607,6 +2764,7 @@ class ClaudeCodeConfig(BaseModel):
     # Engages only once ``particles memory rescope`` has run on the store.
     observer_scope: Literal["store", "project"] = "store"
     harvest: ClaudeCodeHarvestConfig = Field(default_factory=ClaudeCodeHarvestConfig)
+    agent_extraction: AgentExtractionConfig = Field(default_factory=AgentExtractionConfig)
 
 
 class AgentMemoryProjectionGitConfig(BaseModel):
@@ -2861,7 +3019,8 @@ class AuditConfig(BaseModel):
     # a model that may think before it answers, and its thinking spends from
     # this budget. The measured runs averaged ~130 output tokens, but one
     # reading on 2026-09-26 (claude-sonnet-5, 96-note store) was cut at 1024
-    # and its flag went unread.
+    # and its flag went unread. The update probe's second reading uses the same
+    # budget and retry before rung 2.5 retires a claim.
     verify_max_tokens: int = Field(default=1024, ge=1)
     # A second reading cut at ``verify_max_tokens`` (or empty, the budget spent
     # on thinking) is re-issued once at this larger budget, since the same call
@@ -2869,39 +3028,53 @@ class AuditConfig(BaseModel):
     # as a failed reading and its flag stays unverified. A value at or below
     # ``verify_max_tokens`` disables the retry.
     verify_retry_max_tokens: int = Field(default=4096, ge=0)
-    # Cost- and time-estimate assumptions (disclosed in the printed estimate),
-    # re-based on the 2026-09-25 owner audit: 96 Claude Code memory files
-    # (~53k source tokens) into a fresh store, claude-sonnet-5 extraction at
-    # ``extraction.max_tokens`` 16384 with the retry at 20000 (since raised to
-    # 32000 and 64000), claude-haiku-4-5 probes, 200-probe cap. Measured: 104
-    # extraction calls averaging ~7,000 output tokens each (725k in all, mostly
-    # adaptive thinking, ~13.6 per source token), so output per call is nearly
-    # flat in the source size and is modelled per call, not per source token.
-    # 8 of the 96 calls were retried at ``extraction.retry_max_tokens``. 374
-    # semantic-lint calls: the 200
-    # capped audit probes plus ~174 §6.6 probes the extraction pipeline makes
-    # while it reconciles each new belief against a near-identical one. $7.97
-    # billed; 96 minutes wall time. The pre-fix estimate printed $1.92-3.57.
+    # Cost- and time-estimate assumptions (disclosed in the printed estimate).
+    # Two measured runs, both claude-sonnet-5 extraction and claude-haiku-4-5
+    # probes:
     #
-    # Expected output tokens per extraction call, averaged over a run with its
-    # retries included. The per-model mapping (keyed like
-    # ``llm.price_per_mtok``: the resolved model id, or ``"<provider>:<model>"``)
-    # is consulted first; the scalar is the fallback. The 2026-09 provider
-    # survey measured ~6.7k on claude-sonnet-5 and ~3.6k on claude-haiku-4-5, so
-    # routing ``llm.extraction`` to haiku warrants an entry of about 3600.
-    estimate_output_tokens_per_extraction_call: int = Field(default=7000, ge=0)
-    estimate_output_tokens_per_extraction_call_by_model: dict[str, int] = Field(
-        default_factory=dict
-    )
-    # The expected output range is the per-call figure times (1 - spread) with no
-    # retries, up to (1 + spread) with the expected retries. A spread, not a
-    # measurement: output per call varies with how much a source says.
+    # * 2026-09-25, 96 Claude Code memory files (~212k characters, ~2.2k a
+    #   file) into a fresh store, at ``extraction.max_tokens`` 16384 with the
+    #   retry at 20000: 104 extraction calls (8 retried) averaging ~7,000
+    #   output tokens, 374 semantic-lint calls (the 200 capped audit probes
+    #   plus ~174 §6.6 probes the pipeline makes while it reconciles each new
+    #   belief), $7.97 billed, 96 minutes.
+    # * 2026-10-04, 6 active ADRs (114k characters, 13-22k each) at 32000 with
+    #   the retry at 64000: 11 chunked calls plus 2 retries, 317k output tokens
+    #   (776 claims, about 7 per 1,000 characters at ~400 output tokens a
+    #   claim), ~$3.58 billed. The flat per-call figure the estimate used
+    #   before (7,000) priced a dense design document about 3x low.
+    #
+    # Output is therefore modelled per call as a fixed part (instructions read,
+    # thinking that does not scale with the text) plus a part proportional to
+    # the characters the call reads. Fitted to both runs with their length
+    # retries taken out: ~1,600 per call plus ~2.0 per character. That gives
+    # ~6,000 for a 2.2k-character memory note and ~31,600 for a full
+    # ``extraction.html_chunk_size`` chunk, which is why a dense document's
+    # full chunks are near the ``extraction.max_tokens`` budget and may be
+    # retried at ``extraction.retry_max_tokens``; the estimate prices those
+    # retries per call rather than at a flat rate.
+    estimate_output_tokens_per_call_base: int = Field(default=1600, ge=0)
+    estimate_output_tokens_per_source_char: float = Field(default=2.0, ge=0.0)
+    # Multiplies both figures above for an extraction model that writes more or
+    # less than claude-sonnet-5, keyed like ``llm.price_per_mtok`` (the resolved
+    # model id, or ``"<provider>:<model>"``). The 2026-09 provider survey
+    # measured ~3,600 output tokens per memory-note call on claude-haiku-4-5
+    # against ~6,700 on claude-sonnet-5, so routing ``llm.extraction`` to haiku
+    # warrants an entry of about 0.55. A model with no entry is scaled by 1.
+    estimate_output_scale_by_model: dict[str, float] = Field(default_factory=dict)
+    # Each call's output is taken to fall anywhere within this fraction of its
+    # expected figure. The expected range runs from every call at (1 - spread)
+    # to every call at (1 + spread), and a call whose output would pass
+    # ``extraction.max_tokens`` at that end is billed the full first budget
+    # plus a retry. A spread, not a measurement: output varies with how much a
+    # source says.
     estimate_output_spread: float = Field(default=0.25, ge=0.0, lt=1.0)
-    # Fraction of extraction calls expected to be retried at the larger
-    # ``extraction.retry_max_tokens`` budget (8 of 96 in the measured run).
-    # Ignored when that retry is disabled. Measured at the old 16384 first
-    # budget; the 32000 budget should retry fewer calls, so the figure is kept
-    # as a conservative bound until a run re-measures it.
+    # Fraction of extraction calls expected to be retried for any reason (an
+    # empty or unparseable reply as well as a cut one), as a floor under the
+    # length retries the model above predicts: the high end and the ceiling
+    # count at least this many. 8 of 96 in the 2026-09-25 run, measured at the
+    # old 16384 first budget, so a conservative bound. Ignored when the retry
+    # is disabled.
     estimate_extraction_retry_rate: float = Field(default=0.083, ge=0.0, le=1.0)
     # §6.6 contradiction probes the extraction pipeline makes per extraction
     # call, on top of the capped audit probes (~174 over 96 calls in the
@@ -2909,17 +3082,21 @@ class AuditConfig(BaseModel):
     # near-duplicates of the harvest makes more.
     estimate_reconcile_probes_per_extraction_call: float = Field(default=1.8, ge=0.0)
     # One contradiction probe (audit or §6.6): instruction plus two claims in,
-    # a one-sentence reason and a verdict line out. The output figure is the
-    # probe call's own ``max_tokens`` (250), an upper bound; the measured run
-    # averaged ~305 in and ~56 out.
+    # a one-sentence reason and a verdict line out. The measured run
+    # (claude-haiku-4-5, no thinking) averaged ~305 in and ~56 out; the output
+    # figure leans high of that. It is an expectation, not a bound: the probe's
+    # own ``max_tokens`` is larger, so a model that thinks by default
+    # (claude-haiku-5-5) has room to think, and its thinking is billed as
+    # output. Raise this if a run's usage line shows probes averaging more.
     estimate_probe_input_tokens: int = Field(default=350, ge=0)
     estimate_probe_output_tokens: int = Field(default=250, ge=0)
-    # Wall time per call, for the time the estimate prints. Calls run one at a
-    # time. The measured run's 96 minutes over 104 extraction calls and 374
-    # probes fits ~50 s per extraction call once the probes (short haiku
-    # replies) are taken at ~1.5 s each; the split is an assumption, the total
-    # is measured.
-    estimate_seconds_per_extraction_call: float = Field(default=50.0, ge=0.0)
+    # Wall time, for the time the estimate prints. Calls run one at a time, and
+    # an extraction call's time is mostly the output it writes, so extraction
+    # is timed by output tokens rather than per call or per file. 125 tokens a
+    # second plus 1.5 s per probe (short haiku replies) reproduces the
+    # 2026-09-25 run's 96 minutes and the 22 minutes one 49k-character ADR took
+    # (2026-10-04, ~145k output tokens); the split between the two is assumed.
+    estimate_extraction_output_tokens_per_second: float = Field(default=125.0, gt=0.0)
     estimate_seconds_per_probe: float = Field(default=1.5, ge=0.0)
     # One second reading: the instruction plus two claims with their
     # passages in (measured ~1,450 tokens on memory notes), and the call's own
@@ -2931,15 +3108,14 @@ class AuditConfig(BaseModel):
     # Wall time per second reading: the measured runs read 22 flags in ~41 s.
     estimate_seconds_per_verification: float = Field(default=2.0, ge=0.0)
 
-    @field_validator("estimate_output_tokens_per_extraction_call_by_model")
+    @field_validator("estimate_output_scale_by_model")
     @classmethod
-    def _non_negative_output_tokens(cls, value: dict[str, int]) -> dict[str, int]:
-        """Every per-model output figure is a token count: zero or more."""
-        for key, tokens in value.items():
-            if tokens < 0:
+    def _non_negative_output_scale(cls, value: dict[str, float]) -> dict[str, float]:
+        """Every per-model output scale is a multiplier: zero or more."""
+        for key, scale in value.items():
+            if scale < 0:
                 raise ValueError(
-                    f"audit.estimate_output_tokens_per_extraction_call_by_model[{key!r}] "
-                    f"must be >= 0, got {tokens}"
+                    f"audit.estimate_output_scale_by_model[{key!r}] must be >= 0, got {scale}"
                 )
         return value
 
@@ -3059,6 +3235,26 @@ class ReanchorConfig(BaseModel):
     max_restatements_per_run: int = Field(default=20, ge=0)
 
 
+class ReleaseConfig(BaseModel):
+    """Releasing a claim held behind a claim an autonomous pass retired.
+
+    A rung-3 record holds the newer claim quarantined. When an update, the
+    re-anchor pass or the document sweep later retires the stored claim, the
+    ``release`` pass re-checks the held claim against the current ACTIVE set
+    and releases it only when nothing still contradicts it. It never retires
+    a claim.
+    """
+
+    # Master switch. Off, the cycle skips the pass and says so; the records
+    # stay for review.
+    enabled: bool = True
+    # Records examined per run, oldest retirement first. Each costs one
+    # contradiction probe and at most one second reading per pair, over the
+    # nearest claim plus up to reconciliation.update_supersession.max_candidates
+    # subject-pool members. A record past the cap waits for the next run.
+    max_records: int = Field(default=10, ge=0)
+
+
 class ConsolidationCensusConfig(BaseModel):
     """How often the cycle runs its census, pass 3.
 
@@ -3101,6 +3297,10 @@ class ConsolidationConfig(BaseModel):
     # Pass 1 per-run cap: PENDING snapshots extracted per cycle, oldest first.
     # A capped run discloses the remainder; the next run continues.
     max_pending_entries: int = Field(default=20, ge=0)
+    # Pass 1 priority class: entries carrying any of these tags
+    # take the cap's slots first, longest-owed first; everything else fills
+    # what remains. The cap is unchanged. Empty restores plain longest-owed order.
+    priority_tags: list[str] = Field(default_factory=lambda: ["rule-file", "memory-file"])
     # Pass 1 pooled batching: run the capped set as concurrent
     # per-snapshot tasks whose LLM requests merge into one Message
     # Batches job (50% price; batch mechanics reuse the llm.batch.* knobs).
@@ -3127,6 +3327,12 @@ class ConsolidationConfig(BaseModel):
     # is a store's whole history of changed facts, and because its pre-filter
     # (update_order) means every probe is spent on a pair rung 2.5 can act on.
     max_update_probes: int = Field(default=100, ge=0)
+    # per-run cap on the paraphrases pass's first readings of the
+    # update probe (a CHANGES adds a second reading). When the cap is reached
+    # the pass's cursor stops at the last retirement fully examined. One
+    # retirement's candidates are asked together, so a run exceeds the cap only
+    # when the cap is below reconciliation.update_supersession.max_paraphrases.
+    max_paraphrase_probes: int = Field(default=30, ge=0)
     # Cycle lock. The kernel holds the lock, so a live cycle is never
     # reclaimed and a crashed one frees it at once. Past this age a skipped
     # caller warns on stderr that the holder may be hung. It is still the
@@ -3147,6 +3353,8 @@ class ConsolidationConfig(BaseModel):
     )
     # The re-anchor pass, between the update sweep and the census.
     reanchor: ReanchorConfig = Field(default_factory=ReanchorConfig)
+    # The held-claim release pass, between re-anchor and the census.
+    release: ReleaseConfig = Field(default_factory=ReleaseConfig)
     # The run-level batch-wait budget.
     batch_wait: ConsolidationBatchWaitConfig = Field(default_factory=ConsolidationBatchWaitConfig)
     # The run's dollar budget, in US$ at list price over the token
@@ -3676,6 +3884,7 @@ class ParticlesConfig(BaseModel):
     cli: CliConfig = Field(default_factory=CliConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
     http: HttpConfig = Field(default_factory=HttpConfig)
+    network: NetworkConfig = Field(default_factory=NetworkConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
     build: BuildConfig = Field(default_factory=BuildConfig)
     engine: EngineConfig = Field(default_factory=EngineConfig)
@@ -3849,6 +4058,7 @@ CLIENT_SECTIONS: frozenset[str] = frozenset(
         "llm",
         "mastodon",
         "migration",
+        "network",
         "rdf",
         "reddit",
         "storage",
@@ -4071,7 +4281,7 @@ def validate_config() -> tuple[Path | None, ParticlesConfig]:
 def _migrate_legacy_keys(raw: dict[str, Any]) -> None:
     """Migrate deprecated config keys in-place, logging a one-time warning.
 
-    Four migrations are active:
+    Five migrations are active:
 
     * ``lint.co_evidential_candidate_threshold`` was renamed to
       ``links_suggest.candidate_threshold``.
@@ -4088,6 +4298,10 @@ def _migrate_legacy_keys(raw: dict[str, Any]) -> None:
       ``benchmark_rot.estimate_extraction_prompt_overhead_tokens`` to
       ``extraction.estimate_prompt_overhead_tokens``, shared with the audit
       estimate and the measured usage line.
+    * the audit estimate's flat per-call output figure gave way to a per-call
+      base plus a per-character rate (``audit.estimate_output_tokens_per_call_base``,
+      ``audit.estimate_output_tokens_per_source_char``); see
+      :func:`_migrate_audit_output_keys`.
 
     Each old key is honoured only when its new home is unset, so an operator
     who has already moved to the new key wins. The shims may be removed once
@@ -4097,6 +4311,7 @@ def _migrate_legacy_keys(raw: dict[str, Any]) -> None:
     _migrate_llm_model_keys(raw)
     _migrate_query_answer_max_tokens(raw)
     _migrate_shared_estimate_keys(raw)
+    _migrate_audit_output_keys(raw)
 
 
 def _migrate_co_evidential_threshold(raw: dict[str, Any]) -> None:
@@ -4205,6 +4420,52 @@ def _migrate_shared_estimate_keys(raw: dict[str, Any]) -> None:
             old_key,
             new_section,
             new_key,
+        )
+
+
+#: The flat per-call output figure the per-model entries were relative to.
+_LEGACY_AUDIT_OUTPUT_PER_CALL = 7000
+
+
+def _migrate_audit_output_keys(raw: dict[str, Any]) -> None:
+    """Retire the audit estimate's flat per-call output and per-call time keys.
+
+    ``audit.estimate_output_tokens_per_extraction_call_by_model`` entries carry
+    over as ``audit.estimate_output_scale_by_model`` ratios against the old
+    7,000 default (an entry of 3600 becomes 0.51), since what an operator
+    recorded there was how much less a model writes. The scalar
+    ``estimate_output_tokens_per_extraction_call`` and
+    ``estimate_seconds_per_extraction_call`` have no counterpart in a model
+    that scales with the source and are dropped with the warning.
+    """
+    section = raw.get("audit")
+    if not isinstance(section, dict):
+        return
+    by_model = section.pop("estimate_output_tokens_per_extraction_call_by_model", None)
+    if isinstance(by_model, dict) and by_model:
+        scales = section.setdefault("estimate_output_scale_by_model", {})
+        if isinstance(scales, dict):
+            for key, tokens in by_model.items():
+                if key not in scales and isinstance(tokens, int | float):
+                    scales[key] = tokens / _LEGACY_AUDIT_OUTPUT_PER_CALL
+        log.warning(
+            "config: 'audit.estimate_output_tokens_per_extraction_call_by_model' is "
+            "deprecated and will be removed in a future release. Its entries were "
+            "carried over as 'audit.estimate_output_scale_by_model' ratios against "
+            "7000; set that key instead."
+        )
+    for old_key in (
+        "estimate_output_tokens_per_extraction_call",
+        "estimate_seconds_per_extraction_call",
+    ):
+        if section.pop(old_key, None) is None:
+            continue
+        log.warning(
+            "config: 'audit.%s' is no longer read. The audit estimate now scales "
+            "output with the source: see 'audit.estimate_output_tokens_per_call_base', "
+            "'audit.estimate_output_tokens_per_source_char' and "
+            "'audit.estimate_extraction_output_tokens_per_second'.",
+            old_key,
         )
 
 

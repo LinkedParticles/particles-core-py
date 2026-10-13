@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from particles.core.modality import classifier_identity
 from particles.core.schema import AssertionModality
 from particles.extraction import general, journal
+from particles.llm.breaker import PROBE_MAX_TOKENS
 
 log = logging.getLogger(__name__)
 
@@ -137,9 +138,13 @@ async def classify_modality(content: str) -> ModalityVerdict | None:
     component = general.modality_prompt_component()
     instructions = _CLASSIFY_FRAME + component.rule + _CLASSIFY_OUTPUT
     system, user = fenced_prompt(instructions, content, label="claim")
+    # The reply is one small JSON object, but ``extraction`` can route to a
+    # model that thinks by default (claude-sonnet-5-5 does), and thinking
+    # spends from ``max_tokens``: at 64 the reply can come back empty, leaving
+    # the claim on its stale default. The shared probe budget leaves it room.
     try:
         raw, provider_model = await complete_with_provider_model(
-            "extraction", user, max_tokens=64, system=system
+            "extraction", user, max_tokens=PROBE_MAX_TOKENS, system=system
         )
     except Exception as exc:
         log.warning("Modality classifier call failed: %s", exc)

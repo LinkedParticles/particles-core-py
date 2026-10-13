@@ -241,6 +241,14 @@ class TestPricing:
         # read (0.1x) + 1.00 output.
         assert usage.snapshot().cost_usd == pytest.approx(5.70)
 
+    def test_haiku_5_5_ships_priced(self) -> None:
+        # $0.10/$0.50 per MTok, its rate for prompts of up to 100k tokens.
+        with track_usage() as usage:
+            record_usage(
+                "anthropic:claude-haiku-5-5", input_tokens=1_000_000, output_tokens=1_000_000
+            )
+        assert usage.snapshot().cost_usd == pytest.approx(0.60)
+
     def test_an_unpriced_model_prices_nothing(self) -> None:
         with track_usage() as usage:
             record_usage("anthropic:claude-sonnet-5", input_tokens=1_000, output_tokens=10)

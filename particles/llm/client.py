@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import anthropic
 
+from particles.http import egress_request_hook
 from particles.secrets import get_anthropic_api_key
 
 _client: anthropic.Anthropic | None = None
@@ -35,7 +36,15 @@ def get_client() -> anthropic.Anthropic:
     """
     global _client
     if _client is None:
-        _client = anthropic.Anthropic(api_key=get_anthropic_api_key())
+        # The SDK's own client factory, so every SDK default (timeout, limits,
+        # keepalive, proxies) stands; the request hook adds the no-egress check
+        # on every request and redirect hop.
+        _client = anthropic.Anthropic(
+            api_key=get_anthropic_api_key(),
+            http_client=anthropic.DefaultHttpxClient(
+                event_hooks={"request": [egress_request_hook("llm purpose (anthropic)")]}
+            ),
+        )
     return _client
 
 

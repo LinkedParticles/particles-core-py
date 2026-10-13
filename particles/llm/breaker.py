@@ -38,6 +38,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from particles.config import get_config, register_reset_hook
+from particles.egress import EgressRefused
 from particles.llm.errors import describe_account_level_failure, is_account_level_failure
 from particles.llm.registry import EmptyCompletionError
 
@@ -104,7 +105,28 @@ def record_unusable_reply(what: str, reply: str) -> None:
     """
     global _failure_count
     _failure_count += 1
-    log.warning("%s reply carried no usable verdict; pair skipped: %r", what, reply[:200])
+    log.warning(
+        "%s reply carried no usable verdict; pair skipped (%d chars): %s",
+        what,
+        len(reply),
+        _reply_excerpt(reply),
+    )
+
+
+#: How much of an unusable reply a warning shows from each end.
+_EXCERPT_CHARS = 300
+
+
+def _reply_excerpt(reply: str) -> str:
+    """The reply, or its head and tail when long, for a warning.
+
+    The tail is shown as well as the head because a malformed reply usually
+    goes wrong at its end: a cut-off answer, a missing closing quote, or text
+    after the JSON. The head alone hid that (2026-10-11).
+    """
+    if len(reply) <= 2 * _EXCERPT_CHARS:
+        return repr(reply)
+    return f"{reply[:_EXCERPT_CHARS]!r} … {reply[-_EXCERPT_CHARS:]!r}"
 
 
 def _reset_llm_state() -> None:
@@ -117,6 +139,20 @@ def _reset_llm_state() -> None:
 
 
 register_reset_hook(_reset_llm_state)
+
+
+#: The output budget of a short probe: a verdict, a reason line, a small JSON
+#: object. The answer itself is ~60 tokens, but a purpose routed to a model
+#: that thinks by default (claude-haiku-5-5, claude-sonnet-5-5, claude-opus-5-5)
+#: spends its thinking from the same ``max_tokens``. On 2026-10-11 a
+#: claude-haiku-5-5 contradiction probe spent the whole of a 250-token budget
+#: thinking and returned no text block, so the re-anchor pass left a restatement
+#: UNRESTATED although its probe and second reading had passed. The fix is room,
+#: not a thinking-off request: claude-sonnet-5-5 rejects ``disabled``, and the
+#: Opus 5.5 and Fable 5 models cannot turn thinking off at all. A ceiling
+#: costs nothing unless it is used: a model that does not think writes the same
+#: ~60 tokens it did at 250, and a reply cut here is still read as no verdict.
+PROBE_MAX_TOKENS = 4096
 
 
 #: The account-level predicate now lives in the Client-layer ``llm`` package
@@ -154,7 +190,7 @@ def _trip(exc: BaseException) -> None:
 
 async def _llm_call(
     prompt: str,
-    max_tokens: int = 200,
+    max_tokens: int = PROBE_MAX_TOKENS,
     system: str | None = None,
     response_schema: dict[str, Any] | None = None,
     purpose: LLMPurpose = "semantic_lint",
@@ -168,13 +204,11 @@ async def _llm_call(
     # returns ``""`` instead of ``None``, uncounted, so the call site sees it
     # as the cut reply it is and counts only the outcome it settles on.
     #
-    # Portability note on the small ``max_tokens`` defaults used by the probe
-    # call sites (100–200 tokens): safe on models where omitting ``thinking``
-    # runs without thinking (e.g. claude-sonnet-4-6), but on adaptive-by-default
-    # models (Sonnet 5, Opus 4.7+, Fable 5) thinking spend counts against
-    # ``max_tokens`` and can consume the whole budget before any text block —
-    # repointing ``llm.semantic_lint`` at one of those needs a bigger budget or
-    # an explicit thinking-off configuration.
+    # Budgets: on a model that thinks by default (Haiku 5.5, Sonnet 5 and 5.5,
+    # Opus 5 and later, Fable 5) thinking spend counts against ``max_tokens``
+    # and can consume the whole budget before any text block. A probe call
+    # site passes :data:`PROBE_MAX_TOKENS` (the default here), never a budget
+    # sized to the answer alone.
     global _tripped_until, _failure_count
     if time.monotonic() < _tripped_until:
         # Breaker open: an account-level failure is in effect. Do not hammer a
@@ -204,6 +238,11 @@ async def _llm_call(
         )
         _tripped_until = 0.0  # success (incl. the half-open probe) clears the breaker
         return result
+    except EgressRefused as exc:
+        # A policy, not a failure: never counted, never trips the
+        # breaker, never logged as an error. The caller degrades as for None.
+        log.debug("LLM call not made: %s", exc)
+        return None
     except Exception as exc:
         if empty_reply_as_text and isinstance(exc, EmptyCompletionError):
             _tripped_until = 0.0  # the model answered: the account is fine
@@ -218,7 +257,7 @@ async def _llm_call(
 
 async def _llm_call_many(
     requests: Sequence[CompletionRequest],
-    max_tokens: int = 200,
+    max_tokens: int = PROBE_MAX_TOKENS,
     response_schema: dict[str, Any] | None = None,
     purpose: LLMPurpose = "semantic_lint",
     *,
@@ -257,6 +296,9 @@ async def _llm_call_many(
             response_schema=response_schema,
             latency_tolerant=latency_tolerant,
         )
+    except EgressRefused as exc:
+        log.debug("Batched LLM call not made: %s", exc)
+        return [None] * len(requests)
     except Exception as exc:
         _failure_count += len(requests)
         if _is_account_level(exc):

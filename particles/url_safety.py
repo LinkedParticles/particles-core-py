@@ -34,6 +34,11 @@ Three layers, sharing one blocklist (``_is_blocked_ip``):
 
 Failure mode is fail-closed: an unresolvable hostname raises
 ``UnsafeUrlError`` rather than being allowed through.
+
+All three first ask the no-egress posture (:mod:`particles.egress`),
+before anything is resolved, so a refused host is never looked up. That check
+is composed with the SSRF blocklist, never merged into it: allowing a LAN host
+for a model server does not let a deposited URL reach it.
 """
 
 from __future__ import annotations
@@ -47,6 +52,8 @@ from typing import Any
 from urllib.parse import urlparse
 
 import httpx
+
+from particles import egress
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +98,7 @@ def validate_fetch_url(url: str) -> None:
         raise UnsafeUrlError(f"URL scheme {parsed.scheme!r} not allowed; use http or https")
     if not parsed.hostname:
         raise UnsafeUrlError(f"URL {url!r} has no hostname")
+    egress.check_url(url, "fetch")
 
     for ip in _resolve_all(parsed.hostname):
         if _is_blocked_ip(ip):
@@ -150,7 +158,9 @@ def _is_blocked_ip(ip: IPAddress) -> bool:
     return ip in _CGNAT_V6_MAPPED
 
 
-def resolve_and_pin(host: str, *, resolve: Resolver | None = None) -> list[IPAddress]:
+def resolve_and_pin(
+    host: str, *, port: int = 443, resolve: Resolver | None = None
+) -> list[IPAddress]:
     """Resolve ``host`` and return every address, all of them vetted.
 
     The subprocess-egress counterpart to :class:`ValidatingTransport`:
@@ -165,12 +175,17 @@ def resolve_and_pin(host: str, *, resolve: Resolver | None = None) -> list[IPAdd
     candidate has already passed the blocklist, so widening from one address to
     all cannot admit a blocked one.
 
+    ``port`` is the one the subprocess will connect to; the no-egress posture
+    is checked against ``host:port`` before anything is resolved.
+
     Raises:
+        EgressRefused: ``network.egress`` does not allow ``host:port``.
         UnsafeUrlError: fail-closed, if the host does not resolve or if ANY
             resolved address is blocked. That all-or-nothing rule is the one
             ``validate_fetch_url`` already applies, and it is what stops a
             split A/AAAA answer smuggling an internal address past a public one.
     """
+    egress.check(host, port, "subprocess fetch")
     resolver: Resolver = resolve if resolve is not None else _resolve_all
     addrs = resolver(host)
     if not addrs:
@@ -241,6 +256,9 @@ class ValidatingTransport(httpx.AsyncHTTPTransport):
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         host = request.url.host
+        # The no-egress posture first, before any lookup; every
+        # redirect hop passes here, so each hop's host is checked.
+        egress.check(host, request.url.port or egress.host_port(str(request.url))[1], "fetch")
         addrs = self._resolve(host)
         if not addrs:
             raise UnsafeUrlError(

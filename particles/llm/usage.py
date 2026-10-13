@@ -21,6 +21,12 @@ The totals are what the provider *reported*, which is what it bills. The
 dollar figure is list price from ``llm.price_per_mtok`` with the batch and
 prompt-cache multipliers applied; it is never read from a billing API, which
 would need an Admin key no user should have to hold to learn what a run cost.
+
+A completion served from the replay cache (:mod:`particles.llm.replay`) is
+reported too, flagged ``replayed`` with the usage it was recorded with. It
+lands in a row of its own, priced at what it would have cost, and is kept out
+of the run's spend so the usage line shows the saving instead of undercounting
+the work.
 """
 
 from __future__ import annotations
@@ -41,13 +47,16 @@ UNATTRIBUTED = "unattributed"
 
 
 class UsageRow(BaseModel):
-    """Totals for one (purpose, provider, model, batched) slice of a run."""
+    """Totals for one (purpose, provider, model, batched, replayed) slice of a run."""
 
     purpose: str
     provider: str
     model: str
     #: True for requests that rode a batch API (billed at the batch discount).
     batched: bool = False
+    #: True for completions served from the replay cache: nothing was billed,
+    #: and the tokens are the ones recorded with the original call.
+    replayed: bool = False
     #: Responses received. A call that failed before the provider answered is
     #: not billed and is not counted.
     calls: int = 0
@@ -61,6 +70,7 @@ class UsageRow(BaseModel):
     #: or ``finish_reason=length``): the reply was cut off mid-text.
     max_tokens_stops: int = 0
     #: List price of this slice in US$, ``None`` when the model has no entry.
+    #: For a replayed slice this is what the calls would have cost, not spend.
     cost_usd: float | None = None
 
 
@@ -68,16 +78,25 @@ class LLMUsage(BaseModel):
     """A snapshot of one run's measured LLM usage, priced at list price."""
 
     rows: list[UsageRow] = Field(default_factory=list)
-    #: Sum of every row's list price; ``None`` when any row is unpriced (a
-    #: partial figure would read as a total).
+    #: Sum of every billed row's list price; ``None`` when any billed row is
+    #: unpriced (a partial figure would read as a total). Replayed rows are
+    #: not spend and are not in it.
     cost_usd: float | None = 0.0
     #: ``provider:model`` of each unpriced model.
     unpriced: list[str] = Field(default_factory=list)
+    #: List price the replayed rows would have cost: what the replay
+    #: cache saved. ``None`` when a replayed row is unpriced.
+    replayed_cost_usd: float | None = 0.0
 
     @property
     def calls(self) -> int:
-        """Responses received across every row."""
-        return sum(row.calls for row in self.rows)
+        """Responses received from a provider across every row (replays excluded)."""
+        return sum(row.calls for row in self.rows if not row.replayed)
+
+    @property
+    def replayed_calls(self) -> int:
+        """Completions served from the replay cache across every row."""
+        return sum(row.calls for row in self.rows if row.replayed)
 
     @property
     def max_tokens_stops(self) -> int:
@@ -92,7 +111,9 @@ class LLMUsage(BaseModel):
         one row is unpriced, so a budget check sums the rows it can price and
         the usage line discloses the rest.
         """
-        return sum(row.cost_usd for row in self.rows if row.cost_usd is not None)
+        return sum(
+            row.cost_usd for row in self.rows if row.cost_usd is not None and not row.replayed
+        )
 
 
 @dataclass
@@ -105,7 +126,7 @@ class _Counts:
     max_tokens_stops: int = 0
 
 
-_Key = tuple[str, str, str, bool]  # (purpose, provider, model, batched)
+_Key = tuple[str, str, str, bool, bool]  # (purpose, provider, model, batched, replayed)
 
 
 class UsageAccumulator:
@@ -131,9 +152,10 @@ class UsageAccumulator:
         cache_creation_tokens: int,
         cache_read_tokens: int,
         hit_max_tokens: bool,
+        replayed: bool = False,
     ) -> None:
         """Add one response's usage to the slice it belongs to."""
-        key = (purpose, provider, model, batched)
+        key = (purpose, provider, model, batched, replayed)
         with self._lock:
             counts = self._counts.setdefault(key, _Counts())
             counts.calls += 1
@@ -150,9 +172,12 @@ class UsageAccumulator:
         rows: list[UsageRow] = []
         unpriced: list[str] = []
         total: float | None = 0.0
-        for (purpose, provider, model, batched), counts in items:
+        saved: float | None = 0.0
+        for (purpose, provider, model, batched, replayed), counts in items:
             cost = _price_row(provider, model, batched, counts)
-            if cost is None:
+            if replayed:
+                saved = None if cost is None or saved is None else saved + cost
+            elif cost is None:
                 key = f"{provider}:{model}"
                 if key not in unpriced:
                     unpriced.append(key)
@@ -165,6 +190,7 @@ class UsageAccumulator:
                     provider=provider,
                     model=model,
                     batched=batched,
+                    replayed=replayed,
                     calls=counts.calls,
                     input_tokens=counts.input_tokens,
                     output_tokens=counts.output_tokens,
@@ -174,7 +200,7 @@ class UsageAccumulator:
                     cost_usd=cost,
                 )
             )
-        return LLMUsage(rows=rows, cost_usd=total, unpriced=unpriced)
+        return LLMUsage(rows=rows, cost_usd=total, unpriced=unpriced, replayed_cost_usd=saved)
 
 
 _ACCUMULATORS: ContextVar[tuple[UsageAccumulator, ...]] = ContextVar(
@@ -225,11 +251,13 @@ def record_usage(
     cache_read_tokens: int = 0,
     hit_max_tokens: bool = False,
     batched: bool = False,
+    replayed: bool = False,
 ) -> None:
     """Report one response's usage to every open :func:`track_usage` scope.
 
     ``provider_model`` is the adapter's ``"<provider>:<model>"`` key. Called by
-    the adapters; a no-op when no scope is open.
+    the adapters, and by the replay cache with ``replayed=True`` for a
+    completion it served without a call; a no-op when no scope is open.
     """
     accumulators = _ACCUMULATORS.get()
     if not accumulators:
@@ -247,6 +275,7 @@ def record_usage(
             cache_creation_tokens=max(0, cache_creation_tokens),
             cache_read_tokens=max(0, cache_read_tokens),
             hit_max_tokens=hit_max_tokens,
+            replayed=replayed,
         )
 
 
@@ -303,6 +332,10 @@ def render_usage_line(usage: LLMUsage) -> str:
     ``LLM usage: 96 extraction calls (claude-sonnet-5), 312k input, 640k output
     tokens; 200 semantic lint calls (claude-haiku-4-5), 60k input, 4k output
     tokens; ≈ $9.20 at list price.`` An unpriced model gets tokens only.
+
+    Replayed completions count in a group's calls and are named
+    (``90 replayed``), but their tokens are not in its input and output: those
+    are what this run bought. What they would have cost closes the line.
     """
     if not usage.rows:
         return "LLM usage: no LLM calls."
@@ -312,21 +345,25 @@ def render_usage_line(usage: LLMUsage) -> str:
     parts: list[str] = []
     for (purpose, provider, model), rows in grouped.items():
         calls = sum(r.calls for r in rows)
+        billed = [r for r in rows if not r.replayed]
         label = model if provider == "anthropic" else f"{provider}:{model}"
         text = (
             f"{_plural(calls, purpose.replace('_', ' ') + ' call')} ({label}), "
-            f"{format_tokens(sum(r.input_tokens for r in rows))} input, "
-            f"{format_tokens(sum(r.output_tokens for r in rows))} output tokens"
+            f"{format_tokens(sum(r.input_tokens for r in billed))} input, "
+            f"{format_tokens(sum(r.output_tokens for r in billed))} output tokens"
         )
-        cache_read = sum(r.cache_read_tokens for r in rows)
-        cache_write = sum(r.cache_creation_tokens for r in rows)
+        cache_read = sum(r.cache_read_tokens for r in billed)
+        cache_write = sum(r.cache_creation_tokens for r in billed)
         if cache_read:
             text += f", {format_tokens(cache_read)} cache read"
         if cache_write:
             text += f", {format_tokens(cache_write)} cache write"
-        batched = sum(r.calls for r in rows if r.batched)
+        batched = sum(r.calls for r in billed if r.batched)
         if batched:
             text += f", {batched} batched"
+        replayed = sum(r.calls for r in rows if r.replayed)
+        if replayed:
+            text += f", {replayed} replayed"
         parts.append(text)
     line = "LLM usage: " + "; ".join(parts)
     if usage.cost_usd is not None:
@@ -336,6 +373,11 @@ def render_usage_line(usage: LLMUsage) -> str:
         line += (
             f"; no dollar total, because {', '.join(usage.unpriced)} {verb} in llm.price_per_mtok."
         )
+    if usage.replayed_calls:
+        line += f" {_plural(usage.replayed_calls, 'call')} replayed from the cache"
+        if usage.replayed_cost_usd is not None:
+            line += f" (≈ {format_usd(usage.replayed_cost_usd)} not re-bought)"
+        line += "."
     stops = usage.max_tokens_stops
     if stops:
         line += (

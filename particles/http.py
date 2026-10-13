@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
 
+from particles import egress
 from particles.url_safety import ValidatingTransport
 
 log = logging.getLogger(__name__)
@@ -42,6 +43,60 @@ async def particles_client(
         transport=ValidatingTransport(),
     ) as client:
         yield client
+
+
+def _egress_check(request: httpx.Request, purpose: str) -> None:
+    port = request.url.port or egress.host_port(str(request.url))[1]
+    egress.check(request.url.host, port, purpose)
+
+
+class EgressTransport(httpx.AsyncHTTPTransport):
+    """Async transport that enforces the no-egress posture and nothing else.
+
+    For the clients that must not use :class:`ValidatingTransport`, because
+    their destination is operator-configured and may be loopback or a LAN host:
+    the OpenAI-compatible adapter and the remote-engine client.
+    Every request, including each redirect hop, is checked against
+    ``network.egress`` before it connects; no SSRF blocklist applies.
+    """
+
+    def __init__(self, *, purpose: str = "connection", **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._purpose = purpose
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        _egress_check(request, self._purpose)
+        return await super().handle_async_request(request)
+
+
+def egress_request_hook(purpose: str) -> Callable[[Any], None]:
+    """A request event hook that enforces the posture on a client we do not build.
+
+    The Anthropic SDK runs on ``httpx2`` and refuses an ``httpx`` transport, and
+    any custom transport would drop its connection limits, keepalive options and
+    proxy mounts. Its own ``anthropic.DefaultHttpxClient`` takes
+    ``event_hooks`` unchanged, and a request hook runs before every request and
+    redirect hop, so the check rides that instead. The request is
+    duck-typed: ``httpx`` and ``httpx2`` share the ``url.host`` / ``url.port`` /
+    ``url.scheme`` shape.
+    """
+
+    def _hook(request: Any) -> None:
+        url = request.url
+        egress.check(url.host, url.port or egress.host_port(str(url))[1], purpose)
+
+    return _hook
+
+
+def egress_client(*, purpose: str = "connection", **kwargs: Any) -> httpx.AsyncClient:
+    """An ``httpx.AsyncClient`` for an operator-configured endpoint, egress-checked.
+
+    The one constructor for every async client outside :func:`particles_client`:
+    ``tests/test_egress_chokepoint.py`` fails on an
+    ``httpx.AsyncClient(`` / ``httpx.Client(`` anywhere else in the package.
+    ``kwargs`` go to ``httpx.AsyncClient`` unchanged.
+    """
+    return httpx.AsyncClient(transport=EgressTransport(purpose=purpose), **kwargs)
 
 
 class ResponseTooLarge(Exception):

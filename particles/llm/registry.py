@@ -34,8 +34,11 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Literal, Protocol, runtime_checkable
 
+from particles.egress import ANTHROPIC_HOST, EgressRefused, current_policy, host_port
 from particles.llm.batch_budget import current_batch_wait_budget
+from particles.llm.replay import maybe_wrap
 from particles.llm.usage import current_purpose, purpose_scope
+from particles.secrets import get_anthropic_base_url_optional
 
 log = logging.getLogger(__name__)
 
@@ -68,6 +71,22 @@ class CompletionError(RuntimeError):
     contents, and so on. The port never decides the fallback; it only reports
     that no usable text came back.
     """
+
+
+class PurposeRefused(CompletionError, EgressRefused):
+    """The purpose's endpoint is refused by ``network.egress``.
+
+    Raised by :func:`get_provider` before any adapter is built, so no SDK retry
+    loop runs and nothing is sent. It is a :class:`CompletionError`, so every
+    call site's existing fallback applies, and an
+    :class:`~particles.egress.EgressRefused`, so a caller can tell a policy from
+    an outage. The purpose is unavailable, never rerouted: a fallback to another
+    provider would falsify the extraction-model stamp.
+    """
+
+    def __init__(self, purpose: str, host: str, port: int | None, posture: str) -> None:
+        EgressRefused.__init__(self, host, port, f"llm purpose {purpose}", posture)
+        self.llm_purpose = purpose
 
 
 class EmptyCompletionError(CompletionError):
@@ -348,10 +367,47 @@ def budget_hint() -> str:
     )
 
 
+def purpose_endpoint(purpose: str) -> tuple[str, int | None, str]:
+    """``(host, port, provider name)`` the purpose's configured provider connects to.
+
+    Reads config only. The Anthropic route honours ``ANTHROPIC_BASE_URL``, the
+    SDK's own override, so the answer names where the SDK would really connect.
+    """
+    from particles.config import get_config
+
+    selection = get_config().llm.for_purpose(purpose)
+    if selection.provider == "anthropic":
+        base = get_anthropic_base_url_optional()
+        if base:
+            host, port = host_port(base)
+            return host, port, "anthropic"
+        return ANTHROPIC_HOST[0], ANTHROPIC_HOST[1], "anthropic"
+    entry = get_config().llm.providers.get(selection.provider)
+    if entry is None:
+        return "", None, selection.provider
+    host, port = host_port(entry.base_url)
+    return host, port, selection.provider
+
+
+def purpose_allowed(purpose: str) -> bool:
+    """Whether ``network.egress`` lets ``purpose`` reach its provider."""
+    policy = current_policy()
+    if not policy.refusing:
+        return True
+    overrides = _OVERRIDES.get()
+    if overrides is not None and purpose in overrides:
+        return True
+    host, port, _ = purpose_endpoint(purpose)
+    return policy.allows(host, port)
+
+
 def get_provider(purpose: LLMPurpose) -> CompletionProvider:
     """Resolve the provider configured for ``purpose``.
 
     A scoped :func:`override_providers` entry for ``purpose`` wins over config.
+    Inside a :func:`~particles.llm.replay.replay_scope` the config-resolved
+    provider is wrapped in the replay cache; an override is not,
+    since a scripted provider costs nothing to call again.
 
     ``provider: "anthropic"`` selects the native-SDK adapter directly; any
     other name is an ``llm.providers`` entry whose ``adapter`` field picks
@@ -364,6 +420,16 @@ def get_provider(purpose: LLMPurpose) -> CompletionProvider:
     if overrides is not None and purpose in overrides:
         return overrides[purpose]
 
+    policy = current_policy()
+    if policy.refusing:
+        host, port, _ = purpose_endpoint(purpose)
+        if not policy.allows(host, port):
+            raise PurposeRefused(purpose, host, port, policy.posture)
+    return maybe_wrap(purpose, _resolve_from_config(purpose))
+
+
+def _resolve_from_config(purpose: LLMPurpose) -> CompletionProvider:
+    """The adapter ``config.llm`` routes ``purpose`` to (the body of :func:`get_provider`)."""
     from particles.config import get_config
 
     selection = get_config().llm.for_purpose(purpose)

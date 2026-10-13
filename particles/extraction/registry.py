@@ -86,6 +86,7 @@ def _make_extractors() -> list[ExtractorPlugin]:
     # ``get_extractors()``. Pay the plugin-import cost on first registry use,
     # not on every ``import particles.extraction.registry``. See root
     # AGENTS.md § Code conventions → Deferred imports (case 2: lazy-init).
+    from particles.extraction.agent import AgentExtractor
     from particles.extraction.docstrings import DocstringExtractor
     from particles.extraction.general import GeneralExtractor
     from particles.extraction.github import (
@@ -129,6 +130,7 @@ def _make_extractors() -> list[ExtractorPlugin]:
         GitHubPagesExtractor(),
         DocstringExtractor(),  # PYTHON_SOURCE structured extractor; before the fallback
         JournalExtractor(),  # JOURNAL genre; before the fallback
+        AgentExtractor(),  # never routed: accepts() is False
         GeneralExtractor(),  # fallback — must be last
     ]
 
@@ -184,6 +186,11 @@ def select_extractor(source_type: str) -> ExtractorPlugin:
         LookupError: if no registered extractor accepts ``source_type``.
     """
     for plugin in get_extractors():
+        # A plugin may read a source type without being routed to it: the
+        # agent extractor accepts anything so the benchmark can run it, and is
+        # only ever invoked by name.
+        if getattr(plugin, "ROUTED", True) is False:
+            continue
         if is_must_not(plugin, source_type):
             continue
         if plugin.accepts(source_type):

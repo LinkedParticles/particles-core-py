@@ -411,7 +411,11 @@ def plan_group(
 
 
 class CloseCause(StrEnum):
-    """How a closed census record was closed (table)."""
+    """How a closed INCONSISTENCY record was closed (table).
+
+    ``WITHDRAWN`` and ``PARTNER_RETIRED`` also close records extraction opened,
+    whose events carry ``origin: extraction``.
+    """
 
     REVIEW = "review"
     """A review action: a ``REVIEW_RESOLVED`` event names the record."""
@@ -424,6 +428,10 @@ class CloseCause(StrEnum):
     WITHDRAWN = "withdrawn"
     """A re-reading under a revised instruction no longer confirms any of its
     pairs. Mechanical, like a lapse: nothing covers the pairs after."""
+    PARTNER_RETIRED = "partner_retired"
+    """A write-time record whose stored side an autonomous pass retired, closed
+    because nothing ACTIVE still contradicts the held claim.
+    Mechanical: it records no judgment on either source."""
 
     @property
     def judgment(self) -> bool:

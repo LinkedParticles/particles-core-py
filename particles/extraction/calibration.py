@@ -20,11 +20,12 @@ scalar-domain ``clamp(p / T, 0, 1)`` approximation it replaces was retired, and
 
 from __future__ import annotations
 
+import itertools
 import logging
 import math
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import numpy as np
 from scipy.optimize import minimize_scalar  # type: ignore[import-untyped]
@@ -60,8 +61,30 @@ TRANSFORM_LOGIT = "logit"
 #: such a record is. A stored ``transform`` of ``None`` means this.
 TRANSFORM_LINEAR = "linear"
 
+#: Value of ``ExtractorCalibration.transform`` for an isotonic map (
+#: §4): a monotone, piecewise-linear map from stated confidence to observed
+#: hit rate, stored as its breakpoints. The method for a target that is a
+#: base-rate map, which one temperature cannot express without distorting
+#: the ranking.
+TRANSFORM_ISOTONIC = "isotonic"
+
+#: Smallest number of fitted pairs one isotonic block may hold. Below it a
+#: block's hit rate is too noisy to store as a confidence.
+ISOTONIC_MIN_BLOCK = 10
+
 # Numerical guard for log(0) / logit(0) in the fit.
 _EPS = 1e-7
+
+
+class ConfidenceScaler(Protocol):
+    """What the pipeline applies a stored calibration through."""
+
+    #: The ``Confidence.calibration_method`` a calibrated particle records.
+    method: str
+
+    def calibrate(self, raw_value: float) -> float: ...
+
+    def calibrate_batch(self, raw_values: list[float]) -> list[float]: ...
 
 
 def is_saturated(raw_value: float) -> bool:
@@ -284,7 +307,9 @@ class HeldOutCheck:
     """ECE of the same pairs with the temperature applied."""
 
 
-def heldout_check(temperature: float, raw_values: list[float], correct: list[bool]) -> HeldOutCheck:
+def heldout_check(
+    temperature: float | ConfidenceScaler, raw_values: list[float], correct: list[bool]
+) -> HeldOutCheck:
     """Score ``temperature`` on recorded ``(raw, correct)`` pairs it was not fitted on.
 
     Pure: no I/O and no fit. The pairs are the raw stated confidences a
@@ -303,7 +328,12 @@ def heldout_check(temperature: float, raw_values: list[float], correct: list[boo
         raise ValueError("raw_values and correct must have the same length")
     if not raw_values:
         return HeldOutCheck(n=0, ece_before=0.0, ece_after=0.0)
-    scaled = TemperatureScaler(temperature=temperature).calibrate_batch(raw_values)
+    scaler = (
+        TemperatureScaler(temperature=temperature)
+        if isinstance(temperature, int | float)
+        else temperature
+    )
+    scaled = scaler.calibrate_batch(raw_values)
     return HeldOutCheck(
         n=len(raw_values),
         ece_before=expected_calibration_error(raw_values, correct),
@@ -346,6 +376,7 @@ class TemperatureScaler:
     temperature: float = 1.0
     diagnostics: FitDiagnostics | None = field(default=None, init=False, repr=False)
     _fitted: bool = field(default=False, init=False, repr=False)
+    method: str = field(default="temperature_scaling", init=False)
 
     def fit(self, raw_values: list[float], correct: list[bool]) -> TemperatureScaler:
         """Fit temperature parameter on a labelled validation set.
@@ -427,6 +458,97 @@ class TemperatureScaler:
         return [self.calibrate(v) for v in raw_values]
 
 
+@dataclass
+class IsotonicScaler:
+    """Isotonic calibration: stated confidence mapped monotonically to hit rate.
+
+    Fitted by pool-adjacent-violators over the pairs sorted by stated
+    confidence, then merged until every block holds at least ``min_block``
+    pairs. Each block becomes one breakpoint, ``(mean stated, observed hit
+    rate)``; :meth:`calibrate` interpolates linearly between breakpoints and
+    holds the end values beyond them. Every pair is fitted, saturated ones
+    included: unlike a temperature, this map can move 0.0 and 1.0.
+
+    The target the 2026-10 measurements found is base-rate calibration: the
+    hosted extractor states about 0.9 and is right about 90 % of the time.
+    A map from stated value to observed rate expresses that directly, where a
+    single temperature can only stretch or squash around 0.5.
+    """
+
+    breakpoints: list[tuple[float, float]] = field(default_factory=list)
+    min_block: int = ISOTONIC_MIN_BLOCK
+    diagnostics: FitDiagnostics | None = field(default=None, init=False, repr=False)
+    method: str = field(default="isotonic_regression", init=False)
+
+    def fit(self, raw_values: list[float], correct: list[bool]) -> IsotonicScaler:
+        """Fit the map. Sets :attr:`breakpoints` and :attr:`diagnostics`."""
+        if len(raw_values) != len(correct):
+            raise ValueError("raw_values and correct must have the same length")
+        pairs = sorted(zip(raw_values, correct, strict=True), key=lambda p: p[0])
+        # Each block: [sum of stated, sum of correct, count].
+        blocks: list[list[float]] = []
+        for raw, ok in pairs:
+            blocks.append([raw, 1.0 if ok else 0.0, 1.0])
+            while (
+                len(blocks) > 1 and blocks[-2][1] / blocks[-2][2] >= blocks[-1][1] / blocks[-1][2]
+            ):
+                last = blocks.pop()
+                blocks[-1] = [blocks[-1][i] + last[i] for i in range(3)]
+        # Pool a block smaller than the minimum into its smaller neighbour.
+        # Pooling adjacent blocks of a non-decreasing sequence keeps it so.
+        while len(blocks) > 1 and min(b[2] for b in blocks) < self.min_block:
+            i = min(range(len(blocks)), key=lambda k: blocks[k][2])
+            j = (
+                i - 1
+                if i == len(blocks) - 1 or (i > 0 and blocks[i - 1][2] <= blocks[i + 1][2])
+                else i + 1
+            )
+            lo, hi = min(i, j), max(i, j)
+            blocks[lo] = [blocks[lo][k] + blocks[hi][k] for k in range(3)]
+            del blocks[hi]
+        self.breakpoints = [(b[0] / b[2], b[1] / b[2]) for b in blocks]
+        n = len(pairs)
+        positives = sum(1 for _, ok in pairs if ok)
+        self.diagnostics = FitDiagnostics(
+            n=n,
+            n_fitted=n,
+            n_saturated=0,
+            distinct_raw=len({r for r, _ in pairs}),
+            positive_rate=positives / n if n else 0.0,
+            # No temperature: 1.0 is the identity and never on a bound, so the
+            # bound check stays silent and every other check applies as is.
+            temperature=1.0,
+        )
+        log.info(
+            "IsotonicScaler fitted: %d block(s) over N=%d, %d distinct confidence(s), "
+            "positive rate %.3f",
+            len(self.breakpoints),
+            n,
+            self.diagnostics.distinct_raw,
+            self.diagnostics.positive_rate,
+        )
+        return self
+
+    def calibrate(self, raw_value: float) -> float:
+        """Map one stated confidence through the fitted breakpoints."""
+        points = self.breakpoints
+        if not points:
+            raise ValueError("IsotonicScaler has no breakpoints; fit it first")
+        if raw_value <= points[0][0]:
+            return points[0][1]
+        if raw_value >= points[-1][0]:
+            return points[-1][1]
+        for (x0, y0), (x1, y1) in itertools.pairwise(points):
+            if x0 <= raw_value <= x1:
+                if x1 == x0:
+                    return y1
+                return y0 + (y1 - y0) * (raw_value - x0) / (x1 - x0)
+        return points[-1][1]  # unreachable: the ends are handled above
+
+    def calibrate_batch(self, raw_values: list[float]) -> list[float]:
+        return [self.calibrate(v) for v in raw_values]
+
+
 def _sigmoid(x: float) -> float:
     """Overflow-free logistic. ``exp`` is taken of a negative number only."""
     if x >= 0.0:
@@ -435,7 +557,7 @@ def _sigmoid(x: float) -> float:
     return e / (1.0 + e)
 
 
-def scaler_for_record(calibration: ExtractorCalibration) -> TemperatureScaler | None:
+def scaler_for_record(calibration: ExtractorCalibration) -> ConfidenceScaler | None:
     """Scaler for a stored calibration, or ``None`` if it must not be applied.
 
     ``None`` is returned for any record whose ``transform`` is not
@@ -456,9 +578,22 @@ def scaler_for_record(calibration: ExtractorCalibration) -> TemperatureScaler | 
     stated value, honestly labelled — which is strictly better than either
     misreading. Re-fit with ``particles extractor calibrate <id> --regenerate``.
     """
+    if calibration.transform == TRANSFORM_ISOTONIC:
+        # an isotonic record is its breakpoints; none means a
+        # malformed record, which is refused like any other unappliable one.
+        if not calibration.breakpoints:
+            return None
+        return IsotonicScaler(breakpoints=[(x, y) for x, y in calibration.breakpoints])
     if calibration.transform != TRANSFORM_LOGIT:
         return None
     return TemperatureScaler(temperature=calibration.temperature)
+
+
+def describe_calibration(calibration: ExtractorCalibration) -> str:
+    """A short label for a stored record: its temperature, or its isotonic map's size."""
+    if calibration.transform == TRANSFORM_ISOTONIC:
+        return f"isotonic, {len(calibration.breakpoints or [])} breakpoint(s)"
+    return f"T={calibration.temperature:.4f}"
 
 
 def version_mismatch_reason(calibration: ExtractorCalibration, running_version: str) -> str | None:

@@ -3135,9 +3135,10 @@ def candidate_to_particle(
     ``calibration_source=EXTRACTOR_DIRECT`` and the raw
     ``candidate.confidence_value``. When a calibration record is supplied,
     the raw value is passed through a
-    :class:`particles.extraction.calibration.TemperatureScaler` and the
-    particle carries ``calibration_source=CALIBRATED_BENCHMARK``,
-    ``calibration_method="temperature_scaling"``, and a
+    :class:`particles.extraction.calibration.TemperatureScaler`, or for an
+    isotonic record :class:`~particles.extraction.calibration.IsotonicScaler`,
+    and the particle carries ``calibration_source=CALIBRATED_BENCHMARK``,
+    ``calibration_method`` naming the scaler, and a
     ``calibration_ref`` of the form ``"<extractor_id>:<fitted_at_iso>"``
     so the audit trail back to the fit is grep-able.
 
@@ -3188,7 +3189,9 @@ def candidate_to_particle(
         confidence = Confidence(
             value=scaler.calibrate(candidate.confidence_value),
             calibration_source=CalibrationSource.CALIBRATED_BENCHMARK,
-            calibration_method="temperature_scaling",
+            # the scaler names its method, a temperature or an
+            # isotonic map, so the particle says which one wrote its value.
+            calibration_method=scaler.method,
             calibration_ref=f"{asserted_by}:{calibration.fitted_at.isoformat()}",
         )
     else:

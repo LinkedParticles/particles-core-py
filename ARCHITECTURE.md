@@ -12,6 +12,7 @@ from this layer into the state-holding engine.
 | `core/` | Schema models; the status machine and its transition validator; confidence math (the value is calibrated once at creation and never mutated) |
 | `config.py`, `secrets.py` | Configuration model and secret access |
 | `embeddings.py`, `http.py`, `url_safety.py`, `url_canonical.py` | Shared client-side utilities |
+| `egress.py` | The no-egress posture: the policy every outbound path is checked against |
 | `llm/` | The completion-provider port and its wire-protocol adapters; every model call routes through here |
 | `extraction/` | Turning source bytes into candidate particles with unresolved subject names, with no graph and no store |
 | `conformance/` | Schema + SHACL validation against the normative artifacts |

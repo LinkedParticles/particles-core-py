@@ -40,9 +40,11 @@ import json
 import logging
 import re
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from particles import egress
 from particles.core.schema import (
     ApplicabilityClause,
     CanonicalForm,
@@ -231,9 +233,14 @@ def _structured_claim(
 # store-free) the lookup falls back to L1 + L3 only — labels resolve live but
 # are not persisted across runs. Mirrors ``incremental``'s carry-forward hook.
 #
-# Signature: (entity_id, fetch_live, session) -> label. ``fetch_live`` is the
-# Client-side L3 closure; ``session`` is the caller's session or None.
-LabelCache = Callable[[str, Callable[[], Awaitable[str]], "AsyncSession | None"], Awaitable[str]]
+# Signature: (entity_id, fetch_live, session) -> label or None. ``fetch_live``
+# is the Client-side L3 closure and returns None when the fetch failed;
+# ``session`` is the caller's session or None. The cache persists only a label
+# the closure actually fetched, and passes None through for a failed fetch, so
+# an outage is never cached as the entity's label.
+LabelCache = Callable[
+    [str, Callable[[], Awaitable[str | None]], "AsyncSession | None"], Awaitable[str | None]
+]
 _label_cache: LabelCache | None = None
 
 
@@ -243,56 +250,87 @@ def register_label_cache(cache: LabelCache) -> None:
     _label_cache = cache
 
 
-async def _fetch_label(
-    entity_id: str, url: str, fallback: str, session: AsyncSession | None = None
-) -> str:
+def _label_url(entity_id: str) -> str:
+    kind = "properties" if entity_id.startswith("P") else "items"
+    return f"{_WIKIDATA_REST}/entities/{kind}/{entity_id}"
+
+
+async def fetch_live_label(entity_id: str) -> str | None:
+    """Fetch the English label of a Wikidata item or property from the REST API.
+
+    Returns the label, or the entity id itself when Wikidata answered and the
+    entity has no English label. Returns None when the fetch failed (a network
+    error, a timeout, an error status), which a caller must not cache: the id is
+    then a fallback, not an answer.
+
+    Raises:
+        EgressRefused: the network posture refuses the Wikidata host. A refusal
+            is never cached either.
+    """
+    egress.check(*egress.WIKIDATA_HOST, "wikidata labels")
+    from particles.http import get_capped, particles_client
+
+    try:
+        async with particles_client(timeout=10.0) as client:
+            resp = await get_capped(client, _label_url(entity_id))
+            resp.raise_for_status()
+            data = resp.json()
+            return str(data.get("labels", {}).get("en", entity_id))
+    except Exception as exc:
+        log.warning("Failed to fetch label for %s: %s", entity_id, exc)
+        return None
+
+
+async def _fetch_label(entity_id: str, session: AsyncSession | None = None) -> str:
     """Fetch a label with three-level cache: in-process → DB → API.
 
     L1 (in-process) and L3 (live REST) live here on the Client. The L2 DB cache
     is injected via :func:`register_label_cache`; without it, only L1 + L3 run.
+    When the live fetch fails the entity id is returned for the current render
+    and nothing is cached, so the next lookup asks Wikidata again.
     """
     # L1: in-process dict (current process lifetime)
     cache = _property_label_cache if entity_id.startswith("P") else _item_label_cache
     if entity_id in cache:
         return cache[entity_id]
 
-    async def _fetch_live() -> str:
-        # L3: Wikidata REST API
-        from particles.http import get_capped, particles_client
-
-        label = fallback
-        try:
-            async with particles_client(timeout=10.0) as client:
-                resp = await get_capped(client, url)
-                resp.raise_for_status()
-                data = resp.json()
-                label = str(data.get("labels", {}).get("en", fallback))
-        except Exception as exc:
-            log.warning("Failed to fetch label for %s: %s", entity_id, exc)
-        return label
+    async def _fetch_live() -> str | None:
+        # L3: Wikidata REST API. Raises EgressRefused under a posture that
+        # refuses the host, so neither cache persists anything.
+        return await fetch_live_label(entity_id)
 
     # L2: persistent DB cache (Engine-injected); pure-Client falls back to L3.
-    if _label_cache is not None:
-        label = await _label_cache(entity_id, _fetch_live, session)
-    else:
-        label = await _fetch_live()
+    try:
+        if _label_cache is not None:
+            label = await _label_cache(entity_id, _fetch_live, session)
+        else:
+            label = await _fetch_live()
+    except egress.EgressRefused:
+        refused = _refused_labels.get()
+        if refused is not None:
+            refused.add(entity_id)
+        return entity_id  # not written to L1 either, so a later run retries
 
+    if label is None:
+        return entity_id
     cache[entity_id] = label
     return label
 
 
+#: Labels the posture refused during the current extraction, for its quality
+#: note. Each :meth:`WikidataExtractor.extract` installs a fresh
+#: set; nothing reads it outside that call.
+_refused_labels: ContextVar[set[str] | None] = ContextVar("_refused_labels", default=None)
+
+
 async def _fetch_property_label(pid: str, session: AsyncSession | None = None) -> str:
     """Return English label for a Wikidata property ID, e.g. 'P571' → 'inception'."""
-    return await _fetch_label(
-        pid, f"{_WIKIDATA_REST}/entities/properties/{pid}", fallback=pid, session=session
-    )
+    return await _fetch_label(pid, session=session)
 
 
 async def _fetch_item_label(qid: str, session: AsyncSession | None = None) -> str:
     """Return English label for a Wikidata item QID, e.g. 'Q64' → 'Berlin'."""
-    return await _fetch_label(
-        qid, f"{_WIKIDATA_REST}/entities/items/{qid}", fallback=qid, session=session
-    )
+    return await _fetch_label(qid, session=session)
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +465,8 @@ class WikidataExtractor:
 
         candidates: list[CandidateParticle] = []
         notes: list[str] = []
+        refused: set[str] = set()
+        refused_token = _refused_labels.set(refused)
 
         for prop_id, stmt_list in statements.items():
             if prop_id in _SKIP_PROPERTY_IDS:
@@ -484,6 +524,13 @@ class WikidataExtractor:
                         external_refs={qid: external_ref_for(qid) for qid in subjects},
                     )
                 )
+
+        _refused_labels.reset(refused_token)
+        if refused:
+            notes.append(
+                f"{len(refused)} Wikidata label(s) unresolved: network.egress does not "
+                "allow www.wikidata.org. Re-extract after the policy opens to restore them."
+            )
 
         log.info(
             "Wikidata extractor: %d candidates from %s (%s)",

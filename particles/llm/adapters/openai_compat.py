@@ -54,6 +54,8 @@ from typing import Any
 import httpx
 from opentelemetry import metrics, trace
 
+from particles.http import egress_client
+from particles.llm.logprobs import active_capture, record_logprobs
 from particles.llm.registry import (
     CompletionError,
     EmptyCompletionError,
@@ -330,6 +332,16 @@ class OpenAICompatProvider:
         }
         if temperature is not None and cfg.send_temperature:
             body["temperature"] = temperature
+        if cfg.reasoning_effort is not None:
+            body["reasoning_effort"] = cfg.reasoning_effort
+        # Opt-in log-probability capture: requested only inside a
+        # ``capture_logprobs`` scope, so the default request is unchanged and
+        # the reply text returned below is the same either way.
+        capture = active_capture()
+        if capture is not None:
+            body["logprobs"] = True
+            if capture.top_logprobs:
+                body["top_logprobs"] = capture.top_logprobs
         if enforce and response_schema is not None:
             schema = _wrap_array_schema(response_schema) if wrapped else response_schema
             if cfg.structured_output == "strict":
@@ -415,7 +427,7 @@ async def _post_with_retry(
     """
     last_status: int | None = None
     last_detail = ""
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with egress_client(purpose="llm endpoint", timeout=timeout) as client:
         for attempt in range(max_retries + 1):
             try:
                 resp = await client.post(url, json=body, headers=headers)
@@ -495,6 +507,7 @@ def _extract_text(
     # Billed whether or not the reply carries text, so counted before the
     # empty-reply raise below.
     _record_payload_usage(payload, provider_model, truncated=truncated)
+    record_logprobs(provider_model, payload)
     if truncated:
         # The span opened by ``complete()`` is still current here, so the fact
         # reaches telemetry as well as the log (no-op without an OTel SDK).

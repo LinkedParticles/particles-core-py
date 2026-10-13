@@ -36,6 +36,7 @@ from typing import Any
 
 from particles.core.jsonld_context import is_published_curie
 from particles.core.schema import ClaimTerm, ExternalRef, StructuredClaim, TermKind
+from particles.llm.breaker import PROBE_MAX_TOKENS
 
 log = logging.getLogger(__name__)
 
@@ -257,8 +258,11 @@ async def structure_content(content: str, subject_names: list[str]) -> Structure
     # the stored claim (which came from an untrusted source) fenced in the user
     # turn, so an injected instruction inside a claim cannot steer the call.
     system, user = fenced_prompt(instructions, content, label="claim")
+    # One small JSON object, given the shared probe budget rather than one sized
+    # to it: ``extraction`` can route to a model that thinks by default, whose
+    # thinking spends from ``max_tokens`` and could leave 512 with no text.
     try:
-        raw = await complete("extraction", user, max_tokens=512, system=system)
+        raw = await complete("extraction", user, max_tokens=PROBE_MAX_TOKENS, system=system)
     except Exception as exc:
         log.warning("Structurizer call failed: %s", exc)
         return None

@@ -409,7 +409,9 @@ class ProviderSelection(BaseModel):
     """
 
     provider: str = "anthropic"
-    model: str = "claude-sonnet-4-6"
+    # The compiled default since 1.189.0, when it moved from claude-sonnet-4-6
+    # behind measurements registered before the runs.
+    model: str = "claude-sonnet-5-5"
 
 
 class OpenAICompatProviderConfig(BaseModel):
@@ -572,6 +574,27 @@ _LIST_PRICES_PER_MTOK: dict[str, tuple[float, float]] = {
 }
 
 
+# Measured estimate factors that ship for the compiled default and the model it
+# replaced, keyed like ``llm.price_per_mtok``. Characters per input
+# token follow the shipped convention: the old tokenizer's 4.0 rule of thumb
+# divided by the measured token ratio against claude-sonnet-4-6 (1.3437 on one
+# run's byte-identical extraction prompts, token-counting endpoint, 2026-10-13).
+# The output scale is relative to claude-sonnet-5, which the audit's per-call
+# figures were fitted on: claude-sonnet-5-5 wrote 59,760 output tokens on the
+# 2026-10 provider survey's 18 calls against claude-sonnet-5's 111,950 on the same
+# calls (0.534). The extraction figure is the memory benchmark's 6,700 scaled the
+# same way. The claude-sonnet-4-6 entries come from paired run
+# (docs/benchmarks/default-model-adr0317-2026-10-13.md).
+_SHIPPED_CHARS_PER_TOKEN: dict[str, float] = {"claude-sonnet-5-5": 2.98}
+_SHIPPED_OUTPUT_SCALE: dict[str, float] = {
+    "claude-sonnet-5-5": 0.534,
+    "claude-sonnet-4-6": 0.800,
+}
+_SHIPPED_EXTRACTION_OUTPUT_TOKENS: dict[str, int] = {
+    "claude-sonnet-5-5": 3_578,
+    "claude-sonnet-4-6": 5_363,
+}
+
 _T = TypeVar("_T")
 
 
@@ -591,6 +614,23 @@ def lookup_by_model(
     return None, None
 
 
+#: Every completion purpose, in the order the operator-facing lines print them.
+#: A literal here because config cannot import ``particles.llm``;
+#: tests/test_config.py pins it equal to ``particles.llm.LLMPurpose``.
+LLM_PURPOSES: tuple[str, ...] = (
+    "extraction",
+    "semantic_lint",
+    "verification",
+    "subject_resolution",
+    "query_response",
+    "synthesis",
+    "abstraction",
+    "benchmark",
+    "benchmark_answer",
+    "use_judge",
+)
+
+
 def _default_prices() -> dict[str, TokenPrice]:
     return {
         model: TokenPrice(input=inp, output=out)
@@ -603,9 +643,11 @@ class LLMConfig(BaseModel):
 
     ``default`` is the fallback pairing; each purpose may override it. The
     operator can thus route high-volume ``extraction`` to a cheap model while
-    keeping low-volume ``synthesis`` on a hosted one. All compiled defaults are
-    ``claude-sonnet-4-6`` so the out-of-the-box behaviour is unchanged from
-    before the port existed.
+    keeping low-volume ``synthesis`` on a hosted one. Every purpose falls back
+    to the compiled default, ``claude-sonnet-5-5`` since 1.189.0 (
+    ``claude-sonnet-4-6`` before), except ``use_judge``, which carries its own
+    compiled selection. ``particles config validate`` names the
+    default in force and where it came from.
 
     The legacy ``extraction.model`` / ``wiki.model`` keys are migrated into
     this section by ``_migrate_legacy_keys`` (``extraction.model`` →
@@ -711,6 +753,30 @@ class LLMConfig(BaseModel):
         """
         override = getattr(self, purpose, None)
         return override if isinstance(override, ProviderSelection) else self.default
+
+    def selection_source(self, purpose: str) -> str:
+        """Where ``purpose``'s selection comes from, as an operator reads it.
+
+        ``"llm.<purpose>"`` when the configuration sets that purpose,
+        ``"compiled llm.<purpose>"`` for a purpose with its own compiled
+        selection that the configuration leaves alone (``use_judge``),
+        ``"llm.default"`` when the purpose falls back to a configured default,
+        and ``"compiled default"`` when nothing set it. ``"default"`` itself
+        reads as either of the last two.
+        """
+        if purpose != "default" and getattr(self, purpose, None) is not None:
+            if purpose in self.model_fields_set:
+                return f"llm.{purpose}"
+            return f"compiled llm.{purpose}"
+        return "llm.default" if "default" in self.model_fields_set else "compiled default"
+
+    def routed_elsewhere(self) -> dict[str, ProviderSelection]:
+        """The purposes whose selection differs from ``default``, in purpose order."""
+        return {
+            purpose: sel
+            for purpose in LLM_PURPOSES
+            if (sel := self.for_purpose(purpose)) != self.default
+        }
 
     @model_validator(mode="after")
     def _validate_provider_wiring(self) -> LLMConfig:
@@ -974,6 +1040,16 @@ class ModalityRegenerationConfig(BaseModel):
     rate_limit_per_minute: int = Field(default=60, ge=0)
     batch_limit: int = Field(default=200, ge=0)
     commit_interval: int = Field(default=25, ge=1)
+
+
+class ValidityBackfillConfig(BaseModel):
+    """Defaults for ``particles validity``, the prose-date default for ``valid_from``.
+
+    The pass makes no model call, so it has no rate limit; ``commit_interval``
+    is how often it commits, so an interrupt costs seconds of work.
+    """
+
+    commit_interval: int = Field(default=200, ge=1)
 
 
 class ExtractionPolarityConfig(BaseModel):
@@ -1777,6 +1853,10 @@ class SubjectsConfig(BaseModel):
     # claude-sonnet-4-6; on an ordinary-prose gold set, 0.898 to 0.918 against
     # 0.735, 45 of 49 names judged at about US$0.20 per 100 names, no correct
     # link lost on either (docs/benchmarks/subject-resolution-judge-2026-10-01.md).
+    # Re-measured 2026-10-13 on claude-sonnet-5-5, the compiled default since
+    # 1.189.0, at 7 hits: 1.000 on the suite and 0.939 on the ordinary-prose
+    # set, no correct link lost, at about US$0.09 and US$0.20 per 100 names
+    # (docs/benchmarks/default-model-adr0317-2026-10-13.md).
     # With no LLM key, an open breaker, or an unusable reply it takes the top
     # hit, so `top_hit` is also what an offline store gets. Set `top_hit` to
     # resolve with no model call at all.
@@ -3061,7 +3141,12 @@ class AuditConfig(BaseModel):
     # measured ~3,600 output tokens per memory-note call on claude-haiku-4-5
     # against ~6,700 on claude-sonnet-5, so routing ``llm.extraction`` to haiku
     # warrants an entry of about 0.55. A model with no entry is scaled by 1.
-    estimate_output_scale_by_model: dict[str, float] = Field(default_factory=dict)
+    # Ships with measured entries for the compiled default and the model it
+    # replaced (``_SHIPPED_OUTPUT_SCALE``); operator entries merge
+    # over them key by key.
+    estimate_output_scale_by_model: dict[str, float] = Field(
+        default_factory=lambda: dict(_SHIPPED_OUTPUT_SCALE)
+    )
     # Each call's output is taken to fall anywhere within this fraction of its
     # expected figure. The expected range runs from every call at (1 - spread)
     # to every call at (1 + spread), and a call whose output would pass
@@ -3107,6 +3192,14 @@ class AuditConfig(BaseModel):
     estimate_verify_output_tokens: int = Field(default=1024, ge=0)
     # Wall time per second reading: the measured runs read 22 flags in ~41 s.
     estimate_seconds_per_verification: float = Field(default=2.0, ge=0.0)
+
+    @field_validator("estimate_output_scale_by_model", mode="before")
+    @classmethod
+    def _merge_over_shipped_scales(cls, value: Any) -> Any:
+        """Operator entries replace the shipped ones key by key; the rest stay."""
+        if isinstance(value, dict):
+            return {**_SHIPPED_OUTPUT_SCALE, **value}
+        return value
 
     @field_validator("estimate_output_scale_by_model")
     @classmethod
@@ -3524,8 +3617,10 @@ class MemoryBenchmarkConfig(BaseModel):
     # on claude-sonnet-5 but ~3.6k on claude-haiku-4-5 — so an arm routing
     # ``llm.extraction`` elsewhere is mis-estimated ~2x on the write side
     # without an entry here. The rendered estimate says which source it used.
+    # Ships with measured entries for the compiled default and the model it
+    # replaced; operator entries merge over them key by key.
     estimate_output_tokens_per_extraction_call_by_model: dict[str, int] = Field(
-        default_factory=dict
+        default_factory=lambda: dict(_SHIPPED_EXTRACTION_OUTPUT_TOKENS)
     )
     # Characters per input token — the factor the estimate and the pre-flight
     # context-window check divide prompt bytes by. The scalar is the classic
@@ -3536,8 +3631,30 @@ class MemoryBenchmarkConfig(BaseModel):
     # lookup as ``llm.price_per_mtok`` — is what keeps their input projection and
     # their window verdict honest. The write side is keyed on the extraction
     # model, the answer side and the window check on the answer model.
+    # The map ships one entry, for the compiled default, and the
+    # scalar stays the old tokenizer's 4.0, so a model with no entry (a local
+    # or OpenAI-compatible one included) keeps the factor it always had.
+    # Operator entries merge over the shipped one key by key.
     chars_per_token: float = Field(default=4.0, gt=0.0)
-    chars_per_token_by_model: dict[str, float] = Field(default_factory=dict)
+    chars_per_token_by_model: dict[str, float] = Field(
+        default_factory=lambda: dict(_SHIPPED_CHARS_PER_TOKEN)
+    )
+
+    @field_validator("estimate_output_tokens_per_extraction_call_by_model", mode="before")
+    @classmethod
+    def _merge_over_shipped_output_tokens(cls, value: Any) -> Any:
+        """Operator entries replace the shipped ones key by key; the rest stay."""
+        if isinstance(value, dict):
+            return {**_SHIPPED_EXTRACTION_OUTPUT_TOKENS, **value}
+        return value
+
+    @field_validator("chars_per_token_by_model", mode="before")
+    @classmethod
+    def _merge_over_shipped_chars_per_token(cls, value: Any) -> Any:
+        """Operator entries replace the shipped ones key by key; the rest stay."""
+        if isinstance(value, dict):
+            return {**_SHIPPED_CHARS_PER_TOKEN, **value}
+        return value
 
     @field_validator("estimate_output_tokens_per_extraction_call_by_model")
     @classmethod
@@ -3735,6 +3852,31 @@ class LeakageBenchmarkConfig(BaseModel):
     confirm_call_threshold: int = Field(default=50, ge=0)
 
 
+class UpdateGateBenchmarkConfig(BaseModel):
+    """The trip-versus-move case and the update-gate pair sets.
+
+    Run counts and safety margins only. The pipeline under test runs the
+    compiled defaults with every purpose pinned to the chosen model: nothing
+    here re-tunes extraction, reconciliation or consolidation. There is no
+    confirm threshold: every live run asks before its first call, because
+    neither suite has a free live path.
+    """
+
+    # The record's protocol (item 5): the bar is stated only when a
+    # run uses these counts.
+    move_runs: int = Field(default=3, ge=0)
+    trip_alone_runs: int = Field(default=2, ge=0)
+    # Samples per pair in the update-gate replay; the sets were registered at 3.
+    samples: int = Field(default=3, ge=1)
+    # The per-run ceiling --max-usd defaults to, as a multiple of a measured
+    # estimate (a profile or the 2026-10-12 record). An upper-bound estimate is
+    # already a ceiling and is used as is.
+    max_usd_multiplier: float = Field(default=4.0, ge=1.0)
+    # How long one run's child may take before it is stopped and reported
+    # incomplete. A live run took a few minutes on 2026-10-12.
+    run_timeout_seconds: float = Field(default=1800.0, gt=0.0)
+
+
 class BenchmarkConfig(BaseModel):
     """Benchmark-harness run persistence (family).
 
@@ -3903,6 +4045,7 @@ class ParticlesConfig(BaseModel):
     extraction_stance: ExtractionStanceConfig = Field(default_factory=ExtractionStanceConfig)
     extraction_polarity: ExtractionPolarityConfig = Field(default_factory=ExtractionPolarityConfig)
     extraction_validity: ExtractionValidityConfig = Field(default_factory=ExtractionValidityConfig)
+    validity_backfill: ValidityBackfillConfig = Field(default_factory=ValidityBackfillConfig)
     extraction_vision: ExtractionVisionConfig = Field(default_factory=ExtractionVisionConfig)
     structured_claim: StructuredClaimConfig = Field(default_factory=StructuredClaimConfig)
     rdf: RdfConfig = Field(default_factory=RdfConfig)
@@ -3956,6 +4099,9 @@ class ParticlesConfig(BaseModel):
         default_factory=RelevanceFloorBenchmarkConfig
     )
     benchmark_leakage: LeakageBenchmarkConfig = Field(default_factory=LeakageBenchmarkConfig)
+    benchmark_update_gate: UpdateGateBenchmarkConfig = Field(
+        default_factory=UpdateGateBenchmarkConfig
+    )
     benchmark: BenchmarkConfig = Field(default_factory=BenchmarkConfig)
     refetch_floors: dict[str, int] = Field(default_factory=lambda: dict(_DEFAULT_REFETCH_FLOORS))
     local_refresh: LocalRefreshConfig = Field(default_factory=LocalRefreshConfig)
@@ -4128,6 +4274,15 @@ _ENV_OVERRIDES: list[tuple[str, str, str]] = [
     ("PARTICLES_DAEMON_STORE", "daemon", "store"),
     ("PARTICLES_DAEMON_WEB_CLIPPER_DIR", "daemon", "web_clipper_dir"),
 ]
+
+
+def env_override_names() -> frozenset[str]:
+    """Every environment variable that overrides a config field.
+
+    A benchmark that runs the SDK in a child process with a private environment
+    removes these, so no override of the operator's reaches the run.
+    """
+    return frozenset(name for name, _section, _field in _ENV_OVERRIDES)
 
 
 # ---------------------------------------------------------------------------

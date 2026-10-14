@@ -55,6 +55,7 @@ from particles.core.schema import (
     Subject,
     TermKind,
     UncertaintyNature,
+    ValidKind,
 )
 from particles.core.scoring.confidence import CalibrationSource
 from particles.core.status import Status, StatusReason
@@ -276,6 +277,11 @@ def to_unit(particle: Particle, subjects: dict[str, Subject]) -> dict[str, Any]:
         unit["uncertaintyKind"] = particle.uncertainty_kind
     if particle.valid_until is not None:
         unit["validUntil"] = particle.valid_until.isoformat()
+    # the world-time start and its kind travel beside the end.
+    if particle.valid_from is not None:
+        unit["validFrom"] = particle.valid_from.isoformat()
+    if particle.valid_kind is not None:
+        unit["validKind"] = particle.valid_kind.value
     if particle.supersedes is not None:
         unit["supersedes"] = particle.supersedes
     if particle.basis is not None:
@@ -396,6 +402,8 @@ def from_unit(unit: dict[str, Any]) -> ParsedUnit:
     )
 
     valid_until_raw = unit.get("validUntil")
+    valid_from_raw = unit.get("validFrom")
+    valid_kind_raw = unit.get("validKind")
     status_reason_raw = unit.get("statusReason")
 
     particle = Particle(
@@ -420,6 +428,8 @@ def from_unit(unit: dict[str, Any]) -> ParsedUnit:
         ),
         uncertainty_kind=unit.get("uncertaintyKind"),
         valid_until=datetime.fromisoformat(valid_until_raw) if valid_until_raw else None,
+        valid_from=datetime.fromisoformat(valid_from_raw) if valid_from_raw else None,
+        valid_kind=ValidKind(valid_kind_raw) if valid_kind_raw else None,
         supersedes=unit.get("supersedes"),
         basis=unit.get("basis"),
         extractor_ref=(

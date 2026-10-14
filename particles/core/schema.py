@@ -112,6 +112,19 @@ class AssertionModality(StrEnum):
     CONSTITUTIVE = "CONSTITUTIVE"  # a rule a document establishes ("a Particle MUST …")
 
 
+class ValidKind(StrEnum):
+    """How a claim's world-time interval is read.
+
+    An ``EVENT`` is a moment: its interval is the point ``[valid_from,
+    valid_from]``, and it never carries a ``valid_until``. A ``STATE`` is a
+    span from ``valid_from`` until it closes (its own ``valid_until``, or for a
+    retired claim the close rule), either end open.
+    """
+
+    EVENT = "EVENT"
+    STATE = "STATE"
+
+
 class ParticleType(StrEnum):
     CLAIM = "CLAIM"
     REVIEW = "REVIEW"  # human review annotation records
@@ -596,6 +609,14 @@ class Particle(BaseModel):
     # (revision chain). Kept in declaration order for serialization
     # stability.
     valid_until: datetime | None = None
+    # Core (§6.2): the world-time axis beside the assertion-time
+    # one. ``valid_from`` is when the claim begins to hold; ``valid_kind``
+    # says whether it is a moment (EVENT) or a span (STATE). Read-time
+    # material for the window route and nothing else: never an input to
+    # reconciliation, ranking, or confidence. How a value was set rides on
+    # ``properties`` (``extraction:valid_from_basis`` and its siblings).
+    valid_from: datetime | None = None
+    valid_kind: ValidKind | None = None
     supersedes: str | None = None
     # Extension A field — stored but not processed by Core logic
     basis: dict[str, Any] | None = None
@@ -665,6 +686,28 @@ class Particle(BaseModel):
         # annotation is the normal case.
         if self.canonical_form is CanonicalForm.STRUCTURED and self.structured_claim is None:
             raise ValueError("canonical_form=STRUCTURED requires a structured_claim")
+        return self
+
+    @model_validator(mode="after")
+    def _check_validity_interval(self) -> Particle:
+        """The world-time interval is well-formed.
+
+        A start after the end is no interval, and a moment has one end, so an
+        EVENT never carries a ``valid_until``.
+        """
+        if self.valid_from is not None and self.valid_until is not None:
+            start = (
+                self.valid_from if self.valid_from.tzinfo else self.valid_from.replace(tzinfo=UTC)
+            )
+            end = (
+                self.valid_until
+                if self.valid_until.tzinfo
+                else self.valid_until.replace(tzinfo=UTC)
+            )
+            if start > end:
+                raise ValueError("valid_from must not be after valid_until")
+        if self.valid_kind is ValidKind.EVENT and self.valid_until is not None:
+            raise ValueError("an EVENT is a moment and carries no valid_until")
         return self
 
 
@@ -831,8 +874,9 @@ class ExtractorCalibration(BaseModel):
             pipeline applies the record only when the current extraction
             provider/model matches; on mismatch the particle falls back to
             ``calibration_source=EXTRACTOR_DIRECT``. ``None`` is a legacy record
-            (fitted before this key existed); it is treated as the historical
-            default ``anthropic:claude-sonnet-4-6``.
+            (fitted before this key existed); it is treated as
+            ``anthropic:claude-sonnet-4-6``, the compiled default before 1.189.0
+            and the model those records were fitted on.
         heldout_suite_id: Benchmark suite(s) whose recorded runs the fit was
             scored on out of sample, ``+``-joined like
             ``benchmark_suite_id``. ``None`` on a record persisted before the
@@ -1178,6 +1222,37 @@ class StructuralGroupBy(StrEnum):
     OBJECT = "object"
 
 
+class TimeWindow(BaseModel):
+    """An interval of world time a query asks about.
+
+    Either end may be open; a window with both ends equal is a point, the
+    ``--on`` form. Timezone-naive values are read as UTC, the store's
+    convention.
+    """
+
+    start: datetime | None = None
+    end: datetime | None = None
+
+    @model_validator(mode="after")
+    def _check_bounds(self) -> TimeWindow:
+        if self.start is None and self.end is None:
+            raise ValueError("a time window needs a start or an end")
+        # Naive values are read as UTC, the store's convention (the as_of
+        # validator does the same), so the two ends and the claims compare.
+        if self.start is not None and self.start.tzinfo is None:
+            self.start = self.start.replace(tzinfo=UTC)
+        if self.end is not None and self.end.tzinfo is None:
+            self.end = self.end.replace(tzinfo=UTC)
+        if self.start is not None and self.end is not None and self.start > self.end:
+            raise ValueError("a time window's start must not be after its end")
+        return self
+
+    @property
+    def is_point(self) -> bool:
+        """True for the ``--on`` form: both ends set and equal."""
+        return self.start is not None and self.end is not None and self.start == self.end
+
+
 class QueryRequest(BaseModel):
     # Bounded so an oversized question can't drive an arbitrarily large prompt
     # into the paid query-response completion (security review F6). 8192 chars is
@@ -1234,6 +1309,14 @@ class QueryRequest(BaseModel):
     # is rejected by the validator below (HTTP 422; CLI/MCP surface the
     # message).
     as_of: datetime | None = None
+    # the world-time window — select the claims that began in,
+    # or were in force during, this interval of world time. Unset (None) is
+    # byte-for-byte today's read. With a question it prefilters the candidate
+    # set before scoring and ``top_k``; without one it selects the
+    # deterministic listing ordered by ``valid_from``. Composes with
+    # ``as_of`` (world time, then believed-at-T visibility). A window read
+    # admits retired claims for the period they held.
+    window: TimeWindow | None = None
     # read through a project observer — only beliefs that are global
     # or were observed in this project are candidates. ``None`` (the default) is
     # the store-wide view, for which the read is byte-identical to before. The
@@ -1310,6 +1393,18 @@ class QueryRequest(BaseModel):
             or self.list_vocabulary
             or self.is_aggregate
             or (self.question is None and self.has_claim_filters)
+            or self.is_window_listing
+        )
+
+    @property
+    def is_window_listing(self) -> bool:
+        """True for the window listing: a window, no question, no claim filter
+        or aggregate. Ordered by ``valid_from``, no LLM call."""
+        return (
+            self.window is not None
+            and self.question is None
+            and not self.has_claim_filters
+            and not self.is_aggregate
         )
 
     @model_validator(mode="after")
@@ -1318,7 +1413,13 @@ class QueryRequest(BaseModel):
             raise ValueError(
                 "a query needs a question, a structural claim filter "
                 "(predicate / object_*), an aggregate (count / group_by), "
-                "list_predicates, or list_vocabulary"
+                "a time window, list_predicates, or list_vocabulary "
+                ""
+            )
+        if self.window is not None and (self.list_predicates or self.list_vocabulary):
+            raise ValueError(
+                "a time window selects claims; it does not combine with the "
+                "predicate or vocabulary listings"
             )
         if self.is_aggregate and self.question is not None:
             raise ValueError(
@@ -1535,6 +1636,63 @@ class AsOfNote(BaseModel):
     # event, or ``valid_until``.
     basis: Literal["stored", "successor", "event", "valid_until"]
     successor: AsOfSuccessor | None = None
+
+
+class WindowReading(StrEnum):
+    """Why a claim is in a world-time window.
+
+    ``BEGAN``: its ``valid_from`` lies in the window, whatever its kind; what
+    "what happened in the week" asks. ``IN_FORCE``: a STATE that started
+    before the window and had not closed. ``HELD_AT``: a STATE whose start is
+    unknown but which is known to hold at its anchor (basis ``as-of``), read as
+    in force from there. ``WITHIN``: a claim anchored to a coarse unit (an
+    EVENT somewhere in a month or a year, or a STATE spanning one) whose unit
+    intersects the window.
+    """
+
+    BEGAN = "BEGAN"
+    IN_FORCE = "IN_FORCE"
+    HELD_AT = "HELD_AT"
+    WITHIN = "WITHIN"
+
+
+class WindowHit(BaseModel):
+    """How one hit sits in the requested world-time window (§4).
+
+    A **response model, not particle substrate**: computed at read time,
+    never stored. ``closed_at`` and ``close_basis`` say when a STATE's
+    interval ended and which rule said so (its own ``valid_until``, its
+    successor's ``valid_from``, or its retirement instant); both None for an
+    open interval and for an EVENT. ``retired`` carries the note for
+    a retired claim admitted for the period it held. ``restates`` names the
+    retired original this hit stood in for.
+    """
+
+    reading: WindowReading
+    valid_from: datetime
+    # None for an unkinded claim, admitted under the ``BEGAN`` reading only.
+    valid_kind: ValidKind | None = None
+    closed_at: datetime | None = None
+    close_basis: Literal["valid_until", "successor", "retired_at"] | None = None
+    retired: AsOfNote | None = None
+    restates: str | None = None
+
+
+class WindowCoverage(BaseModel):
+    """What a window read could and could not judge.
+
+    Disclosure only. ``undated`` are candidates with no ``valid_from``;
+    ``unkinded`` carry a date but no kind and so match the ``BEGAN`` reading
+    only; ``retired_admitted`` is how many retired claims the window let in;
+    ``restated`` how many of those yielded to a successor in the set.
+    """
+
+    candidates: int
+    admitted: int
+    undated: int
+    unkinded: int
+    retired_admitted: int
+    restated: int
 
 
 class RelevanceNote(BaseModel):
@@ -1873,6 +2031,16 @@ class QueryResponse(BaseModel):
     # reconstructible (rung 4). Born-retired rows are never counted. Always 0
     # on a normal query.
     as_of_excluded_undatable: int = 0
+    # echo of the request's world-time window; None on a read with
+    # no window.
+    window: TimeWindow | None = None
+    # per-result window readings, query-time only. Parallel to
+    # ``particles`` (``window_hits[i]`` annotates ``particles[i]``). Empty
+    # unless the request set ``window``.
+    window_hits: list[WindowHit | None] = Field(default_factory=list)
+    # what the window could and could not judge. None on a read
+    # with no window. Disclosure only.
+    window_coverage: WindowCoverage | None = None
     # set when the request named an ``observer_project``; None on a
     # store-wide read. Disclosure only.
     observer_scope: ObserverScopeNote | None = None

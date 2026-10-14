@@ -58,7 +58,9 @@ from particles.llm.registry import (
     complete_with_provider_model,
     get_provider,
     override_providers,
+    provider_for_selection,
     purpose_allowed,
+    selection_endpoint,
 )
 from particles.llm.replay import ReplayMode, ReplayStats, render_replay_line, replay_scope
 from particles.llm.usage import (
@@ -102,11 +104,13 @@ __all__ = [
     "is_account_level_failure",
     "make_nonce",
     "override_providers",
+    "provider_for_selection",
     "purpose_allowed",
     "record_usage",
     "render_replay_line",
     "render_usage_line",
     "replay_scope",
+    "selection_endpoint",
     "set_client",
     "track_usage",
 ]

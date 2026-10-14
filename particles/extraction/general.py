@@ -8,8 +8,10 @@ Implements the ExtractorInterface from §14.3:
   extract(snapshot, config, prior) -> ExtractionResult
   accepts(snapshot) -> {accepted, reason}
 
-Uses the Anthropic API with claude-sonnet-4-6 to extract claim-granularity
-particles from any source type. Particles produced by this extractor carry
+Uses the configured ``extraction`` model (the compiled default,
+claude-sonnet-5-5 since 1.189.0, unless ``llm.extraction`` or ``llm.default``
+says otherwise) to extract claim-granularity particles from any
+source type. Particles produced by this extractor carry
 calibration_source = EXTRACTOR_DIRECT by default; when a calibration record
 exists for the extractor, the pipeline threads it into
 ``candidate_to_particle`` and the particle is graduated to
@@ -51,8 +53,15 @@ from particles.core.schema import (
     Snapshot,
     StructuredClaim,
     UncertaintyNature,
+    ValidKind,
 )
 from particles.core.scoring.confidence import CalibrationSource
+from particles.core.validity import (
+    VALID_FROM_BASIS_KEY,
+    VALID_FROM_CONFIDENCE_KEY,
+    VALID_FROM_CUE_KEY,
+    ValidFromBasis,
+)
 from particles.extraction import polarity as _polarity_module
 from particles.extraction import scope as _scope_module
 from particles.extraction import session_state as _session_state_module
@@ -90,7 +99,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 EXTRACTOR_ID = "general-extractor"
-EXTRACTOR_VERSION = "0.16.0"
+EXTRACTOR_VERSION = "0.17.0"
 # 0.4.0: prompt now preserves URL schemes.
 # 0.5.0: HTML chunking moves to paragraph boundaries with hash-input
 #        normalisation and routes through extract_with_carry_forward.
@@ -168,6 +177,19 @@ EXTRACTOR_VERSION = "0.16.0"
 #        The reference date now rides every prompt, not only the validity rule.
 #        Output differs from 0.15.0; ``reindex --extractor-version 0.15.0``
 #        re-extracts the prior tranche.
+# 0.17.0: the world-time start. Under the same
+#        extraction_validity.enabled gate as valid_until, the prompt asks for
+#        ``valid_from`` + ``valid_kind`` (EVENT, a moment; STATE, a span) +
+#        ``valid_from_basis`` (``stated``, or ``as-of`` for a present-tense
+#        state anchored at the reference date, its start unknown) +
+#        ``valid_from_confidence`` + ``valid_from_cue``, and the parser gates
+#        emission on a parseable date, a recognised kind and the same
+#        confidence floor, with no future-date condition (a past start is the
+#        normal case for world time). A claim with a stated start, or a
+#        present-tense state, now carries one; everything else is
+#        byte-for-byte the 0.16.0 output. The deterministic prose default
+#        (``particles validity``) covers the stored claims, so no reindex is
+#        needed for the window route.
 #: The interval every emitted ``confidence_value`` is clamped into
 #: (D1). Strict interiority is the whole point: ``calibration.is_saturated``
 #: treats a value within ``_EPS = 1e-7`` of an endpoint as immovable, so
@@ -426,12 +448,45 @@ _VALIDITY_RULE = """
   correctly. null when you set no boundary.
 - validity_basis: when you set valid_until, a short verbatim quote of the cue
   phrase that bounds validity ("runs through 2026", "exam tomorrow"). null
-  otherwise."""
+  otherwise.
+- valid_from: the date the claim BEGINS to hold in the world, set ONLY when the
+  source states it (or states something that resolves to it against the
+  REFERENCE DATE): "I moved on 2026-10-10", "since March", "started at Acme in
+  2019", "on Thursday" (resolved). Emit an ISO-8601 date.
+  - valid_kind: EVENT when the claim reports something that happened at that
+    moment ("picked up the keys on 2026-10-10", "met her in 2019"), STATE when
+    it reports a condition that began then and lasted ("lives in Pali Hill
+    since 2026-10-10", "has worked at Acme since 2019"). An EVENT never also
+    carries a valid_until.
+  - valid_from_basis: "stated" when the text gives the start. "as-of" for a
+    PRESENT-TENSE STATE whose start the text does not give ("I'm staying at a
+    hotel in Bandra", "I live in Lajpat Nagar", "I now pay 349 rupees a
+    month"): set valid_from to the REFERENCE DATE, valid_kind to STATE, and
+    valid_from_basis to "as-of". That records that the state was known to hold
+    on that day, with its start unknown; it is read as holding from then on,
+    never as having begun then. Never use "as-of" for an EVENT or for a
+    past-tense claim: "I met her" or "I moved last year" said today did not
+    happen today. Do NOT emit when a date in the claim belongs to something
+    else ("the invoice dated 2026-09-01 is unpaid" says nothing about when it
+    became unpaid). When unsure, OMIT it: a missing start is disclosed, a
+    wrong one misplaces the claim in time.
+- valid_from_confidence: when you set valid_from, your self-assessed certainty
+  [0.0–1.0] that the source states this start (or, for "as-of", that the
+  claim is a present-tense state) AND that you resolved the date correctly.
+  null when you set no start.
+- valid_from_cue: when you set valid_from, a short verbatim quote of the cue
+  phrase ("on 2026-10-10", "since March", "in 2019"; for "as-of", the
+  present-tense phrase, "I'm staying at"). null otherwise."""
 
 _VALIDITY_SCHEMA_FIELD = (
     ',\n  "valid_until": "<ISO-8601 date or datetime, or null>"'
     ',\n  "validity_confidence": <float 0.0–1.0, or null>'
     ',\n  "validity_basis": "<short verbatim cue quote, or null>"'
+    ',\n  "valid_from": "<ISO-8601 date, or null>"'
+    ',\n  "valid_kind": "EVENT" | "STATE" | null'
+    ',\n  "valid_from_basis": "stated" | "as-of" | null'
+    ',\n  "valid_from_confidence": <float 0.0–1.0, or null>'
+    ',\n  "valid_from_cue": "<short verbatim cue quote, or null>"'
 )
 
 _STRUCTURE_RULE = """
@@ -702,6 +757,7 @@ def _parse_code_texts() -> tuple[str, ...]:
         _parse_extraction_response,
         _parse_extraction_reply,
         _gate_valid_until,
+        _gate_valid_from,
         _drop_session_state_candidates,
         candidate_to_particle,
     )
@@ -833,6 +889,14 @@ def _extraction_response_schema(
         properties["valid_until"] = {"type": ["string", "null"]}
         properties["validity_confidence"] = {"type": ["number", "null"]}
         properties["validity_basis"] = {"type": ["string", "null"]}
+        properties["valid_from"] = {"type": ["string", "null"]}
+        properties["valid_kind"] = {"type": ["string", "null"], "enum": ["EVENT", "STATE", None]}
+        properties["valid_from_basis"] = {
+            "type": ["string", "null"],
+            "enum": ["stated", "as-of", None],
+        }
+        properties["valid_from_confidence"] = {"type": ["number", "null"]}
+        properties["valid_from_cue"] = {"type": ["string", "null"]}
     if structure_enabled:
         properties["structured_claim"] = {
             "type": ["object", "null"],
@@ -901,6 +965,13 @@ class CandidateParticle:
     # case) means the claim carries no boundary and keeps its decay treatment.
     # Passed straight through ``candidate_to_particle`` to ``Particle.valid_until``.
     valid_until: datetime | None = None
+    # the world-time start and its kind, gated by the parser under
+    # the same ``extraction_validity.enabled`` switch. ``None`` (the default,
+    # the disabled case, and every claim with no stated start) leaves the
+    # claim undated for the window route, which discloses it. Passed straight
+    # through ``candidate_to_particle``.
+    valid_from: datetime | None = None
+    valid_kind: ValidKind | None = None
     # the derived S-P-O annotation, parsed from the same reply and
     # already stamped with the producing extractor's id + version. Its terms are
     # still *unresolved* — the Engine binds the subject term to a Subject UUID
@@ -2872,6 +2943,97 @@ def _gate_valid_until(
     return parsed, confidence, basis, None
 
 
+def _gate_valid_from(
+    raw_valid_from: object,
+    raw_kind: object,
+    raw_confidence: object,
+    raw_cue: object,
+    *,
+    floor: float,
+    raw_basis: object = None,
+) -> tuple[datetime | None, ValidKind | None, float | None, str | None, str | None, str]:
+    """Apply the start-emission gate to one item.
+
+    Returns ``(valid_from, valid_kind, confidence, cue, note, basis)``. The
+    start is set only when a parseable date, a recognised kind and a
+    confidence at or above ``floor`` all hold: the gate minus its
+    future-date condition, because a past start is the normal case for world
+    time. ``basis`` is ``stated`` (the text gives the start) or ``as-of`` (a
+    present-tense state anchored at the reference date, its start unknown;
+    read as held-at, never began), and an ``as-of`` EVENT is a contradiction
+    the gate drops. Any condition failing yields ``None`` values and a
+    non-empty ``note`` naming the drop, never a silent drop. A wrong start
+    misplaces a claim in a window and retires nothing, so the gate is biased
+    toward under-emission for accuracy rather than safety.
+    """
+    stated = ValidFromBasis.STATED.value
+    if not isinstance(raw_valid_from, str) or not raw_valid_from.strip():
+        return None, None, None, None, None, stated
+    parsed = _parse_iso_datetime(raw_valid_from)
+    if parsed is None:
+        return (
+            None,
+            None,
+            None,
+            None,
+            (
+                f"VALID_FROM_UNPARSEABLE: valid_from {raw_valid_from!r} is not a resolvable "
+                "ISO-8601 date; no start set"
+            ),
+            stated,
+        )
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    kind_raw = str(raw_kind or "").strip().upper()
+    if kind_raw not in (ValidKind.EVENT.value, ValidKind.STATE.value):
+        return (
+            None,
+            None,
+            None,
+            None,
+            (
+                f"VALID_FROM_NO_KIND: start {parsed.date().isoformat()} dropped "
+                f"(valid_kind {raw_kind!r} is neither EVENT nor STATE)"
+            ),
+            stated,
+        )
+    basis_raw = str(raw_basis or stated).strip().lower()
+    if basis_raw not in (stated, ValidFromBasis.AS_OF.value):
+        basis_raw = stated
+    if basis_raw == ValidFromBasis.AS_OF.value and kind_raw == ValidKind.EVENT.value:
+        return (
+            None,
+            None,
+            None,
+            None,
+            (
+                f"VALID_FROM_AS_OF_EVENT: start {parsed.date().isoformat()} dropped "
+                "(an as-of anchor marks a state known to hold, never an event)"
+            ),
+            stated,
+        )
+    try:
+        confidence: float | None = float(raw_confidence)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        confidence = None
+    if confidence is not None and not math.isfinite(confidence):
+        confidence = None
+    if confidence is None or confidence < floor:
+        return (
+            None,
+            None,
+            None,
+            None,
+            (
+                f"VALID_FROM_BELOW_FLOOR: start {parsed.date().isoformat()} dropped "
+                f"(valid_from_confidence {confidence} < floor {floor})"
+            ),
+            stated,
+        )
+    cue = raw_cue.strip() if isinstance(raw_cue, str) and raw_cue.strip() else None
+    return parsed, ValidKind(kind_raw), confidence, cue, None, basis_raw
+
+
 def _parse_extraction_response(
     raw: str,
 ) -> tuple[list[CandidateParticle], list[str]]:
@@ -3087,6 +3249,43 @@ def _parse_extraction_reply(
                 if vconf is not None:
                     properties[VALIDITY_CONFIDENCE_KEY] = vconf
 
+        # the world-time start, under the same switch. An
+        # EVENT that also carries a valid_until is a span by the model's own
+        # account: demoted to STATE with a note rather than losing either end.
+        valid_from: datetime | None = None
+        valid_kind: ValidKind | None = None
+        if validity_cfg.enabled:
+            valid_from, valid_kind, fconf, fcue, fnote, fbasis = _gate_valid_from(
+                item.get("valid_from"),
+                item.get("valid_kind"),
+                item.get("valid_from_confidence"),
+                item.get("valid_from_cue"),
+                floor=validity_cfg.min_boundary_confidence,
+                raw_basis=item.get("valid_from_basis"),
+            )
+            if fnote:
+                notes.append(f"Item {i}: {fnote}")
+            if valid_from is not None:
+                if valid_kind is ValidKind.EVENT and valid_until is not None:
+                    notes.append(
+                        f"Item {i}: VALID_KIND_DEMOTED: an EVENT with a valid_until is a "
+                        "span; read as STATE"
+                    )
+                    valid_kind = ValidKind.STATE
+                if valid_until is not None and valid_from > valid_until:
+                    notes.append(
+                        f"Item {i}: VALID_FROM_AFTER_END: start "
+                        f"{valid_from.date().isoformat()} is after the boundary; no start set"
+                    )
+                    valid_from, valid_kind = None, None
+            if valid_from is not None:
+                properties = properties or {}
+                properties[VALID_FROM_BASIS_KEY] = fbasis
+                if fcue:
+                    properties[VALID_FROM_CUE_KEY] = fcue
+                if fconf is not None:
+                    properties[VALID_FROM_CONFIDENCE_KEY] = fconf
+
         # the derived S-P-O annotation, stamped with THIS extractor's
         # identity — the stamp records what actually produced the triple, which
         # is what makes the extraction-time and backfill populations tellable
@@ -3111,6 +3310,8 @@ def _parse_extraction_reply(
                 stance_target_index=stance_target_index,
                 stance_magnitude=stance_magnitude,
                 valid_until=valid_until,
+                valid_from=valid_from,
+                valid_kind=valid_kind,
                 structured_claim=structured_claim,
                 properties=properties,
             )
@@ -3239,6 +3440,10 @@ def candidate_to_particle(
         # (None for every claim without a genuine future-dated cue, and for the
         # disabled case). The §9.3 staleness lint + the as-of rung 3 consume it.
         valid_until=candidate.valid_until,
+        # the world-time start the parser gated in; None leaves the
+        # claim undated for the window route, which says so.
+        valid_from=candidate.valid_from,
+        valid_kind=candidate.valid_kind,
         particle_type=candidate.particle_type,
         extractor_ref=extractor_ref or ExtractorRef(name=EXTRACTOR_ID, version=EXTRACTOR_VERSION),
         # the pairing the completion seam stamped on this candidate.

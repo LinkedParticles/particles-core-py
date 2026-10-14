@@ -30,10 +30,18 @@ from datetime import UTC, datetime
 import pytest
 
 from particles.config import ExtractionValidityConfig, ParticlesConfig
+from particles.core.schema import ValidKind
+from particles.core.validity import (
+    VALID_FROM_BASIS_KEY,
+    VALID_FROM_CONFIDENCE_KEY,
+    VALID_FROM_CUE_KEY,
+    ValidFromBasis,
+)
 from particles.extraction import general
 from particles.extraction.general import (
     VALIDITY_BASIS_KEY,
     VALIDITY_CONFIDENCE_KEY,
+    _gate_valid_from,
     _gate_valid_until,
     _parse_extraction_response,
     candidate_to_particle,
@@ -256,3 +264,195 @@ class TestCandidateToParticle:
             cand, corpus_entry_id="e1", snapshot_id="s1", subject_ids=[]
         )
         assert particle.valid_until is None
+
+
+# ---------------------------------------------------------------------------
+# the start gate (the gate minus the future condition)
+# ---------------------------------------------------------------------------
+
+
+class TestGateValidFrom:
+    def test_emits_past_start(self) -> None:
+        vf, kind, conf, cue, note, basis = _gate_valid_from(
+            "2026-10-10", "EVENT", 0.9, "on 2026-10-10", floor=0.75
+        )
+        assert vf is not None and vf.date().isoformat() == "2026-10-10" and vf.tzinfo is not None
+        assert kind is ValidKind.EVENT and conf == 0.9 and cue == "on 2026-10-10"
+        assert note is None and basis == ValidFromBasis.STATED
+
+    def test_as_of_state_anchor(self) -> None:
+        vf, kind, _, _, note, basis = _gate_valid_from(
+            "2026-10-08", "STATE", 0.9, "I'm staying at", floor=0.75, raw_basis="as-of"
+        )
+        assert vf is not None and kind is ValidKind.STATE and note is None
+        assert basis == ValidFromBasis.AS_OF
+
+    def test_as_of_event_dropped(self) -> None:
+        vf, *_, note, basis = _gate_valid_from(
+            "2026-10-08", "EVENT", 0.9, "x", floor=0.75, raw_basis="as-of"
+        )
+        assert vf is None and note is not None and "VALID_FROM_AS_OF_EVENT" in note
+
+    def test_unknown_basis_reads_as_stated(self) -> None:
+        *_, basis = _gate_valid_from("2026-10-08", "STATE", 0.9, "x", floor=0.75, raw_basis="guess")
+        assert basis == ValidFromBasis.STATED
+
+    def test_future_start_allowed(self) -> None:
+        vf, kind, _, _, note, _ = _gate_valid_from("2099-01-01", "STATE", 0.9, "from", floor=0.75)
+        assert vf is not None and kind is ValidKind.STATE and note is None
+
+    def test_missing_is_silent(self) -> None:
+        assert _gate_valid_from(None, None, None, None, floor=0.75) == (
+            None,
+            None,
+            None,
+            None,
+            None,
+            ValidFromBasis.STATED,
+        )
+
+    def test_unparseable_dropped_with_note(self) -> None:
+        *_, note, _ = _gate_valid_from("last Thursday", "EVENT", 0.9, "x", floor=0.75)
+        assert note is not None and "VALID_FROM_UNPARSEABLE" in note
+
+    def test_unknown_kind_dropped(self) -> None:
+        vf, kind, _, _, note, _ = _gate_valid_from("2026-10-10", "SPAN", 0.9, "x", floor=0.75)
+        assert vf is None and kind is None and note is not None and "VALID_FROM_NO_KIND" in note
+
+    def test_below_floor_dropped(self) -> None:
+        vf, *_, note, _ = _gate_valid_from("2026-10-10", "EVENT", 0.5, "x", floor=0.75)
+        assert vf is None and note is not None and "VALID_FROM_BELOW_FLOOR" in note
+
+
+class TestParserValidFrom:
+    def test_start_populates_candidate_and_crumbs(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_config(monkeypatch, enabled=True)
+        raw = _reply(
+            [
+                {
+                    "content": "The user lives in Pali Hill since 2026-10-10.",
+                    "subjects": [],
+                    "confidence_value": 0.9,
+                    "uncertainty_nature": "EPISTEMIC",
+                    "valid_from": "2026-10-10",
+                    "valid_kind": "STATE",
+                    "valid_from_confidence": 0.9,
+                    "valid_from_cue": "since 2026-10-10",
+                }
+            ]
+        )
+        candidates, _notes = _parse_extraction_response(raw)
+        c = candidates[0]
+        assert c.valid_from is not None and c.valid_from.date().isoformat() == "2026-10-10"
+        assert c.valid_kind is ValidKind.STATE
+        assert c.properties is not None
+        assert c.properties[VALID_FROM_BASIS_KEY] == ValidFromBasis.STATED
+        assert c.properties[VALID_FROM_CUE_KEY] == "since 2026-10-10"
+        assert c.properties[VALID_FROM_CONFIDENCE_KEY] == 0.9
+
+    def test_as_of_anchor_populates_basis(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_config(monkeypatch, enabled=True)
+        raw = _reply(
+            [
+                {
+                    "content": "The user is staying at a hotel in Bandra, Mumbai.",
+                    "subjects": [],
+                    "confidence_value": 0.9,
+                    "uncertainty_nature": "EPISTEMIC",
+                    "valid_from": "2026-10-08",
+                    "valid_kind": "STATE",
+                    "valid_from_basis": "as-of",
+                    "valid_from_confidence": 0.9,
+                    "valid_from_cue": "I'm staying at",
+                }
+            ]
+        )
+        candidates, _ = _parse_extraction_response(raw)
+        c = candidates[0]
+        assert c.valid_from is not None and c.valid_kind is ValidKind.STATE
+        assert c.properties is not None
+        assert c.properties[VALID_FROM_BASIS_KEY] == ValidFromBasis.AS_OF
+
+    def test_event_with_boundary_is_demoted_to_state(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_config(monkeypatch, enabled=True)
+        raw = _reply(
+            [
+                {
+                    "content": "The user is in Mumbai for a week from 2026-10-08.",
+                    "subjects": [],
+                    "confidence_value": 0.9,
+                    "uncertainty_nature": "EPISTEMIC",
+                    "valid_until": FUTURE,
+                    "validity_confidence": 0.9,
+                    "validity_basis": "for a week",
+                    "valid_from": "2026-10-08",
+                    "valid_kind": "EVENT",
+                    "valid_from_confidence": 0.9,
+                    "valid_from_cue": "from 2026-10-08",
+                }
+            ]
+        )
+        candidates, notes = _parse_extraction_response(raw)
+        c = candidates[0]
+        assert c.valid_until is not None and c.valid_from is not None
+        assert c.valid_kind is ValidKind.STATE
+        assert any("VALID_KIND_DEMOTED" in n for n in notes)
+
+    def test_start_after_end_dropped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_config(monkeypatch, enabled=True)
+        raw = _reply(
+            [
+                {
+                    "content": "x",
+                    "subjects": [],
+                    "confidence_value": 0.9,
+                    "uncertainty_nature": "EPISTEMIC",
+                    "valid_until": FUTURE,
+                    "validity_confidence": 0.9,
+                    "validity_basis": "through",
+                    "valid_from": "2027-06-01",
+                    "valid_kind": "STATE",
+                    "valid_from_confidence": 0.9,
+                    "valid_from_cue": "from",
+                }
+            ]
+        )
+        candidates, notes = _parse_extraction_response(raw)
+        assert candidates[0].valid_from is None and candidates[0].valid_kind is None
+        assert any("VALID_FROM_AFTER_END" in n for n in notes)
+
+    def test_disabled_emits_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_config(monkeypatch, enabled=False)
+        raw = _reply(
+            [
+                {
+                    "content": "x",
+                    "subjects": [],
+                    "confidence_value": 0.9,
+                    "uncertainty_nature": "EPISTEMIC",
+                    "valid_from": "2026-10-10",
+                    "valid_kind": "EVENT",
+                    "valid_from_confidence": 0.9,
+                    "valid_from_cue": "on",
+                }
+            ]
+        )
+        candidates, _ = _parse_extraction_response(raw)
+        assert candidates[0].valid_from is None
+
+    def test_start_flows_to_particle(self) -> None:
+        from particles.core.schema import UncertaintyNature
+        from particles.extraction.general import CandidateParticle
+
+        start = datetime(2026, 10, 10, tzinfo=UTC)
+        cand = CandidateParticle(
+            content="x",
+            confidence_value=0.9,
+            uncertainty_nature=UncertaintyNature.EPISTEMIC,
+            valid_from=start,
+            valid_kind=ValidKind.EVENT,
+        )
+        particle = candidate_to_particle(
+            cand, corpus_entry_id="e1", snapshot_id="s1", subject_ids=[]
+        )
+        assert particle.valid_from == start and particle.valid_kind is ValidKind.EVENT

@@ -103,6 +103,16 @@ CONTRACT: list[FieldContract] = [
     ),
     FieldContract("uncertainty_kind", FieldTier.OPTIONAL, "Extension A free-text label"),
     FieldContract("valid_until", FieldTier.OPTIONAL, "Time-bounded claims only"),
+    FieldContract(
+        "valid_from",
+        FieldTier.OPTIONAL,
+        "Claims with a stated world-time start; the window route's input",
+    ),
+    FieldContract(
+        "valid_kind",
+        FieldTier.OPTIONAL,
+        "EVENT (a moment) or STATE (a span); how valid_from and valid_until are read",
+    ),
     FieldContract("supersedes", FieldTier.OPTIONAL, "Set by reindex, not by extractors"),
     FieldContract(
         "tags",

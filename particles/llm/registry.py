@@ -32,13 +32,16 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 from particles.egress import ANTHROPIC_HOST, EgressRefused, current_policy, host_port
 from particles.llm.batch_budget import current_batch_wait_budget
 from particles.llm.replay import maybe_wrap
 from particles.llm.usage import current_purpose, purpose_scope
 from particles.secrets import get_anthropic_base_url_optional
+
+if TYPE_CHECKING:
+    from particles.config import ProviderSelection
 
 log = logging.getLogger(__name__)
 
@@ -368,14 +371,20 @@ def budget_hint() -> str:
 
 
 def purpose_endpoint(purpose: str) -> tuple[str, int | None, str]:
-    """``(host, port, provider name)`` the purpose's configured provider connects to.
+    """``(host, port, provider name)`` the purpose's configured provider connects to."""
+    from particles.config import get_config
+
+    return selection_endpoint(get_config().llm.for_purpose(purpose))
+
+
+def selection_endpoint(selection: ProviderSelection) -> tuple[str, int | None, str]:
+    """``(host, port, provider name)`` a provider selection connects to.
 
     Reads config only. The Anthropic route honours ``ANTHROPIC_BASE_URL``, the
     SDK's own override, so the answer names where the SDK would really connect.
     """
     from particles.config import get_config
 
-    selection = get_config().llm.for_purpose(purpose)
     if selection.provider == "anthropic":
         base = get_anthropic_base_url_optional()
         if base:
@@ -433,15 +442,36 @@ def _resolve_from_config(purpose: LLMPurpose) -> CompletionProvider:
     from particles.config import get_config
 
     selection = get_config().llm.for_purpose(purpose)
+    return provider_for_selection(selection, context=f"llm purpose {purpose!r}")
+
+
+def provider_for_selection(
+    selection: ProviderSelection, *, context: str = "provider selection"
+) -> CompletionProvider:
+    """The adapter for a ``(provider, model)`` selection, built the way config routes one.
+
+    The construction half of :func:`get_provider`, with no purpose and no egress
+    check, for a caller that routes a selection it was handed through
+    :func:`override_providers` (a benchmark pinning one model). An
+    override is never checked against ``network.egress``, so such a caller
+    checks :func:`selection_endpoint` itself. ``context`` names the selection
+    in the error.
+
+    Raises:
+        CompletionError: If the provider is neither ``anthropic`` nor an
+            ``llm.providers`` entry, or the entry names an unregistered adapter.
+    """
+    from particles.config import get_config
+
     adapters = _get_adapters()
     if selection.provider == "anthropic":
         return adapters["anthropic"]("anthropic", selection.model)
     entry = get_config().llm.providers.get(selection.provider)
     if entry is None:
         # Config-load validation prevents this for file-loaded config; a
-        # programmatically-mutated config can still miss.
+        # programmatically-mutated config or a caller's own selection can miss.
         raise CompletionError(
-            f"llm purpose {purpose!r} routes to unknown provider "
+            f"{context} routes to unknown provider "
             f"{selection.provider!r} (not 'anthropic', not in llm.providers)"
         )
     factory = adapters.get(entry.adapter)

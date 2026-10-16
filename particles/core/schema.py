@@ -2408,6 +2408,11 @@ class LintFinding(BaseModel):
     # than one claim per side; every other record names one.
     # ``None`` on every other finding type.
     conflict_sides: list[list[str]] | None = None
+    # The ladder rung whose verdict the finding rests on, ``name@version``:
+    # on a census ``CONTRADICTION`` finding, the second
+    # reading when one confirmed it, else the contradiction probe. ``None``
+    # on a finding no ladder decided.
+    decided_by: str | None = None
 
 
 class LintReport(BaseModel):

@@ -699,6 +699,10 @@ def decide_ladder(
 # written and no cascade runs.
 RETIRED_VALUE_KEY = "conflict:retired_value"
 
+#: The ``properties`` key naming the ladder rung whose verdict opened an
+#: INCONSISTENCY record, ``name@version``.
+DECIDED_BY_KEY = "conflict:decided_by"
+
 
 def build_inconsistency_particle(
     existing: Particle,
@@ -709,6 +713,7 @@ def build_inconsistency_particle(
     asserted_by: str = "extract-pipeline",
     trigger_ref_type: ProvenanceRefType = ProvenanceRefType.SOURCE,
     retired_twin: bool = False,
+    decided_by: str | None = None,
 ) -> Particle:
     """Construct the INCONSISTENCY ``Particle`` for an unresolvable pair.
 
@@ -752,6 +757,10 @@ def build_inconsistency_particle(
         headline says so, and :data:`RETIRED_VALUE_KEY` carries the twin's
         ``status_reason`` in ``properties`` so Review can tell the two kinds
         of record apart.
+      - ``decided_by``: the stamp of the ladder rung whose
+        verdict opened the record, carried in ``properties`` under
+        :data:`DECIDED_BY_KEY`; ``None`` leaves it unstamped (a fail-closed
+        record no rung decided, or a retired-value hold).
     """
     # Inherit subject_ids from the existing particle (Particle A). Fall back
     # to the new particle's set if existing has none.
@@ -773,6 +782,8 @@ def build_inconsistency_particle(
             f"Particle A: {existing.id} — {existing.content[:120]}\n"
             f"Particle B (new): {new.content[:120]}"
         )
+    if decided_by is not None:
+        properties = {**(properties or {}), DECIDED_BY_KEY: decided_by}
 
     return Particle(
         content=inc_content,

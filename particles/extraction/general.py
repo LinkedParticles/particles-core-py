@@ -99,7 +99,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 EXTRACTOR_ID = "general-extractor"
-EXTRACTOR_VERSION = "0.17.0"
+EXTRACTOR_VERSION = "0.18.0"
 # 0.4.0: prompt now preserves URL schemes.
 # 0.5.0: HTML chunking moves to paragraph boundaries with hash-input
 #        normalisation and routes through extract_with_carry_forward.
@@ -190,6 +190,16 @@ EXTRACTOR_VERSION = "0.17.0"
 #        byte-for-byte the 0.16.0 output. The deterministic prose default
 #        (``particles validity``) covers the stored claims, so no reindex is
 #        needed for the window route.
+# 0.18.0: the session basis. On a source type in
+#        extraction_validity.session_source_types (a harness transcript), the
+#        prompt gains one rule: a past-tense claim reporting an act performed
+#        in the session anchors at the reference date as an EVENT under
+#        ``valid_from_basis: session``; a past event the session merely
+#        mentions keeps the 0.17.0 rules. The gate accepts ``session`` only
+#        from such a source and only for an EVENT (a ``session`` STATE is read
+#        as ``as-of``). Every other source's prompt and output are
+#        byte-for-byte 0.17.0, so a reindex is worth running only on the
+#        transcripts a window read should find.
 #: The interval every emitted ``confidence_value`` is clamped into
 #: (D1). Strict interiority is the whole point: ``calibration.is_saturated``
 #: treats a value within ``_EPS = 1e-7`` of an endpoint as immovable, so
@@ -484,10 +494,28 @@ _VALIDITY_SCHEMA_FIELD = (
     ',\n  "validity_basis": "<short verbatim cue quote, or null>"'
     ',\n  "valid_from": "<ISO-8601 date, or null>"'
     ',\n  "valid_kind": "EVENT" | "STATE" | null'
-    ',\n  "valid_from_basis": "stated" | "as-of" | null'
+    ',\n  "valid_from_basis": "stated" | "as-of" | "session" | null'
     ',\n  "valid_from_confidence": <float 0.0–1.0, or null>'
     ',\n  "valid_from_cue": "<short verbatim cue quote, or null>"'
 )
+
+# woven in only when the source is a session transcript (a source
+# type in ``extraction_validity.session_source_types``), so every other
+# prompt is byte-for-byte unchanged. The reference date of a harness deposit
+# is the session's own start (``hook session-end`` passes it), so an act the
+# session performed is dated to the day it happened.
+_SESSION_VALIDITY_RULE = """
+- SESSION SOURCE: this source is the transcript of a session held on the
+  REFERENCE DATE. A past-tense claim that reports an act performed IN the
+  session ("the tests passed", "the cherry-pick landed cleanly", "the user
+  chose option (a)", "the PR was opened") happened on that day: set
+  valid_from to the REFERENCE DATE, valid_kind to EVENT, and valid_from_basis
+  to "session", with valid_from_cue the past-tense phrase. Do NOT use
+  "session" for a past event the session merely mentions or recalls ("the
+  treaty was signed in 1919", "PR #502 was merged last week", "I moved last
+  year"): those keep the rules above, dated only when the text states a date.
+  Never use "session" for a STATE: a present-tense state is "as-of" as above.
+  When unsure whether the act was performed in the session, OMIT the start."""
 
 _STRUCTURE_RULE = """
 - structured_claim: re-express the claim's relational core as ONE
@@ -551,6 +579,7 @@ PROMPT_MODALITY = "prompt.modality"
 PROMPT_POLARITY = "prompt.polarity"
 PROMPT_STANCE = "prompt.stance"
 PROMPT_VALIDITY = "prompt.validity"
+PROMPT_SESSION_VALIDITY = "prompt.session_validity"
 PROMPT_REFERENCE_DATE = "prompt.reference_date"
 PROMPT_STRUCTURE = "prompt.structure"
 PROMPT_TOOL_TURNS = "prompt.tool_turns"
@@ -587,6 +616,7 @@ def extract_prompt_components(
     structure_enabled: bool = False,
     tool_turns_present: bool = False,
     context_present: bool = False,
+    session_source: bool = False,
 ) -> list[PromptComponent]:
     """The components of one extraction prompt, in prompt order.
 
@@ -610,6 +640,11 @@ def extract_prompt_components(
         PromptComponent(PROMPT_VALIDITY, _VALIDITY_RULE, _VALIDITY_SCHEMA_FIELD)
         if validity_enabled
         else PromptComponent(PROMPT_REFERENCE_DATE, _REFERENCE_DATE_RULE),
+        # only on a session transcript, and only under the validity
+        # rule it extends.
+        PromptComponent(PROMPT_SESSION_VALIDITY, _SESSION_VALIDITY_RULE)
+        if validity_enabled and session_source
+        else None,
         PromptComponent(PROMPT_STRUCTURE, _STRUCTURE_RULE, _STRUCTURE_SCHEMA_FIELD)
         if structure_enabled
         else None,
@@ -633,6 +668,7 @@ def _build_extract_prompt(
     structure_enabled: bool = False,
     tool_turns_present: bool = False,
     context_present: bool = False,
+    session_source: bool = False,
 ) -> str:
     """Assemble the extraction prompt from :func:`extract_prompt_components`.
 
@@ -664,15 +700,32 @@ def _build_extract_prompt(
             structure_enabled=structure_enabled,
             tool_turns_present=tool_turns_present,
             context_present=context_present,
+            session_source=session_source,
         )
     )
 
 
+#: Whether the source under extraction is a session transcript.
+#: Set by :meth:`GeneralExtractor.extract` around the text paths from the
+#: snapshot's source type, read where the prompt is assembled and where the
+#: reply is gated, so the flag never threads through every call signature
+#: (the ``_REPLY_TALLY`` pattern). ``False`` outside an extraction.
+_SESSION_SOURCE: ContextVar[bool] = ContextVar("particles_session_source", default=False)
+
+
 def _configured_prompt_components(
-    *, tool_turns_present: bool = False, context_present: bool = False
+    *,
+    tool_turns_present: bool = False,
+    context_present: bool = False,
+    session_source: bool | None = None,
 ) -> list[PromptComponent]:
-    """:func:`extract_prompt_components` under the current config."""
+    """:func:`extract_prompt_components` under the current config.
+
+    ``session_source`` defaults to the extraction in progress (``_SESSION_SOURCE``).
+    """
     cfg = get_config()
+    if session_source is None:
+        session_source = _SESSION_SOURCE.get()
     return extract_prompt_components(
         scope_enabled=cfg.extraction_scope.enabled,
         modality_enabled=cfg.extraction_modality.enabled,
@@ -682,6 +735,7 @@ def _configured_prompt_components(
         structure_enabled=cfg.structured_claim.enabled,
         tool_turns_present=tool_turns_present,
         context_present=context_present,
+        session_source=session_source,
     )
 
 
@@ -828,10 +882,12 @@ def general_component_table() -> ComponentTable:
     append-context rules, the paths and the vision channel depend on the source
     and are in the table but not in ``always``.
     """
-    base = _configured_prompt_components()
+    base = _configured_prompt_components(session_source=False)
     gated = [
         c
-        for c in _configured_prompt_components(tool_turns_present=True, context_present=True)
+        for c in _configured_prompt_components(
+            tool_turns_present=True, context_present=True, session_source=True
+        )
         if c.name not in {b.name for b in base}
     ]
     digests = {c.name: c.digest for c in [*base, *gated]}
@@ -893,7 +949,7 @@ def _extraction_response_schema(
         properties["valid_kind"] = {"type": ["string", "null"], "enum": ["EVENT", "STATE", None]}
         properties["valid_from_basis"] = {
             "type": ["string", "null"],
-            "enum": ["stated", "as-of", None],
+            "enum": ["stated", "as-of", "session", None],
         }
         properties["valid_from_confidence"] = {"type": ["number", "null"]}
         properties["valid_from_cue"] = {"type": ["string", "null"]}
@@ -1292,18 +1348,26 @@ class GeneralExtractor:
         resume_carried: Mapping[str, Sequence[str]] | None = (
             resume_obj if isinstance(resume_obj, Mapping) else None
         )
-        result = await self._extract_single_pass(
-            content,
-            is_markdown=is_markdown,
-            mark_tools=mark_tools,
-            session=session,
-            corpus_entry_id=corpus_entry_id,
-            reference_published_at=reference_published_at,
-            completion_pool=completion_pool,
-            resume_carried=resume_carried,
-            supersede_ids=supersede_ids,
-            append_prefix=append_prefix,
+        # a session transcript's own acts may anchor at its date.
+        session_source = isinstance(source_type, str) and (
+            source_type in get_config().extraction_validity.session_source_types
         )
+        token = _SESSION_SOURCE.set(session_source)
+        try:
+            result = await self._extract_single_pass(
+                content,
+                is_markdown=is_markdown,
+                mark_tools=mark_tools,
+                session=session,
+                corpus_entry_id=corpus_entry_id,
+                reference_published_at=reference_published_at,
+                completion_pool=completion_pool,
+                resume_carried=resume_carried,
+                supersede_ids=supersede_ids,
+                append_prefix=append_prefix,
+            )
+        finally:
+            _SESSION_SOURCE.reset(token)
         # An agent session's worktree / cwd / branch is true for minutes, never
         # a durable belief. Filtered here, after every text path returns, so
         # the single-pass, chunked, and pooled routes are all covered.
@@ -2951,6 +3015,7 @@ def _gate_valid_from(
     *,
     floor: float,
     raw_basis: object = None,
+    session_source: bool = False,
 ) -> tuple[datetime | None, ValidKind | None, float | None, str | None, str | None, str]:
     """Apply the start-emission gate to one item.
 
@@ -2961,7 +3026,10 @@ def _gate_valid_from(
     time. ``basis`` is ``stated`` (the text gives the start) or ``as-of`` (a
     present-tense state anchored at the reference date, its start unknown;
     read as held-at, never began), and an ``as-of`` EVENT is a contradiction
-    the gate drops. Any condition failing yields ``None`` values and a
+    the gate drops. ``session`` is an act the session performed,
+    anchored at its date: accepted only while ``session_source`` (the source
+    is a transcript), and only for an EVENT, since a ``session`` STATE is what
+    ``as-of`` already says and is read as that. Any condition failing yields ``None`` values and a
     non-empty ``note`` naming the drop, never a silent drop. A wrong start
     misplaces a claim in a window and retires nothing, so the gate is biased
     toward under-emission for accuracy rather than safety.
@@ -2998,7 +3066,23 @@ def _gate_valid_from(
             stated,
         )
     basis_raw = str(raw_basis or stated).strip().lower()
-    if basis_raw not in (stated, ValidFromBasis.AS_OF.value):
+    session_basis = ValidFromBasis.SESSION.value
+    if basis_raw == session_basis and not session_source:
+        return (
+            None,
+            None,
+            None,
+            None,
+            (
+                f"VALID_FROM_SESSION_OUTSIDE_TRANSCRIPT: start {parsed.date().isoformat()} "
+                "dropped (a session anchor is read only from a session transcript)"
+            ),
+            stated,
+        )
+    if basis_raw == session_basis and kind_raw == ValidKind.STATE.value:
+        # A state known to hold in the session is the as-of reading, not an act.
+        basis_raw = ValidFromBasis.AS_OF.value
+    if basis_raw not in (stated, ValidFromBasis.AS_OF.value, session_basis):
         basis_raw = stated
     if basis_raw == ValidFromBasis.AS_OF.value and kind_raw == ValidKind.EVENT.value:
         return (
@@ -3262,6 +3346,7 @@ def _parse_extraction_reply(
                 item.get("valid_from_cue"),
                 floor=validity_cfg.min_boundary_confidence,
                 raw_basis=item.get("valid_from_basis"),
+                session_source=_SESSION_SOURCE.get(),
             )
             if fnote:
                 notes.append(f"Item {i}: {fnote}")

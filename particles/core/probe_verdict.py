@@ -23,6 +23,8 @@ operations that consult it:
   clear it, so no new call is needed.
 * :func:`subject_link_key` keys the one kind that is not a pair of claims: the
   subject-link judge's pick among a name's Wikidata candidates.
+* :func:`rung_kind` names the record set of a deterministic ladder rung,
+  whose verdicts the ledger keeps beside the probes'.
 
 An edit to either claim changes its content hash and misses the record, and a
 prompt change misses too. Pure: no I/O, no logging.
@@ -37,10 +39,12 @@ from enum import StrEnum
 from particles.core.duplicate_key import content_hash
 
 __all__ = [
+    "RUNG_KIND_PREFIX",
     "ProbeKind",
     "VerdictKey",
     "prompt_hash",
     "remembered_clear",
+    "rung_kind",
     "subject_link_key",
     "verdict_key",
 ]
@@ -76,6 +80,22 @@ class ProbeKind(StrEnum):
 _SYMMETRIC = frozenset(
     {ProbeKind.CONTRADICTION, ProbeKind.SECOND_READING, ProbeKind.RECONCILE_CONTRADICTION}
 )
+
+
+#: The ``probe_kind`` prefix of a deterministic rung's ledger rows.
+RUNG_KIND_PREFIX = "rung:"
+
+
+def rung_kind(name: str) -> str:
+    """The ledger kind a deterministic rung's verdicts are recorded under: one per rung.
+
+    A model rung records under its probe's own :class:`ProbeKind`; every other
+    rung under ``rung:<name>``, so each rung's rows are its own record set.
+    """
+    kind = f"{RUNG_KIND_PREFIX}{name}"
+    if len(kind) > 32:
+        raise ValueError(f"rung name too long for the ledger: {name!r}")
+    return kind
 
 
 def prompt_hash(*parts: str) -> str:

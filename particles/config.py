@@ -1096,10 +1096,18 @@ class ExtractionValidityConfig(BaseModel):
     a structural decision (does a boundary exist?), never the stored
     ``confidence.value``. ``enabled: false`` reproduces the pre-0197
     behaviour exactly (no candidate ever carries ``valid_until`` from extraction).
+
+    ``session_source_types`` names the source types a harness deposits as a
+    session transcript. For those, the extractor may anchor a
+    past-tense claim reporting an act performed *in the session* at the
+    reference date as an ``EVENT`` under the ``session`` basis, so a window
+    read finds what a session did; for every other source a past-tense claim
+    with no date gets no start. Empty disables the rule.
     """
 
     enabled: bool = True
     min_boundary_confidence: float = 0.75
+    session_source_types: list[str] = Field(default_factory=lambda: ["CONVERSATION"])
 
 
 class StructuredClaimConfig(BaseModel):
@@ -3081,6 +3089,15 @@ class AuditConfig(BaseModel):
     # 0 probes nothing (disclosed the same way). `particles lint` is not
     # affected: cost gating is the audit's concern, lint stays exhaustive.
     max_contradiction_probes: int = Field(default=50, ge=0)
+    # (the ruling, order, do not drop): under a probe
+    # cap the census probes the pairs some single reader sees first (the
+    # observer precondition reconciles or reviews them) and
+    # reserves this share of the cap for cross-scope pairs, two projects'
+    # claims the precondition declines, so a contradiction between projects
+    # is still discovered and recorded as OBSERVER_DIVERGENCE. A share neither
+    # side fills goes to the other. An ordering, never a filter; a store that
+    # was never rescoped, and uncapped `particles lint`, are not reordered.
+    cross_scope_probe_share: float = Field(default=0.2, ge=0.0, le=1.0)
     # read each pair the probe flagged a second time, on
     # ``llm.verification``, with each claim's source passage, note name and
     # note date, and count only the confirmed pairs in the headline. The report

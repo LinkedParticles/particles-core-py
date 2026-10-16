@@ -64,6 +64,8 @@ class ValidFromBasis(StrEnum):
     """A prose ``as of <date>`` cue: known to hold at the date, start unknown."""
     COARSE = "coarse"
     """A prose ``in <year>`` / ``in <month> <year>`` cue: the unit is the span."""
+    SESSION = "session"
+    """An act performed in a session transcript, anchored at the session's date."""
     OPERATOR = "operator"
     """Set by an operator or an authorized agent."""
 

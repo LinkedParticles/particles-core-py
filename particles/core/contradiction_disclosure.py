@@ -76,8 +76,7 @@ DISCLOSURE_ACTOR = "memory-consolidate"
 READING_STANDING = "standing/1"
 #: The instruction for a pair with a claim from a time-stamped record (a
 #: session transcript, another append-only log): a value observed at a later
-#: time may be a change, and only the same moment or a fixed fact confirms
-#:.
+#: time may be a change, and only the same moment or a fixed fact confirms.
 READING_OBSERVED = "observed/1"
 
 _EXCERPT_CHARS = 120

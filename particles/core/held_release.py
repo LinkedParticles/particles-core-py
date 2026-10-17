@@ -31,9 +31,9 @@ from particles.core.observer_scope import PairPrecondition
 from particles.core.schema import Particle
 from particles.core.status import Status, StatusReason
 
-#: The retirements an autonomous pass writes: rung 2.5 and its sweep
-#:, the re-anchor pass, and the document sweep
-#:. A claim a person retired is not among them, and a record
+#: The retirements an autonomous pass writes: rung 2.5 and its sweep,
+#: the re-anchor pass, and the document sweep.
+#: A claim a person retired is not among them, and a record
 #: behind one stays with review.
 AUTONOMOUS_RETIREMENTS: frozenset[StatusReason] = frozenset(
     {

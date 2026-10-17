@@ -113,8 +113,8 @@ OBSERVATION_TAG = "memory-compat:observation"
 RELATION_TAG = "memory-compat:relation"
 #: Marks a Subject as deleted through the façade.
 TOMBSTONE_TAG = "memory-compat:deleted"
-#: Marks a particle as arriving by migration rather than by an agent write
-#:. Distinct from ``CalibrationSource.IMPORTED`` on purpose: the
+#: Marks a particle as arriving by migration rather than by an agent write.
+#: Distinct from ``CalibrationSource.IMPORTED`` on purpose: the
 #: calibration source says *how the number was produced*, this says *which run
 #: put the record here*, so an operator can find or retract one import.
 IMPORT_TAG = "migration:mcp-memory"

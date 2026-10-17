@@ -956,6 +956,12 @@ class ExtractionConfig(BaseModel):
     # The largest delta chunk sent in one call. Each chunk after the first
     # takes the end of the chunk before it as its context.
     append_chunk_chars: int = Field(default=7500, ge=1000)
+    # the agent extractor's prompt (the Stop hook's ask and its API
+    # proxy) tells the model how many claims text of its size usually yields,
+    # as a thoroughness guide, never a quota. 1.9 is the median claims per
+    # 1000 characters of the general extractor's transcript deltas in the
+    # maintainers' store (262 reads, measured 2026-10-16).
+    agent_expected_claims_per_kchar: float = Field(default=1.9, gt=0.0)
     # a pair the §6.6 contradiction probe confirms is read a second
     # time, before the write loop, with each claim's source kind, name, time
     # and passage (on ``llm.verification``). A pair the reading does not
@@ -2801,12 +2807,21 @@ class AgentExtractionConfig(BaseModel):
     # An ask unanswered after this many seconds is expired.
     ask_ttl_seconds: int = Field(default=900, ge=60)
     # A submission covers its span only with at least this many accepted claims
-    # per 1000 characters. 2.7 is the 10th percentile of the general
-    # extractor's own transcript deltas in the maintainers' store.
-    min_claims_per_kchar: float = Field(default=2.7, ge=0.0)
+    # per 1000 characters. 1.27 is the 10th percentile of the general
+    # extractor's own transcript deltas in the maintainers' store (262 delta
+    # reads, measured 2026-10-16; it was 2.7 on 2026-10-09, before the
+    # session-state and tool-turn filters thinned transcript extraction).
+    min_claims_per_kchar: float = Field(default=1.27, ge=0.0)
     # ...and with no more than this share of candidates dropped for evidence
     # not found in the span. Placeholder until the shadow week measures it.
     max_evidence_drop_ratio: float = Field(default=0.5, ge=0.0, le=1.0)
+    # In shadow mode, keep each submission's accepted candidates (claim text,
+    # stated confidence, evidence) in a local JSONL file, so a later labelling
+    # pass can fit a calibration map on real session claims. The
+    # operator event log keeps counts only. Off writes nothing.
+    keep_shadow_candidates: bool = True
+    # None ⇒ ``<claude_code.state_dir>/agent-extraction-shadow.jsonl``.
+    shadow_candidates_path: str | None = None
 
     @field_validator("mode", mode="before")
     @classmethod

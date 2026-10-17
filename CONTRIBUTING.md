@@ -73,6 +73,12 @@ uv run ruff format --check .
 uv run reuse lint          # per-file SPDX licensing
 ```
 
+`uv.lock` pins the whole dependency closure, and CI installs it with
+`uv sync --locked`. A change to the dependencies in `pyproject.toml` runs
+`uv lock` and commits the updated lock in the same PR. The resolver honours a
+seven-day cooldown (`[tool.uv] exclude-newer`), so a release published in the
+last week is not yet eligible.
+
 Every new source file carries a two-line licensing header, after any shebang and
 before the module docstring:
 

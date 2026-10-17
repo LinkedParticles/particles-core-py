@@ -55,7 +55,7 @@ log = logging.getLogger(__name__)
 EXTRACTOR_ID = "claude-code-agent"
 #: The agent prompt's version. A calibration map applies only to the version
 #: it was fitted under, so bump this on any prompt change.
-EXTRACTOR_VERSION = "0.1.0"
+EXTRACTOR_VERSION = "0.2.0"
 
 #: The MCP tool the agent submits through.
 SUBMIT_TOOL = "extraction_submit"
@@ -78,15 +78,53 @@ _JSON_ONLY = "Return ONLY a JSON array. No prose before or after. Each element:"
 _AGENT_SCHEMA_FIELD = ',\n  "evidence": "<verbatim passage from the source text>"'
 
 _SUBMIT_INSTRUCTION = """\
-Particles memory: before you finish, extract this session's durable claims.
+Particles memory: before you finish, extract the claims in the session text below.
 
-Read the session text below. It is the part of this conversation not yet
-recorded. Apply the rules, then call the `{tool}` tool exactly once with
-`ask_id` set to "{ask_id}" and `candidates` set to the JSON array described.
-If nothing in the text is worth recording, call it with an empty array.
-Do not summarise what you recorded afterwards; reply with one short line.
+The text is the part of this conversation not yet recorded. When you have
+extracted it, call the `{tool}` tool exactly once with `ask_id` set to
+"{ask_id}" and `candidates` set to the JSON array described. If the text
+holds no claim the rules admit, call it with an empty array. Do not summarise
+what you recorded afterwards; reply with one short line.
+
+{thoroughness}
 
 """
+
+#: Shared by the ask and the API proxy, so the proxy's benchmark and
+#: calibration measure the prompt the agent is given. The shadow week found the
+#: 0.1.0 ask yielding about 0.4x the general extractor's claims on the same
+#: transcripts: the agent read "durable claims ... worth recording" as an
+#: invitation to curate ("keeping things modest"), took a whole span in one
+#: pass where the general extractor reads 7,500-character chunks, and wrote
+#: every schema field of every candidate, nulls included.
+_THOROUGHNESS = """\
+Extract exactly as a background extractor reading this text would: every
+individual claim the rules admit, not a summary and not a selection of
+highlights. Do not leave a claim out because it seems minor, obvious, or true
+only for now; what is kept is decided later, not here. Work through the text
+in order, a few paragraphs at a time, and finish each part before moving on.
+
+The text is about {kchars} thousand characters long. Text like this usually
+yields about {expected} claims. That is a guide to how thorough to be, never a
+quota: do not invent, split, or repeat claims to reach it, and record fewer
+when the text holds fewer.
+
+Keep each candidate compact. Always give content, subjects, confidence_value
+and evidence; leave out every other field whose value would be null or the
+default (uncertainty_nature EPISTEMIC, scope WORLD, assertion_modality
+FALSIFIABLE, polarity ASSERTED)."""
+
+
+def expected_claims(span_chars: int) -> int:
+    """How many claims a span this size usually yields: the ask's thoroughness guide."""
+    rate = get_config().extraction.agent_expected_claims_per_kchar
+    return max(1, round(rate * span_chars / 1000))
+
+
+def thoroughness(span_text: str) -> str:
+    """The completeness and compactness instructions for a span of this size."""
+    chars = len(span_text)
+    return _THOROUGHNESS.format(kchars=max(1, round(chars / 1000)), expected=expected_claims(chars))
 
 
 def agent_rules(reference_date: str) -> str:
@@ -115,7 +153,9 @@ def build_ask(ask_id: str, span_text: str, *, reference_date: str | None = None)
     date = reference_date or datetime.now(UTC).date().isoformat()
     rules = agent_rules(date).replace(_JSON_ONLY, "The `candidates` array. Each element:")
     return (
-        _SUBMIT_INSTRUCTION.format(tool=SUBMIT_TOOL, ask_id=ask_id)
+        _SUBMIT_INSTRUCTION.format(
+            tool=SUBMIT_TOOL, ask_id=ask_id, thoroughness=thoroughness(span_text)
+        )
         + rules
         + "\n\n"
         + data_fence_instruction(nonce)
@@ -328,7 +368,9 @@ class AgentExtractor:
         text = content_to_text(content)
         nonce = make_nonce()
         date = datetime.now(UTC).date().isoformat()
-        system = agent_rules(date) + "\n\n" + data_fence_instruction(nonce)
+        system = (
+            thoroughness(text) + "\n\n" + agent_rules(date) + "\n\n" + data_fence_instruction(nonce)
+        )
         try:
             raw, provider_model = await complete_with_provider_model(
                 "extraction",

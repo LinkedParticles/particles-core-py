@@ -40,8 +40,8 @@ from particles.core.schema import ParticleType
 from particles.extraction.polarity import is_non_asserted
 from particles.extraction.scope import is_excluded_document_meta
 
-#: Key on the ``properties`` dict carrying the subject-scope record. Prefixed
-#:; the ``extraction:`` namespace is registered in §5.
+#: Key on the ``properties`` dict carrying the subject-scope record. Prefixed;
+#: the ``extraction:`` namespace is registered in §5.
 SUBJECT_SCOPE_KEY = "extraction:subject_scope"
 
 #: The one value that marks a claim as author-scoped. Absence of the key means

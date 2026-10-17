@@ -555,8 +555,8 @@ _EXTRACT_SCHEMA_TAIL = """
 }"""
 
 
-#: The rule a delta read carries when its prompt holds a context section
-#:. In the prompt proper, never inlined in the chunk text, so the
+#: The rule a delta read carries when its prompt holds a context section.
+#: In the prompt proper, never inlined in the chunk text, so the
 #: instruction is a trusted rule rather than words inside the fenced data.
 APPEND_CONTEXT_RULE = """
 - The user message holds two fenced sections. The one labelled "context" is

@@ -63,8 +63,13 @@ jobs:
           python-version: "3.11"
           enable-cache: false
 
+      # `--locked`: install exactly the committed `uv.lock`, and fail if it no
+      # longer matches pyproject.toml rather than quietly re-resolving. The lock
+      # is cut by the release export under the seven-day cooldown that
+      # `[tool.uv] exclude-newer` declares; a PR that changes a dependency runs
+      # `uv lock` and commits the result with it.
       - name: Install
-        run: uv sync
+        run: uv sync --locked
 
       # `not integration` is the tier that needs no API key. The integration
       # tier makes real Anthropic calls and is a developer-key concern.
@@ -89,9 +94,9 @@ jobs:
       # published, so a different version can fail on a no-op diff. Needs no
       # project install.
       - name: ruff check
-        run: uvx --from 'ruff==0.16.10' ruff check .
+        run: uvx --from 'ruff==0.17.0' ruff check .
       - name: ruff format --check
-        run: uvx --from 'ruff==0.16.10' ruff format --check .
+        run: uvx --from 'ruff==0.17.0' ruff format --check .
 
   reuse:
     name: REUSE licensing

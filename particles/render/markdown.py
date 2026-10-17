@@ -568,8 +568,8 @@ def is_within_directory(directory: Path, path: Path) -> bool:
         return False
 
 
-#: Ownership ledger a one-file-per-subject exporter keeps at its export root
-#:: the root-relative paths of every ``.md`` file its last run wrote.
+#: Ownership ledger a one-file-per-subject exporter keeps at its export root:
+#: the root-relative paths of every ``.md`` file its last run wrote.
 EXPORT_MANIFEST_NAME = ".particles-export.json"
 
 #: Append-only journal of files a run has written that its prior manifest did

@@ -19,7 +19,7 @@
 # version and advance together.
 [project]
 name = "linkedparticles-core"
-version = "1.192.2"
+version = "1.192.10"
 description = "Store-free client library for Particles: define, validate, serialize, and extract provenance-tracked belief particles"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -63,14 +63,33 @@ classifiers = [
 # by a module in this distribution. It is a subset of the engine's, never a
 # superset: installing the engine installs this, so a package needed by both
 # is declared in both and resolved once.
+#
+# These ranges are the published compatibility claim, and they are allowed to
+# be wider than the development upstream's own floors, which a dependency bot
+# raises to each new release. Three rules bound them, and a test in the
+# upstream checks all three against its own pyproject and lockfile:
+#
+#   1. Every range admits the version the upstream's suite runs against.
+#   2. A next-breaking upper bound is the upstream's bound, moved when it is,
+#      and the floor beneath it sits on the release line just below it: the
+#      bound declares that line the only one vetted.
+#   3. No floor reaches back into an older major than the upstream's floor,
+#      since the code is ported to and tested on that major alone.
+#
+# Where a published advisory affects a path this layer exercises, the floor
+# is the first release that fixes it, and the advisory is named beside it.
 dependencies = [
     "pydantic>=2.7",
     "pyyaml>=6.0",
     "httpx>=0.27",
-    "anthropic>=0.28",
+    # The 1.x SDK surface: the `omit` sentinel, and sampling parameters passed
+    # through `extra_body` since 1.0 dropped the typed keyword arguments.
+    "anthropic>=1.0",
     "numpy>=1.26",
     "scipy>=1.13",
-    "sentence-transformers>=2.7",
+    # GHSA-jhr6-gm9c-rqjv (fixed in 5.6.0): the encoder model is loaded at
+    # runtime, so the fix is a floor here.
+    "sentence-transformers>=5.6.0",
     # Declared explicitly *only* so `[tool.uv.sources]` below can route it to
     # the CPU-only wheel index — uv sources apply to a project's direct
     # dependencies, and torch is otherwise transitive via
@@ -81,22 +100,25 @@ dependencies = [
     # async session; the import is executed at module load even though no
     # Client module opens a connection. Declared so a store-free install still
     # imports, and with `[asyncio]` because that import needs greenlet, which
-    # SQLAlchemy stopped installing by default in 2.1. Bounded below the next
-    # minor: 2.1 changed ORM and typing behaviour this code depends on.
-    "sqlalchemy[asyncio]>=2.0,<2.2",
+    # SQLAlchemy stopped installing by default in 2.1. Floored at 2.1 and
+    # bounded below the next minor: 2.1 changed ORM and typing behaviour this
+    # code depends on.
+    "sqlalchemy[asyncio]>=2.1,<2.2",
     # JSON-LD / RDF / SHACL parsing stack — these handle attacker-influenced
     # input (interchange import, conformance validation), so they carry tested
     # next-breaking upper bounds in addition to the floor: a future breaking
     # major of any of them must be vetted before adoption rather than pulled in
     # silently by a downstream `pip install`.
-    "pyld>=2.0,<4",
-    "pyshacl>=0.26,<0.32",
+    "pyld>=3.0,<4",
+    "pyshacl>=0.40,<0.41",
     "rdflib>=7.0,<8",
     "jsonschema>=4.22",
     # Deposited PDFs are attacker-influenced input on the runtime path, so this
-    # floor (CVE-2026-71852 / CVE-2026-71870, fixed in 6.15.0) is a direct
-    # dependency floor rather than an environment constraint.
-    "pypdf>=6.15.0",
+    # is a direct dependency floor rather than an environment constraint. 6.19.0
+    # is the first release with every published advisory fixed, the latest
+    # being GHSA-php9-fj8v-98fj, GHSA-v247-6f48-mgcj and GHSA-w23x-9jrw-r45c
+    # (CVE-2026-71852 / CVE-2026-71870 were fixed in 6.15.0).
+    "pypdf>=6.19.0",
     "html2text>=2024.2",
     "lxml-stubs>=0.5.1",
     # Observability API only: a small, pure-Python, no-op-by-default package.
@@ -113,7 +135,7 @@ dependencies = [
 # extractor imports it lazily and raises an actionable ImportError when vision
 # extraction is enabled without it, so the base install stays lean.
 vision = [
-    "pypdfium2>=4.30",
+    "pypdfium2>=5.0",
 ]
 
 # PyPI renders these beside the description and maps the recognized names
@@ -221,11 +243,20 @@ explicit = true
 [tool.uv.sources]
 torch = [{ index = "pytorch-cpu", marker = "sys_platform != 'darwin'" }]
 
-# Security floors on packages that are not direct dependencies — they arrive
-# transitively, so a floor here raises the minimum without adding a spurious
-# direct dependency. Revisit each line once the parent's own floor moves past
-# the fixed version.
+# `exclude-newer` is the seven-day supply-chain cooldown: a resolve here never
+# picks a release published in the last week, which is the window in which a
+# compromised upload is usually caught and yanked. It is a relative span, so the
+# committed `uv.lock` (cut by the export from this file) records the span and
+# not a timestamp, and `uv sync --locked` stays satisfied as the days pass. The
+# lock and this line travel together: drop the line and `uv lock --check`
+# reports the lock stale.
+#
+# The `constraint-dependencies` are security floors on packages that are not
+# direct dependencies. They arrive transitively, so a floor here raises the
+# minimum without adding a spurious direct dependency. Revisit each line once
+# the parent's own floor moves past the fixed version.
 [tool.uv]
+exclude-newer = "7 days"
 constraint-dependencies = [
     "idna>=3.15",         # CVE-2026-45409, runtime hostname path
     "setuptools>=83.0.0", # PYSEC-2026-3447, build path (pulled in by torch)

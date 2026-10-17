@@ -94,6 +94,18 @@ class TestVerifySubmission:
         )
         assert verified.accepted[0].uncertainty_nature.value == "ALEATORY"
 
+    def test_a_compact_candidate_takes_the_defaults(self) -> None:
+        # The 0.2.0 ask tells the agent to leave out null and default fields.
+        compact = {
+            "content": "Staging runs Postgres 17.",
+            "subjects": ["staging database"],
+            "confidence_value": 0.9,
+            "evidence": "Postgres 17",
+        }
+        verified = agent.verify_submission([compact], SPAN)
+        assert len(verified.accepted) == 1 and not verified.malformed
+        assert verified.accepted[0].uncertainty_nature.value == "EPISTEMIC"
+
 
 class TestCoverage:
     cfg = AgentExtractionConfig(min_claims_per_kchar=2.0, max_evidence_drop_ratio=0.5)
@@ -202,6 +214,35 @@ class TestPrompt:
         assert "Return ONLY a JSON array" not in ask
         assert '<session nonce="' in ask and "hello" in ask
         assert "{reference_date}" not in ask
+
+    def test_ask_asks_for_every_claim_and_names_the_expected_count(self) -> None:
+        span = "## User\n\n" + "x" * 9990
+        ask = agent.build_ask("ask-123", span, reference_date="2026-10-09")
+        assert "durable" not in ask.split("Rules:")[0]
+        assert "not a selection of" in ask
+        # 10,000 characters at the default 1.9 claims per 1000.
+        assert "about 10 thousand characters" in ask and "about 19 claims" in ask
+        assert "never a\nquota" in ask
+
+    def test_expected_count_follows_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        cfg = agent.get_config().extraction
+        monkeypatch.setattr(cfg, "agent_expected_claims_per_kchar", 3.0)
+        assert agent.expected_claims(20_000) == 60
+        assert agent.expected_claims(10) == 1
+
+    async def test_the_proxy_is_given_the_same_guide(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        seen: dict[str, str] = {}
+
+        async def fake(purpose: str, user: str, **kwargs: Any) -> tuple[str, str]:
+            seen["system"] = kwargs["system"]
+            return "[]", "anthropic:test"
+
+        monkeypatch.setattr("particles.llm.complete_with_provider_model", fake)
+        await agent.AgentExtractor().extract(
+            None,  # type: ignore[arg-type]
+            SPAN.encode(),
+        )
+        assert agent.thoroughness(SPAN) in seen["system"]
 
     def test_rules_carry_the_general_extractor_rules(self) -> None:
         rules = agent.agent_rules("2026-10-09")

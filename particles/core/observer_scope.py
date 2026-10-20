@@ -158,6 +158,26 @@ def meet(premises: Iterable[BeliefScope]) -> BeliefScope:
     return BeliefScope(keys=keys, lapsed=lapsed and not keys)
 
 
+def join(members: Iterable[BeliefScope]) -> BeliefScope:
+    """The scope a ``CO_EVIDENTIAL`` merge gives every sourced member: their union.
+
+    The join pools the group's attesting entries, so the merged
+    scope is global as soon as one member is, and otherwise the union of their
+    keys. A union with no keys is in view for no project; it is reported as
+    lapsed when some member was lapsed, which is a reading for display only,
+    since the pooled entries decide between lapsed and unattributed. Applies to
+    sourced beliefs: a derived belief keeps the meet of its premises.
+    """
+    keys: set[str] = set()
+    lapsed = False
+    for member in members:
+        if member.is_global:
+            return GLOBAL_SCOPE
+        keys |= member.keys
+        lapsed = lapsed or member.lapsed
+    return BeliefScope(keys=frozenset(keys), lapsed=lapsed and not keys)
+
+
 def visible(scope: BeliefScope, observer_project: str | None, *, widened: bool = False) -> bool:
     """The predicate: is a belief with ``scope`` in view for this observer?
 
@@ -185,6 +205,30 @@ def share_an_observer(a: BeliefScope, b: BeliefScope) -> bool:
     if a.unattributed or b.unattributed:
         return True
     return bool(a.keys & b.keys)
+
+
+def same_scope(a: BeliefScope, b: BeliefScope) -> bool:
+    """Whether two beliefs have exactly the same observers: the agent link test.
+
+    A ``CO_EVIDENTIAL`` edge unions the two groups' sources, so it leaves both
+    scopes unchanged only when they are already equal. Visibility is not
+    enough: a project's belief linked to a global one becomes global. Lapsed
+    and unattributed are distinct readings and only equal themselves.
+    """
+    if a.is_global or b.is_global:
+        return a.is_global and b.is_global
+    if a.keys or b.keys:
+        return a.keys == b.keys
+    return a.lapsed == b.lapsed
+
+
+def describe_scope(scope: BeliefScope) -> str:
+    """A short operator-facing reading of a scope, for refusals and reports."""
+    if scope.is_global:
+        return "global"
+    if scope.keys:
+        return "project " + ", ".join(sorted(scope.keys))
+    return "lapsed" if scope.lapsed else "unattributed"
 
 
 class PairPrecondition(StrEnum):

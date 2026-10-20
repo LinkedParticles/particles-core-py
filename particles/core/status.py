@@ -81,8 +81,11 @@ _ALLOWED: frozenset[tuple[Status | None, Status]] = frozenset(
         (Status.ACTIVE, Status.SUPERSEDED),
         (Status.ACTIVE, Status.RETRACTED),
         (Status.ACTIVE, Status.PROVENANCE_STALE),
-        (Status.INCONSISTENCY, Status.PROVENANCE_STALE),  # PREFER A/B: loser demoted
-        (Status.INCONSISTENCY, Status.RETRACTED),  # BOTH VALID: INCONSISTENCY particle retracted
+        # Every non-DEFER resolution retracts the record (§6.6 wrapper-terminal
+        # rule): review, the trust cascade, the held-claim release and the
+        # disclosure sweep. There is no INCONSISTENCY → PROVENANCE_STALE edge;
+        # the cascade wrote one until 1.192.15 (migration 053).
+        (Status.INCONSISTENCY, Status.RETRACTED),
         (Status.INCONSISTENCY, Status.INCONSISTENCY),  # DEFER: re-set same status
         (Status.PROVENANCE_STALE, Status.SUPERSEDED),  # Reindex supersession of stale particle
         (Status.PROVENANCE_STALE, Status.RETRACTED),  # Explicit operator cleanup

@@ -2159,6 +2159,21 @@ def _split_into_paragraph_chunks(text: str, size: int) -> list[str]:
     return [text[start:end] for start, end in paragraph_spans(text, size)]
 
 
+def whole_read_chunks(text: str) -> list[str] | None:
+    """The chunks a whole read of ``text`` cuts, or ``None`` for a single-pass read.
+
+    The cut :meth:`GeneralExtractor._extract_html_chunked` makes above
+    ``extraction.html_chunk_size``: normalised, then split on paragraphs. At
+    or under the size the text goes in one call that carry-forward never
+    answers, hence ``None``. For a caller that plans a read before it runs
+    (the consolidation dry run).
+    """
+    size = get_config().extraction.html_chunk_size
+    if len(text) <= size:
+        return None
+    return _split_into_paragraph_chunks(_normalise_for_hashing(text), size)
+
+
 def paragraph_spans(text: str, size: int) -> list[tuple[int, int]]:
     """The ``[start, end)`` spans :func:`_split_into_paragraph_chunks` cuts.
 

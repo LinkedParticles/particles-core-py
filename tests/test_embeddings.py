@@ -24,6 +24,7 @@ from particles.embeddings import (
     EmbeddingProfile,
     _toggle_progress_bars,
     _TracingEmbeddingModel,
+    cosine_similarities,
     cosine_similarity,
     get_embedding_profile,
 )
@@ -180,6 +181,35 @@ class TestCosineSimilarity:
         b = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
         sim = cosine_similarity(a, b)
         assert 0.0 <= sim <= 1.0
+
+
+class TestCosineSimilarities:
+    """The matrix form of the primitive agrees with the per-pair one."""
+
+    def test_matches_the_per_pair_primitive(self) -> None:
+        rng = np.random.default_rng(1)
+        vectors = [rng.standard_normal(384).astype(np.float32) for _ in range(300)]
+        vectors.append(-vectors[0])  # clamped to 0
+        vectors.append(np.zeros(384, dtype=np.float32))  # the epsilon case
+        query = rng.standard_normal(384).astype(np.float32)
+        batched = cosine_similarities(query, vectors)
+        per_pair = [cosine_similarity(query, v) for v in vectors]
+        assert len(batched) == len(per_pair)
+        assert all(isinstance(x, float) for x in batched)
+        # The sums run in another order, so the last bit can differ.
+        assert np.allclose(batched, per_pair, rtol=0, atol=1e-6)
+        assert all(0.0 <= x <= 1.0 for x in batched)
+
+    def test_identical_vectors_tie_wherever_they_sit(self) -> None:
+        rng = np.random.default_rng(2)
+        rows = [rng.standard_normal(384).astype(np.float32) for _ in range(1001)]
+        twin = rows[3].copy()
+        query = rng.standard_normal(384).astype(np.float32)
+        sims = cosine_similarities(query, [*rows, twin])
+        assert sims[3] == sims[-1]
+
+    def test_no_vectors(self) -> None:
+        assert cosine_similarities(np.ones(4, dtype=np.float32), []) == []
 
 
 class TestEmbeddingProfile:

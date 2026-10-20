@@ -419,7 +419,7 @@ class CloseCause(StrEnum):
     REVIEW = "review"
     """A review action: a ``REVIEW_RESOLVED`` event names the record."""
     CASCADE = "cascade"
-    """The trust cascade: ``PROVENANCE_STALE``, with no event."""
+    """The trust cascade: no event; its REVIEW particle names the record."""
     LAPSED = "lapsed"
     """The lapse sweep: a side has no member left."""
     REGROUPED = "regrouped"

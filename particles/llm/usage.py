@@ -284,14 +284,15 @@ def _price_row(provider: str, model: str, batched: bool, counts: _Counts) -> flo
     from particles.config import ProviderSelection, get_config
 
     config = get_config()
-    price = config.llm.price_for(ProviderSelection(provider=provider, model=model))
+    selection = ProviderSelection(provider=provider, model=model)
+    price = config.llm.price_for(selection)
     if price is None:
         return None
     llm = config.llm
     cost = (
         counts.input_tokens * price.input
         + counts.cache_creation_tokens * price.input * llm.cache_write_price_multiplier
-        + counts.cache_read_tokens * price.input * llm.cache_read_price_multiplier
+        + counts.cache_read_tokens * price.input * llm.cache_read_multiplier_for(selection)
         + counts.output_tokens * price.output
     ) / 1_000_000
     if batched:

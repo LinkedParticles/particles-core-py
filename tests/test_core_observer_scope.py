@@ -17,10 +17,13 @@ from particles.core.observer_scope import (
     EntryScope,
     PairPrecondition,
     classify_entry,
+    describe_scope,
+    join,
     meet,
     pair_precondition,
     project_keys,
     project_tag,
+    same_scope,
     scope_of_entries,
     visible,
 )
@@ -189,3 +192,53 @@ class TestPairPrecondition:
             assert verdict is PairPrecondition.RECONCILE
         else:
             assert (verdict is PairPrecondition.RECONCILE) == (existing <= cand)
+
+
+class TestJoin:
+    """The scope a CO_EVIDENTIAL merge gives both sides (Atlas review finding 8)."""
+
+    def test_the_union_of_two_projects(self) -> None:
+        assert join([keyed("-a"), keyed("-b")]) == keyed("-a", "-b")
+
+    def test_one_global_member_makes_the_group_global(self) -> None:
+        assert join([keyed("-a"), GLOBAL_SCOPE]) == GLOBAL_SCOPE
+
+    def test_a_member_in_view_for_no_project_adds_nothing(self) -> None:
+        assert join([keyed("-a"), UNATTRIBUTED_SCOPE]) == keyed("-a")
+        assert join([keyed("-a"), LAPSED_SCOPE]) == keyed("-a")
+
+    def test_no_keys_stays_in_view_for_no_project(self) -> None:
+        assert join([UNATTRIBUTED_SCOPE, LAPSED_SCOPE]).in_view_for_no_project
+        assert join([LAPSED_SCOPE]).lapsed
+        assert join([UNATTRIBUTED_SCOPE]).unattributed
+
+
+class TestSameScope:
+    """The agent link test: equal observers, not mutual visibility."""
+
+    SCOPES = (
+        GLOBAL_SCOPE,
+        UNATTRIBUTED_SCOPE,
+        LAPSED_SCOPE,
+        keyed("a"),
+        keyed("b"),
+        keyed("a", "b"),
+    )
+
+    def test_each_scope_equals_only_itself(self) -> None:
+        for i, x in enumerate(self.SCOPES):
+            for j, y in enumerate(self.SCOPES):
+                assert same_scope(x, y) == (i == j), (x, y)
+
+    def test_a_global_scope_carrying_keys_is_still_global(self) -> None:
+        assert same_scope(BeliefScope(is_global=True, keys=frozenset({"a"})), GLOBAL_SCOPE)
+
+    def test_describe(self) -> None:
+        assert [describe_scope(s) for s in self.SCOPES] == [
+            "global",
+            "unattributed",
+            "lapsed",
+            "project a",
+            "project b",
+            "project a, b",
+        ]

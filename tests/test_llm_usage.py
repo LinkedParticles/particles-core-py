@@ -241,6 +241,17 @@ class TestPricing:
         # read (0.1x) + 1.00 output.
         assert usage.snapshot().cost_usd == pytest.approx(5.70)
 
+    def test_a_model_billing_cache_reads_lower_uses_its_multiplier(self) -> None:
+        # The pricing page bills claude-sonnet-5-5's cache reads at 0.05x
+        # input (llm.cache_read_price_multiplier_by_model), not the standard 0.1x.
+        with track_usage() as usage:
+            record_usage("anthropic:claude-sonnet-5-5", cache_read_tokens=1_000_000)
+        assert usage.snapshot().cost_usd == pytest.approx(0.10)
+        get_config().llm.cache_read_price_multiplier_by_model = {"claude-sonnet-5-5": 0.2}
+        with track_usage() as usage:
+            record_usage("anthropic:claude-sonnet-5-5", cache_read_tokens=1_000_000)
+        assert usage.snapshot().cost_usd == pytest.approx(0.40)
+
     def test_haiku_5_5_ships_priced(self) -> None:
         # $0.10/$0.50 per MTok, its rate for prompts of up to 100k tokens.
         with track_usage() as usage:

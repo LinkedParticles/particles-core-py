@@ -31,6 +31,42 @@ from particles.core.status import Status, StatusReason
 
 _TERMINAL = (Status.RETRACTED, Status.SUPERSEDED)
 
+CLOSED_RECORD: tuple[Status, StatusReason] = (Status.RETRACTED, StatusReason.CONFLICT_RESOLVED)
+"""The state every non-DEFER resolution leaves an INCONSISTENCY record in.
+
+The §6.6 wrapper-terminal rule: review, the trust cascade, the held-claim
+release and the disclosure sweep all close a record this way. A record the
+cascade closed before 1.192.15 was left ``PROVENANCE_STALE`` /
+``CONFLICT_RESOLVED`` instead; migration 053 moves those here."""
+
+CASCADE_ACTOR = "trust-cascade"
+"""``asserted_by`` on the REVIEW particle the trust cascade writes per record."""
+
+_CASCADE_REVIEW_PREFIX = "CASCADE REVIEW: auto-resolved INCONSISTENCY "
+
+
+def cascade_review_content(
+    inconsistency_id: str, winner_id: str, loser_id: str, statement_id: str
+) -> str:
+    """The content of the REVIEW particle the trust cascade writes for one record."""
+    return (
+        f"{_CASCADE_REVIEW_PREFIX}{inconsistency_id}. "
+        f"Winner: {winner_id}. Loser: {loser_id}. "
+        f"Triggered by trust statement {statement_id}."
+    )
+
+
+def cascade_reviewed_record_id(content: str) -> str | None:
+    """The record a cascade REVIEW particle's content names, or None for other content.
+
+    The cascade writes no operator event, so its REVIEW particle is the one
+    trace that says which closed records it closed.
+    """
+    if not content.startswith(_CASCADE_REVIEW_PREFIX):
+        return None
+    record_id, sep, _rest = content[len(_CASCADE_REVIEW_PREFIX) :].partition(". ")
+    return record_id if sep and record_id else None
+
 
 class Demotion(Enum):
     """What demoting a conflict's losing claim takes, given its current status."""

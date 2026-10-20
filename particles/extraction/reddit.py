@@ -2,12 +2,19 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-"""Reddit post extractor and importer (importer naming).
+"""Reddit post extractor and its Client-safe fetch helpers.
 
-RedditImporter — fetches the Reddit public JSON API ({url}.json?limit=200)
-                  and stores the raw JSON blob.
-RedditExtractor — parses the blob, assembles an LLM-ready text from post + top
-                  comments, and calls _call_llm() for claim-granularity extraction.
+The importer lives in ``particles.ingest.importers.reddit`` (Engine). It fetches
+a thread from the Arctic Shift archive by default, or from Reddit's own ``.json``
+endpoint when ``reddit.fetch_backend`` is ``reddit``, and stores a blob in
+Reddit's two-listing shape either way. This module keeps what both halves share:
+
+* the share-link resolver and the direct ``.json`` curl fetch;
+* the pure helpers that build and read the stored blob, including the archive
+  provenance record the importer appends as a third element;
+* ``RedditExtractor``, which parses the blob, assembles an LLM-ready text from
+  the post and its top comments, and calls ``_call_llm()`` for claim-granularity
+  extraction.
 """
 
 from __future__ import annotations
@@ -16,6 +23,7 @@ import asyncio
 import json
 import logging
 import re
+from collections.abc import Iterator
 from typing import Any
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
@@ -224,14 +232,16 @@ async def _fetch_with_curl(url: str, *, resolve: Resolver | None = None) -> byte
         stderr_text = stderr.decode(errors="replace")
         status = _parse_curl_http_status(stderr_text)
         if status == 403:
-            # Reddit now bot-walls unauthenticated API access (2025–2026
-            # lockdown): a Cloudflare "network security" challenge on the
-            # content endpoints. This is an expected external condition, not a
-            # bug — surface it as a SourceFetchError the API maps to 502.
+            # Reddit bot-walls unauthenticated access to thread content (the
+            # 2025–2026 lockdown), and no longer grants API credentials to
+            # scripts, so the message names the archive backend rather than an
+            # OAuth route that is closed. An expected external
+            # condition, not a bug: a SourceFetchError the API maps to 502.
             detail = (
-                f"Reddit returned HTTP 403 for {url} — it now blocks "
-                "unauthenticated API access (Cloudflare bot-wall); authenticated "
-                "(OAuth) access is required to fetch this content."
+                f"Reddit returned HTTP 403 for {url}: it refuses unauthenticated "
+                "programmatic access to thread content. Set reddit.fetch_backend "
+                "to arctic_shift (the default) to fetch the thread from the "
+                "Arctic Shift archive instead."
             )
         else:
             detail = (
@@ -296,9 +306,10 @@ async def _resolve_reddit_redirect(url: str, *, resolve: Resolver | None = None)
     allowlist is retained; the address pin sits beneath it, not in place of it.
 
     Raises:
-        RuntimeError: if curl fails (e.g. the share link 404s), the response
-            carries no ``Location``, or the resolved target is not a
-            ``(www.|old.)?reddit.com`` ``/comments/`` permalink.
+        SourceFetchError: if curl fails (e.g. the share link 404s or Reddit
+            refuses the request), the response carries no ``Location``, or the
+            resolved target is not a ``(www.|old.)?reddit.com`` ``/comments/``
+            permalink. It subclasses ``RuntimeError``, which this raised before.
         UnsafeUrlError: if the share link's host does not resolve, or resolves
             to a private/reserved address (fail-closed, before curl is spawned).
     """
@@ -329,18 +340,29 @@ async def _resolve_reddit_redirect(url: str, *, resolve: Resolver | None = None)
     )
     stdout, stderr = await proc.communicate()
     if proc.returncode != 0:
-        raise RuntimeError(
-            f"curl failed (exit {proc.returncode}) resolving Reddit share link "
-            f"{url}: {stderr.decode()[:200]}"
-        )
+        stderr_text = stderr.decode(errors="replace")
+        status = _parse_curl_http_status(stderr_text)
+        if status == 403:
+            detail = (
+                f"Reddit returned HTTP 403 resolving the share link {url}: it refused "
+                "the redirect lookup. Deposit the thread's /comments/ permalink instead."
+            )
+        else:
+            detail = (
+                f"curl failed (exit {proc.returncode}"
+                f"{f', HTTP {status}' if status else ''}) resolving Reddit share link "
+                f"{url}: {stderr_text[:200]}"
+            )
+        raise SourceFetchError(detail, url=url, status_code=status)
     match = _LOCATION_HEADER_RE.search(stdout.decode("utf-8", "replace"))
     if match is None:
-        raise RuntimeError(f"Reddit share link did not redirect to a permalink: {url}")
+        raise SourceFetchError(f"Reddit share link did not redirect to a permalink: {url}", url=url)
     resolved = urljoin(url, match.group(1))  # tolerate a relative Location
     canonical = _canonicalize_reddit_permalink(resolved)
     if not _REDDIT_URL_RE.match(canonical):
-        raise RuntimeError(
-            f"Reddit share link resolved to an unexpected target, refusing to fetch: {resolved}"
+        raise SourceFetchError(
+            f"Reddit share link resolved to an unexpected target, refusing to fetch: {resolved}",
+            url=url,
         )
     return canonical
 
@@ -402,6 +424,16 @@ class RedditExtractor:
         )
 
         quality_notes: list[str] = []
+        unsettled_dropped, comment_total = _count_unsettled_below_floor(data)
+        if unsettled_dropped:
+            quality_notes.append(
+                f"REDDIT_SCORES_UNSETTLED: {unsettled_dropped} of {comment_total} comments "
+                f"came from the Arctic Shift archive before its second pass, so their "
+                f"score still reads 0 or 1, and they fell below reddit.min_comment_score "
+                f"and were left out. About 36 hours after the comments were made, run "
+                f"`particles corpus refresh` on this entry to extract them with "
+                f"settled scores."
+            )
         if len(all_qualifying) > cfg.reddit.top_comment_count:
             quality_notes.append(
                 f"REDDIT_COMMENT_LIMIT_HIT: {len(all_qualifying)} qualifying comments "
@@ -500,16 +532,32 @@ def _get_all_qualifying_comments(data: Any) -> list[dict[str, Any]]:
     frequently lives deeper in reply chains and was previously dropped.
     """
     out: list[dict[str, Any]] = []
+    min_score = get_config().reddit.min_comment_score
+    for c in _iter_comments(data):
+        body = c.get("body", "")
+        if body and body not in ("[deleted]", "[removed]"):
+            score = c.get("score", 0)
+            if score >= min_score:
+                out.append({"author": c.get("author", ""), "score": score, "body": body})
+
+    out.sort(key=lambda x: x["score"], reverse=True)
+    return out
+
+
+def _iter_comments(data: Any) -> Iterator[dict[str, Any]]:
+    """Yield every comment record in the thread, breadth-first, at any depth.
+
+    Replies are visited whether or not their parent is later kept: a
+    low-scoring parent can still have high-scoring replies worth surfacing.
+    """
     try:
         roots = data[1]["data"]["children"]
     except (IndexError, KeyError, TypeError):
-        return out
+        return
     if not isinstance(roots, list):
-        return out
+        return
 
-    min_score = get_config().reddit.min_comment_score
     queue: list[Any] = list(roots)
-
     while queue:
         node = queue.pop(0)
         if not isinstance(node, dict):
@@ -521,22 +569,101 @@ def _get_all_qualifying_comments(data: Any) -> list[dict[str, Any]]:
         c = node.get("data", {})
         if not isinstance(c, dict):
             continue
-        body = c.get("body", "")
-        if body and body not in ("[deleted]", "[removed]"):
-            score = c.get("score", 0)
-            if score >= min_score:
-                out.append({"author": c.get("author", ""), "score": score, "body": body})
-        # Enqueue replies regardless of whether this node was kept — a
-        # low-scoring parent can still have high-scoring replies worth
-        # surfacing.
+        yield c
         replies = c.get("replies")
         if isinstance(replies, dict):
             reply_children = replies.get("data", {}).get("children", [])
             if isinstance(reply_children, list):
                 queue.extend(reply_children)
 
-    out.sort(key=lambda x: x["score"], reverse=True)
-    return out
+
+# ---------------------------------------------------------------------------
+# The stored blob: assembly from the archive, and its provenance record
+# ---------------------------------------------------------------------------
+
+#: ``reddit.fetch_backend`` value that reads the Arctic Shift archive.
+ARCTIC_SHIFT_BACKEND = "arctic_shift"
+
+#: ``kind`` of the third top-level element the importer appends to a blob it
+#: assembled from the archive. Reddit's own response has two elements, and the
+#: parsers here read only ``data[0]`` and ``data[1]``, so the record rides the
+#: snapshot's own bytes without changing how the blob is read. The snapshot
+#: model has no metadata column, and adding one would need a store migration.
+FETCH_PROVENANCE_KIND = "particles_fetch_provenance"
+
+# A record the archive first captured this long after it was created carries a
+# meaningful score even without the archive's second pass. Arctic Shift makes
+# that pass about 36 hours after posting; records it imported historically were
+# captured long after the fact and may never get one.
+_SCORE_SETTLE_SECONDS = 36 * 3600
+
+
+def _assemble_reddit_listing(
+    post: dict[str, Any], comment_nodes: list[Any], provenance: dict[str, Any]
+) -> list[Any]:
+    """Build the stored blob from an archive post and its comment tree.
+
+    The first two elements are Reddit's ``{permalink}.json`` response shape (a
+    post Listing, then a comment Listing of ``t1`` nodes), so ``_get_post``,
+    ``_get_all_qualifying_comments`` and the importer's ``primary_url`` read it
+    unchanged. The third is the provenance record (``FETCH_PROVENANCE_KIND``).
+    """
+    return [
+        {"kind": "Listing", "data": {"children": [{"kind": "t3", "data": post}]}},
+        {"kind": "Listing", "data": {"children": list(comment_nodes)}},
+        {"kind": FETCH_PROVENANCE_KIND, "data": provenance},
+    ]
+
+
+def _get_fetch_provenance(data: Any) -> dict[str, Any] | None:
+    """The blob's provenance record, or None for bytes Reddit itself served."""
+    try:
+        element = data[2]
+    except (IndexError, KeyError, TypeError):
+        return None
+    if not isinstance(element, dict) or element.get("kind") != FETCH_PROVENANCE_KIND:
+        return None
+    record = element.get("data")
+    return record if isinstance(record, dict) else None
+
+
+def _is_score_settled(record: dict[str, Any]) -> bool:
+    """Whether an archived post or comment carries a score worth filtering on.
+
+    True once the archive's second pass has run (``_meta.retrieved_2nd_on``), or
+    when the first capture was already long after the record was created.
+    """
+    meta = record.get("_meta")
+    if isinstance(meta, dict) and meta.get("retrieved_2nd_on") is not None:
+        return True
+    try:
+        age = float(record["retrieved_on"]) - float(record["created_utc"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return age >= _SCORE_SETTLE_SECONDS
+
+
+def _count_unsettled_below_floor(data: Any) -> tuple[int, int]:
+    """Count archive comments whose unsettled score dropped them, and all comments.
+
+    Returns ``(dropped, total)`` over live comments (not deleted or removed).
+    ``dropped`` counts those below ``reddit.min_comment_score`` whose score the
+    archive has not settled yet. A blob Reddit served directly returns
+    ``(0, 0)``: its scores are live, and the question does not arise.
+    """
+    provenance = _get_fetch_provenance(data)
+    if provenance is None or provenance.get("backend") != ARCTIC_SHIFT_BACKEND:
+        return 0, 0
+    min_score = get_config().reddit.min_comment_score
+    dropped = total = 0
+    for c in _iter_comments(data):
+        body = c.get("body", "")
+        if not body or body in ("[deleted]", "[removed]"):
+            continue
+        total += 1
+        if c.get("score", 0) < min_score and not _is_score_settled(c):
+            dropped += 1
+    return dropped, total
 
 
 def _render_reddit_body(post: dict[str, Any]) -> str:

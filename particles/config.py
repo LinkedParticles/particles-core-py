@@ -595,6 +595,27 @@ _SHIPPED_EXTRACTION_OUTPUT_TOKENS: dict[str, int] = {
     "claude-sonnet-4-6": 5_363,
 }
 
+# Cache-read multipliers that differ from ``llm.cache_read_price_multiplier``'s
+# standard 0.1x, from the pricing page's footnotes (read 2026-10-18): cache hits
+# on claude-opus-5-5 and claude-sonnet-5-5 bill at 0.05x base input, and on
+# claude-fable-5-1 at 0.025x. Every other model uses the standard multiplier.
+_SHIPPED_CACHE_READ_MULTIPLIER: dict[str, float] = {
+    "claude-fable-5-1": 0.025,
+    "claude-opus-5-5": 0.05,
+    "claude-sonnet-5-5": 0.05,
+}
+
+# How much less output a source type's extraction calls write per character
+# than the documents ``audit.estimate_output_tokens_per_source_char`` was
+# fitted on (memory notes and design records, about 5 claims per 1,000
+# characters). A Claude Code transcript states about 1.9 per 1,000 (the
+# general extractor's transcript deltas), so 0.4. Checked against
+# the five metered consolidation nights of 2026-10-12 to 10-16 on the owner's
+# store (claude-sonnet-5-5, mostly CONVERSATION snapshots): the expected
+# output came out 1.1 to 1.9 times what the provider reported, before the
+# estimate's high end adds its spread.
+_SHIPPED_OUTPUT_SCALE_BY_SOURCE_TYPE: dict[str, float] = {"CONVERSATION": 0.4}
+
 _T = TypeVar("_T")
 
 
@@ -731,6 +752,39 @@ class LLMConfig(BaseModel):
     # at 1.25x input and a cache read at 0.1x.
     cache_write_price_multiplier: float = Field(default=1.25, ge=0.0)
     cache_read_price_multiplier: float = Field(default=0.1, ge=0.0)
+    # Per-model cache-read multipliers, keyed like ``price_per_mtok``, for the
+    # models the pricing page bills below the standard 0.1x
+    # (``_SHIPPED_CACHE_READ_MULTIPLIER``). Entries set here merge over the
+    # shipped ones; a model with no entry uses ``cache_read_price_multiplier``.
+    cache_read_price_multiplier_by_model: dict[str, float] = Field(
+        default_factory=lambda: dict(_SHIPPED_CACHE_READ_MULTIPLIER)
+    )
+
+    @field_validator("cache_read_price_multiplier_by_model", mode="before")
+    @classmethod
+    def _merge_over_shipped_cache_reads(cls, value: Any) -> Any:
+        """Operator entries replace the shipped ones key by key; the rest stay."""
+        if isinstance(value, dict):
+            return {**_SHIPPED_CACHE_READ_MULTIPLIER, **value}
+        return value
+
+    @field_validator("cache_read_price_multiplier_by_model")
+    @classmethod
+    def _non_negative_cache_reads(cls, value: dict[str, float]) -> dict[str, float]:
+        """A cache-read multiplier is a price ratio: zero or more."""
+        for key, factor in value.items():
+            if factor < 0:
+                raise ValueError(
+                    f"llm.cache_read_price_multiplier_by_model[{key!r}] must be >= 0, got {factor}"
+                )
+        return value
+
+    def cache_read_multiplier_for(self, selection: ProviderSelection) -> float:
+        """The cache-read price as a multiple of ``selection``'s input price."""
+        factor, _ = lookup_by_model(
+            self.cache_read_price_multiplier_by_model, selection.provider, selection.model
+        )
+        return self.cache_read_price_multiplier if factor is None else factor
 
     @field_validator("price_per_mtok", mode="before")
     @classmethod
@@ -936,6 +990,14 @@ class ExtractionConfig(BaseModel):
     # alone. On a short source it rivals the source itself. Read by the audit
     # estimate and the memory-rot benchmark.
     estimate_prompt_overhead_tokens: int = Field(default=2500, ge=0)
+    # The part of that system prompt sent as a prompt-cache prefix,
+    # which a batch of extraction calls writes once and then reads at the
+    # model's cache-read price (``llm.cache_read_price_multiplier_by_model``).
+    # The consolidation estimate adds it per call on top of the overhead above;
+    # with ``llm.prompt_cache.enabled`` off it is priced as plain input.
+    # Measured: claude-sonnet-5-5 wrote a 2,868-token prefix on each of the
+    # metered nights of 2026-10-12 to 10-16.
+    estimate_cached_prefix_tokens: int = Field(default=2900, ge=0)
     # The bulk extraction paths skip an unextracted snapshot of a MUTABLE
     # entry once a newer extractable snapshot of the same entry exists: the
     # generation cascade would retire the older generation's beliefs anyway,
@@ -1633,6 +1695,15 @@ class UtilityMiningConfig(BaseModel):
     behavioural_matching: bool = True
     max_behavioural_calls: int = Field(default=150, ge=0)
     behavioural_candidate_limit: int = Field(default=200, ge=0)
+    # Characters per input token the consolidation estimate prices a judge
+    # prompt at. The prompt is mostly tool-call lines (paths, ids, shell
+    # commands), which tokenize denser than prose: on the metered nights of
+    # 2026-10-12 to 10-16, claude-sonnet-5-5 billed 3,560 to 4,240 input
+    # tokens a call for prompts of about 9,100 characters (the action
+    # evidence is capped, so the size holds night to night), 2.1 to 2.6
+    # characters a token. The lower figure keeps the estimate above the bill.
+    # The estimate uses the smaller of this and the model's own factor.
+    estimate_chars_per_token: float = Field(default=2.1, gt=0.0)
 
 
 class UtilityConfig(BaseModel):
@@ -2091,6 +2162,21 @@ class RedditConfig(BaseModel):
     top_comment_count: int = 200
     # Raised 500→1000 for parity with the gist comment body limit.
     comment_body_limit: int = 1000
+    # Where the importer fetches a thread's post and comment tree from. Reddit
+    # bot-walls its own ``.json`` endpoint for unauthenticated clients (403), so
+    # the default reads the Arctic Shift archive, a free third-party mirror that
+    # serves Reddit's own field names. ``reddit`` keeps the direct curl fetch for
+    # an operator whose network can still reach it. The share-link redirect is
+    # always resolved through reddit.com, whichever backend is chosen.
+    fetch_backend: Literal["arctic_shift", "reddit"] = "arctic_shift"
+    # Base URL of the Arctic Shift API host (no trailing path).
+    arctic_shift_base_url: str = "https://arctic-shift.photon-reddit.com"
+    # ``limit`` passed to the archive's comment-tree endpoint: the most comments
+    # one deposit pulls. The extractor still sends only ``top_comment_count``.
+    arctic_shift_comment_limit: int = Field(default=25000, ge=1)
+    # Longest wait honoured on an HTTP 429 before the one retry. A reset further
+    # away than this fails the deposit at once instead of stalling it.
+    arctic_shift_max_wait_seconds: float = Field(default=30.0, ge=0.0)
 
 
 class HackerNewsConfig(BaseModel):
@@ -2222,6 +2308,19 @@ class QueryConfig(BaseModel):
     # default follows the leakage measurement recorded in
     # docs/benchmarks/leakage.md.
     grounded_answers: bool = False
+    # Keep each store's ACTIVE candidates decoded in memory between reads,
+    # re-reading only the rows the store's change journal names as changed
+    # (particles/store/candidate_cache.py). Semantic query, extraction, the
+    # write-time reconciliation seam and the maintenance passes read through
+    # it. Results are identical either way; off reads and decodes every
+    # candidate on every read. The cache holds one decoded row per ACTIVE
+    # belief for the life of the process.
+    candidate_cache: bool = True
+    # After a full build of a cache this many rows or larger, exempt the
+    # process's live objects from Python's cyclic garbage collector
+    # (gc.freeze), which otherwise walks the whole cache on most queries
+    # (about 0.3 s at 56k rows). Process-wide; 0 never freezes.
+    candidate_cache_freeze_rows: int = Field(default=10_000, ge=0)
 
 
 class ContestednessConfig(BaseModel):
@@ -3224,6 +3323,36 @@ class AuditConfig(BaseModel):
     estimate_verify_output_tokens: int = Field(default=1024, ge=0)
     # Wall time per second reading: the measured runs read 22 flags in ~41 s.
     estimate_seconds_per_verification: float = Field(default=2.0, ge=0.0)
+
+    # Multiplies the per-character output rate above for a source type that
+    # states fewer (or more) claims per character than the documents it was
+    # fitted on, keyed by corpus-entry source type (``CONVERSATION``). The
+    # per-call base is unchanged. Read by the consolidation estimate, which
+    # knows each snapshot's source type. Ships with a measured entry for
+    # transcripts (``_SHIPPED_OUTPUT_SCALE_BY_SOURCE_TYPE``); operator entries
+    # merge over it key by key, and a type with no entry is scaled by 1.
+    estimate_output_scale_by_source_type: dict[str, float] = Field(
+        default_factory=lambda: dict(_SHIPPED_OUTPUT_SCALE_BY_SOURCE_TYPE)
+    )
+
+    @field_validator("estimate_output_scale_by_source_type", mode="before")
+    @classmethod
+    def _merge_over_shipped_type_scales(cls, value: Any) -> Any:
+        """Operator entries replace the shipped ones key by key; the rest stay."""
+        if isinstance(value, dict):
+            return {**_SHIPPED_OUTPUT_SCALE_BY_SOURCE_TYPE, **value}
+        return value
+
+    @field_validator("estimate_output_scale_by_source_type")
+    @classmethod
+    def _non_negative_type_scale(cls, value: dict[str, float]) -> dict[str, float]:
+        """Every per-type output scale is a multiplier: zero or more."""
+        for key, scale in value.items():
+            if scale < 0:
+                raise ValueError(
+                    f"audit.estimate_output_scale_by_source_type[{key!r}] must be >= 0, got {scale}"
+                )
+        return value
 
     @field_validator("estimate_output_scale_by_model", mode="before")
     @classmethod

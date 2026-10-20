@@ -24,12 +24,19 @@ A transition is one of three kinds:
   and *autonomous* otherwise: the trust ladder, update supersession,
   duplicate merge, re-anchor, staleness, abstraction revalidation.
 - ``contradiction_closed``: an INCONSISTENCY record closed, by a review
-  (gesture) or by the nightly disclosure pass (autonomous).
+  (gesture) or by a nightly pass (autonomous): the disclosure pass
+  or the held-claim release.
 - ``promotion``: an abstraction asserted, by the accept gesture or
   by the pass itself in ``auto`` mode.
 
 A gesture is an explicit write verb, whether an operator or an agent ran it;
 ``gesture_by_actor`` keeps the two apart for a reader who needs them apart.
+
+An autonomous closure is also tallied by its cause, and by whether it
+returned a held claim to the store (:func:`tally_closures`). Most causes
+release nothing: a lapsed or regrouped census record held no claim. A
+withdrawn extraction record and a partner-retired one each restore the
+claim the record held, and that release is the one no person approved.
 
 Pure: the Engine gathers plain values and this module decides the tally.
 Nothing here is stored on a particle; the result rides the
@@ -39,8 +46,9 @@ Nothing here is stored on a particle; the result rides the
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 #: Event types whose PARTICLE refs name the beliefs an explicit write retired.
 GESTURE_RETIREMENT_EVENTS: frozenset[str] = frozenset(
@@ -54,6 +62,10 @@ TRANSITION_KINDS: tuple[str, ...] = ("retirement", "contradiction_closed", "prom
 
 #: The reason key for a retired row that carries no ``status_reason``.
 UNSPECIFIED_REASON = "UNSPECIFIED"
+
+#: The ``INCONSISTENCY_CLOSED`` payload keys that name the claim a close
+#: returned to the store: a minted successor, or the ACTIVE twin it folded into.
+RELEASE_KEYS: tuple[str, ...] = ("successor", "folded_into")
 
 
 @dataclass(frozen=True)
@@ -71,6 +83,51 @@ class GestureEvent:
     event_type: str
     actor: str
     particle_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class Closure:
+    """One autonomous ``INCONSISTENCY_CLOSED`` event, reduced to what the tally reads."""
+
+    cause: str
+    #: Whether the close returned a held claim to the store.
+    released: bool = False
+
+
+def closure_from_payload(payload: Mapping[str, Any] | None) -> Closure:
+    """Read one close event's cause and whether it released a held claim."""
+    data = payload or {}
+    cause = data.get("cause")
+    return Closure(
+        cause=cause if isinstance(cause, str) and cause else UNSPECIFIED_REASON,
+        released=any(data.get(key) for key in RELEASE_KEYS),
+    )
+
+
+@dataclass(frozen=True)
+class ClosureTally:
+    """Autonomous closures by cause, and the held-claim releases among them."""
+
+    closed_by_cause: dict[str, int] = field(default_factory=dict)
+    released_by_cause: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def closed(self) -> int:
+        return sum(self.closed_by_cause.values())
+
+    @property
+    def released(self) -> int:
+        return sum(self.released_by_cause.values())
+
+
+def tally_closures(closures: Sequence[Closure]) -> ClosureTally:
+    """Count closures and held-claim releases per cause, causes sorted."""
+    closed = Counter(c.cause for c in closures)
+    released = Counter(c.cause for c in closures if c.released)
+    return ClosureTally(
+        closed_by_cause=dict(sorted(closed.items())),
+        released_by_cause=dict(sorted(released.items())),
+    )
 
 
 @dataclass(frozen=True)

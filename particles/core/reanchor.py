@@ -27,6 +27,7 @@ from enum import StrEnum
 from typing import Any
 
 from particles.core.schema import (
+    SCHEMA_VERSION,
     CanonicalForm,
     ContributorRef,
     Particle,
@@ -319,7 +320,9 @@ def build_restatement(
     two stored values with that claim's calibration fields: a conjunction is
     no more credible than its weaker part. ``calibration_source`` is never
     ``DERIVED``: the read path discounts a derived claim whose premise is not
-    ACTIVE, and the retired claim never is.
+    ACTIVE, and the retired claim never is. It is stamped with this SDK's
+    ``schema_version``, never the original's: the stamp promises the fields a
+    record carries, and this SDK writes only the fields it knows (D2).
     """
     weaker = retired if retired.confidence.value < original.confidence.value else original
     sources = [r for r in original.provenance if r.type is ProvenanceRefType.SOURCE]
@@ -336,6 +339,7 @@ def build_restatement(
     return original.model_copy(
         update={
             "id": str(uuid.uuid4()),
+            "schema_version": SCHEMA_VERSION,
             "content": content,
             "confidence": weaker.confidence,
             "provenance": [*sources, premise],

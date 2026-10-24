@@ -9,6 +9,7 @@ Store-free: this file rides the Client distribution's tests too.
 
 from __future__ import annotations
 
+import gc
 import socket
 from collections.abc import Iterator
 from typing import Any
@@ -125,6 +126,28 @@ class TestChecks:
         assert egress.allows("example.org", 443)
         _set_network(monkeypatch, NetworkConfig(egress="none"))
         assert not egress.allows("example.org", 443)
+
+    def test_a_fresh_config_is_never_served_a_released_ones_policy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Each round releases the previous config before building the next, so
+        # CPython tends to allocate the new one at the freed address. A cache
+        # keyed on ``id()`` then serves the released config's policy (a CI
+        # flake, 2026-10-22). The swaps bypass monkeypatch, which would hold
+        # every replaced value alive; one monkeypatch call up front restores
+        # the original.
+        cfg = get_config()
+        original = cfg.network
+        _set_network(monkeypatch, original)
+        for i in range(50):
+            cfg.network = original
+            gc.collect()
+            posture = "none" if i % 2 else "open"
+            cfg.network = NetworkConfig(egress=posture)
+            assert egress.current_policy().posture == posture
+        cached = egress._policy_cache
+        assert cached is not None
+        assert cached[0] is get_config().network
 
 
 @pytest.fixture

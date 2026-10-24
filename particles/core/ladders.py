@@ -31,7 +31,10 @@ shell passes in, so a prompt edit changes the stamp every verdict carries.
 ``semantic_lint``) and ``update_slot_second`` (model, ``verification``,
 confirmation on ``CHANGES``).
 
-**The duplicate ladder**: the ``duplicate_judge`` model rung.
+**The duplicate ladder**: the ``duplicate_judge`` model rung. The
+restatement ladder of a re-extracted ``MUTABLE`` source asks the
+same question with the local ``duplicate_key`` rung (``SAME`` under the §6.10
+key) before it; the judge's ``SAME`` carries nothing until it is admitted.
 
 **The candidate ladder** (the abstraction gate):
 ``population_quantifier`` (pure, ``NOT_ENTAILED`` on a kind-ranging
@@ -60,6 +63,7 @@ from particles.core.schema import Particle, is_truth_apt
 __all__ = [
     "ADJUDICABILITY",
     "DUPLICATE_KEY",
+    "RESTATEMENT_KEY",
     "GENERIC_GUARD",
     "POPULATION_QUANTIFIER",
     "CandidateInput",
@@ -70,6 +74,7 @@ __all__ = [
     "contradiction_ladder",
     "duplicate_key_rung",
     "duplicate_ladder",
+    "restatement_ladder",
     "update_ladder",
 ]
 
@@ -137,7 +142,9 @@ def duplicate_key_rung(
             same = forms.of(a) == forms.of(b)
         return ContradictionVerdict.NO if same else ContradictionVerdict.ABSTAIN
 
-    return Rung(name="duplicate_key", version="1", cost=CostClass.LOCAL, decide=decide)
+    # Version 2: the key folds typographic variants, so its verdicts
+    # are a new record set in the probe ledger rather than a continuation of 1's.
+    return Rung(name="duplicate_key", version="2", cost=CostClass.LOCAL, decide=decide)
 
 
 #: Neither claim is a truth-apt claim, so there is no shared truth to contradict.
@@ -214,6 +221,38 @@ def duplicate_ladder(version: str) -> Ladder[TextPair, DuplicateVerdict]:
         kind=QuestionKind.DUPLICATE,
         abstain=DuplicateVerdict.ABSTAIN,
         rungs=(Rung(name="duplicate_judge", version=version, cost=CostClass.MODEL),),
+    )
+
+
+def _same_key(pair: TextPair) -> DuplicateVerdict:
+    a, b = pair
+    same = normalize_content(a) == normalize_content(b)
+    return DuplicateVerdict.SAME if same else DuplicateVerdict.ABSTAIN
+
+
+#: ``SAME`` when the two texts are one sentence under the §6.10 key, whatever
+#: their subjects: own predicate, admitted from the start.
+RESTATEMENT_KEY: Rung[TextPair, DuplicateVerdict] = Rung(
+    name="duplicate_key", version="2", cost=CostClass.LOCAL, decide=_same_key
+)
+
+
+def restatement_ladder(judge_version: str) -> Ladder[TextPair, DuplicateVerdict]:
+    """The duplicate ladder a re-extracted ``MUTABLE`` source asks of each pair.
+
+    The key rung, then the equivalence judge. The judge is a model
+    rung, which is never run in shadow, so its admission period is
+    held at the write instead (``generation.restatement.judge_admitted``): until
+    the owner admits the judge, its ``SAME`` is recorded and counted and carries
+    nothing.
+    """
+    return Ladder(
+        kind=QuestionKind.DUPLICATE,
+        abstain=DuplicateVerdict.ABSTAIN,
+        rungs=(
+            RESTATEMENT_KEY,
+            Rung(name="duplicate_judge", version=judge_version, cost=CostClass.MODEL),
+        ),
     )
 
 

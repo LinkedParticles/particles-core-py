@@ -61,10 +61,11 @@ lives here, in exactly one place.
 
 from __future__ import annotations
 
+import heapq
 import math
 import re
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -438,3 +439,246 @@ def sweep_rank_lift(
         configured_rank_lift=configured_rank_lift,
         scored=len(rows),
     )
+
+
+# ---------------------------------------------------------------------------
+# The rank-lift monitor
+# ---------------------------------------------------------------------------
+#
+# The sweep above needs an operator to name its targets, so nothing runs it
+# unattended. The monitor checks the thesis the targets stood for instead:
+# beliefs the agent keeps applying *outside* the head reach the head (the floor),
+# and the head keeps room for beliefs that have not earned use yet (the ceiling,
+# the exposure loop). Which beliefs form that cohort is an Engine read
+# (utility events against the start-context record); everything below
+# is pure, and it judges a static scalar without contributing to any rank, so
+# the locality invariant does not apply to it.
+
+#: The cohort size for the retention figure: the top beliefs by total ``R``,
+#: reported beside the verdict and never part of it.
+RETENTION_COHORT = 10
+
+#: Verdicts that are out of band, the ones a transition alert can be raised on.
+OUT_OF_BAND: frozenset[str] = frozenset({"below_floor", "above_ceiling", "no_band"})
+
+
+@dataclass(frozen=True)
+class MonitorThresholds:
+    """The monitor's three report thresholds (``utility.monitor``)."""
+
+    capture: float = 0.75
+    min_cohort: int = 3
+    entry_share: float = 0.25
+
+
+class LiftRanker:
+    """Ranks one view at any ``λ`` with the digest's ``(-score, id)`` order, cheaply.
+
+    Only beliefs with ``R > 0`` move as ``λ`` changes; the rest keep one fixed
+    order. Sorting the moving set per ``λ`` and merging it with the fixed one is
+    the same ordering :func:`sweep_rank_lift` produces, at a cost proportional to
+    the moving set (finding 8).
+    """
+
+    def __init__(self, rows: Sequence[SweepRow]) -> None:
+        self._fixed = sorted(
+            (r for r in rows if r.reinforcement <= 0.0),
+            key=lambda r: (-r.effective_confidence, r.particle_id),
+        )
+        self._moving = [r for r in rows if r.reinforcement > 0.0]
+        self._unit = {r.particle_id: math.log1p(r.reinforcement) for r in self._moving}
+
+    def _scored(self, lam: float) -> list[tuple[float, str, SweepRow]]:
+        moving = [
+            (-(r.effective_confidence + lam * self._unit[r.particle_id]), r.particle_id, r)
+            for r in self._moving
+        ]
+        moving.sort(key=lambda t: (t[0], t[1]))
+        return moving
+
+    def ordered(self, lam: float, limit: int | None = None) -> list[SweepRow]:
+        """The view's beliefs in rendered order at ``lam``; at most ``limit`` of them."""
+        fixed = ((-r.effective_confidence, r.particle_id, r) for r in self._fixed)
+        out: list[SweepRow] = []
+        for _score, _pid, row in heapq.merge(self._scored(lam), fixed, key=lambda t: (t[0], t[1])):
+            out.append(row)
+            if limit is not None and len(out) >= limit:
+                break
+        return out
+
+
+@dataclass(frozen=True)
+class MonitorHead:
+    """The monitor's reading of one rendered head of ``head_size`` beliefs in one view.
+
+    Attributes:
+        head_size: The surface's ``N``.
+        verdict: ``in_band`` | ``below_floor`` | ``above_ceiling`` | ``no_band`` |
+            ``cold``. ``cold`` carries no judgement (the cohort is too small).
+        cohort_size: Cohort beliefs in this view.
+        captured: Cohort beliefs inside the head at the configured ``λ``.
+        entry_share: Share of head slots held by beliefs with ``R = 0`` at the
+            configured ``λ``.
+        floor: The grid band where the capture criterion holds.
+        ceiling: The grid band where the entry-share criterion holds.
+        band: The grid band where both hold.
+        retained: Of the top :data:`RETENTION_COHORT` beliefs by total ``R``, how
+            many the head holds at the configured ``λ``. Reported, never judged:
+            most of that credit was earned through the head itself.
+        retention_size: How many beliefs that retention cohort has.
+        distinct_contents: Distinct content keys in the head at the configured
+            ``λ`` (the diversity figure, a duplicate-mass signal).
+    """
+
+    head_size: int
+    verdict: str
+    cohort_size: int
+    captured: int
+    entry_share: float
+    floor: RankLiftBand
+    ceiling: RankLiftBand
+    band: RankLiftBand
+    retained: int
+    retention_size: int
+    distinct_contents: int
+
+
+def evaluate_rank_lift_monitor(
+    rows: Sequence[SweepRow],
+    *,
+    cohort_ids: Collection[str],
+    grid: Sequence[float],
+    head_sizes: Sequence[int],
+    configured_rank_lift: float,
+    thresholds: MonitorThresholds,
+) -> tuple[MonitorHead, ...]:
+    """Judge the configured ``λ`` for one view at each head size (§3).
+
+    Pure. ``rows`` are the view's beliefs; ``cohort_ids`` the off-head cohort the
+    Engine selected (ids outside ``rows`` are ignored, so one store-wide cohort
+    serves every view). Every grid point is evaluated and each criterion is
+    reduced to a band the way :func:`sweep_rank_lift` reduces its own, with
+    contiguity reported rather than assumed. The verdict reads the configured
+    value itself, not the nearest grid point.
+    """
+    sizes = tuple(dict.fromkeys(int(n) for n in head_sizes if n > 0))
+    present = {r.particle_id for r in rows}
+    cohort = frozenset(pid for pid in cohort_ids if pid in present)
+    retention = frozenset(
+        r.particle_id
+        for r in sorted(
+            (r for r in rows if r.reinforcement > 0.0),
+            key=lambda r: (-r.reinforcement, r.particle_id),
+        )[:RETENTION_COHORT]
+    )
+    ranker = LiftRanker(rows)
+    widest = max(sizes, default=0)
+
+    def reading(lam: float) -> list[SweepRow]:
+        return ranker.ordered(lam, widest)
+
+    per_grid = [reading(lam) for lam in grid]
+    at_configured = reading(configured_rank_lift)
+    heads: list[MonitorHead] = []
+    for n in sizes:
+        effective_n = min(n, len(rows))
+
+        def capture_ok(head: Sequence[SweepRow]) -> bool:
+            held = sum(1 for r in head if r.particle_id in cohort)
+            return bool(cohort) and held >= thresholds.capture * len(cohort) - 1e-12
+
+        def entry_ok(head: Sequence[SweepRow], size: int = effective_n) -> bool:
+            if size == 0:
+                return True
+            return sum(1 for r in head if r.reinforcement <= 0.0) >= (
+                thresholds.entry_share * size - 1e-12
+            )
+
+        floor_mask = [capture_ok(h[:n]) for h in per_grid]
+        ceiling_mask = [entry_ok(h[:n]) for h in per_grid]
+        floor = _band(list(grid), floor_mask)
+        ceiling = _band(list(grid), ceiling_mask)
+        band = _band(list(grid), [a and b for a, b in zip(floor_mask, ceiling_mask, strict=True)])
+
+        head = at_configured[:n]
+        captured = sum(1 for r in head if r.particle_id in cohort)
+        empty_slots = sum(1 for r in head if r.reinforcement <= 0.0)
+        share = empty_slots / effective_n if effective_n else 1.0
+        if len(cohort) < thresholds.min_cohort:
+            verdict = "cold"
+        elif capture_ok(head) and entry_ok(head):
+            verdict = "in_band"
+        elif band.empty:
+            verdict = "no_band"
+        elif not capture_ok(head):
+            verdict = "below_floor"
+        else:
+            verdict = "above_ceiling"
+        heads.append(
+            MonitorHead(
+                head_size=n,
+                verdict=verdict,
+                cohort_size=len(cohort),
+                captured=captured,
+                entry_share=round(share, 4),
+                floor=floor,
+                ceiling=ceiling,
+                band=band,
+                retained=sum(1 for r in head if r.particle_id in retention),
+                retention_size=len(retention),
+                distinct_contents=len({r.content_key for r in head}),
+            )
+        )
+    return tuple(heads)
+
+
+def plan_alert(
+    current: Mapping[str, str],
+    previous: Mapping[str, str] | None,
+    previous_alert: str | None,
+    new_alert: str,
+) -> str | None:
+    """Whether this run raises, carries or clears the monitor's alert.
+
+    ``current`` and ``previous`` map a reading (one view at one head size) to its
+    verdict. An alert is new only when some reading moves to an out-of-band
+    verdict it did not have last run; it is carried while any reading stays out
+    of band; and it clears when none is. With no previous run to compare against
+    (the first run after activation) nothing is raised: a standing verdict known
+    at activation is in the activation report, and a card about it would be one
+    nobody can act on yet.
+    """
+    if previous is None:
+        return None
+    if any(v in OUT_OF_BAND and previous.get(k) != v for k, v in current.items()):
+        return new_alert
+    if previous_alert is not None and any(v in OUT_OF_BAND for v in current.values()):
+        return previous_alert
+    return None
+
+
+def target_transitions(
+    current: Mapping[str, Collection[int]],
+    previous: Mapping[str, Collection[int]] | None,
+    head_sizes: Collection[int],
+) -> list[tuple[str, int, str]]:
+    """Named targets that entered or left a head since the last run.
+
+    ``current`` / ``previous`` map a target id to the head sizes it sits inside.
+    Returns ``(target, head_size, "entered" | "left")`` in target, then head
+    order. A target the previous run did not report is compared against nothing
+    and yields no transition.
+    """
+    if previous is None:
+        return []
+    out: list[tuple[str, int, str]] = []
+    for pid in sorted(current):
+        if pid not in previous:
+            continue
+        now, then = set(current[pid]), set(previous[pid])
+        for n in sorted(head_sizes):
+            if n in now and n not in then:
+                out.append((pid, n, "entered"))
+            elif n in then and n not in now:
+                out.append((pid, n, "left"))
+    return out

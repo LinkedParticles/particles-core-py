@@ -100,6 +100,42 @@ async def test_concurrent_groups_merge_into_one_dispatch(
 
 
 @pytest.mark.asyncio
+async def test_each_parked_caller_observes_the_merged_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The merged call reports what it sent to every caller in it.
+
+    The dispatch runs in a task none of the callers runs, so without the
+    parked group carrying its caller's observations no caller would see it.
+    """
+    from particles.llm.usage import observe_sampling, purpose_scope, record_usage
+
+    async def fake(
+        purpose: str, requests: list[CompletionRequest], **kwargs: Any
+    ) -> tuple[list[str | None], str]:
+        with purpose_scope(purpose, temperature_requested=True):
+            for _ in requests:
+                record_usage("anthropic:test-model", temperature_sent=False)
+        return [f"reply:{r.prompt}" for r in requests], "anthropic:test-model"
+
+    monkeypatch.setattr(pool_mod, "complete_many_with_provider_model", fake)
+    pool = CompletionPool("extraction", expected_participants=2)
+
+    async def worker(prefix: str) -> str | None:
+        async with pool.participant():
+            with observe_sampling() as seen:
+                await pool.complete_group(_requests(prefix, 2), max_tokens=64, temperature=0.0)
+            return seen.value()
+
+    assert await asyncio.gather(worker("a"), worker("b")) == ["dropped", "dropped"]
+
+    # A caller outside any observation block is unaffected.
+    solo = CompletionPool("extraction", expected_participants=1)
+    async with solo.participant():
+        assert (await solo.complete_group(_requests("c", 1), max_tokens=64))[0] == ["reply:c 0"]
+
+
+@pytest.mark.asyncio
 async def test_dispatch_waits_for_the_unparked_participant(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

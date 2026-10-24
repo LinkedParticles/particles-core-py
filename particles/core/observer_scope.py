@@ -33,6 +33,14 @@ from enum import StrEnum
 #: harness adapter that stamps it decides what it names.
 PROJECT_TAG_PREFIX = "project:"
 
+#: The compiled-in tag that makes an entry *unattributed* whatever
+#: ``observer_scope.harness_tags`` says: agent material that no
+#: project key was stamped on. A code constant rather than config, so no
+#: ``config.yaml`` can leave it out. A project key still outranks it, and it
+#: stays on an entry that gains one, as the record that the entry began as an
+#: agent write.
+UNATTRIBUTED_MARKER = "scope:unattributed"
+
 
 def project_tag(key: str) -> str:
     """The corpus-entry tag that records ``key``."""
@@ -59,21 +67,23 @@ class EntryScope(StrEnum):
     """Keyless and not harness-harvested: a hand deposit, a web page, a
     user-level rule file. Its claims are in view for every observer."""
     UNATTRIBUTED = "unattributed"
-    """Harness-harvested but keyless. The fail-closed class: a stamping gap
-    must not make a harness's deposits visible everywhere by accident."""
+    """Harness-harvested, or marked ``scope:unattributed``, but keyless. The
+    fail-closed class: a stamping gap must not make a harness's or an agent's
+    deposits visible everywhere by accident."""
 
 
 def classify_entry(tags: Iterable[str] | None, harness_tags: Collection[str]) -> EntryScope:
     """Classify one corpus entry from its tags.
 
     ``harness_tags`` are the tags a harness adapter puts on everything it
-    harvests (``observer_scope.harness_tags``). Keyed wins over both other
-    classes: an entry with a key is attributed, whoever deposited it.
+    harvests (``observer_scope.harness_tags``). :data:`UNATTRIBUTED_MARKER`
+    counts as one whatever that list says. Keyed wins over both other classes:
+    an entry with a key is attributed, whoever deposited it.
     """
     tag_list = list(tags or ())
     if project_keys(tag_list):
         return EntryScope.KEYED
-    if any(tag in harness_tags for tag in tag_list):
+    if UNATTRIBUTED_MARKER in tag_list or any(tag in harness_tags for tag in tag_list):
         return EntryScope.UNATTRIBUTED
     return EntryScope.GLOBAL
 
@@ -93,14 +103,25 @@ class BeliefScope:
     lapsed: bool = False
     """Some source once stated the belief and none currently does. Only
     meaningful when the scope is neither global nor keyed."""
+    widened: bool = False
+    """An operator's standing statement that this belief applies everywhere
+    (``memory widen``). Read in the shared join, so the lens and the write
+    gate see it alike; the other fields keep the belief's own
+    reading. A widening belongs to one belief: it is not pooled by
+    :func:`join` and not inherited by :func:`meet`."""
+
+    @property
+    def everywhere(self) -> bool:
+        """In view for every observer: global by its sources, or widened."""
+        return self.is_global or self.widened
 
     @property
     def unattributed(self) -> bool:
-        return not self.is_global and not self.keys and not self.lapsed
+        return not self.everywhere and not self.keys and not self.lapsed
 
     @property
     def in_view_for_no_project(self) -> bool:
-        return not self.is_global and not self.keys
+        return not self.everywhere and not self.keys
 
 
 GLOBAL_SCOPE = BeliefScope(is_global=True)
@@ -184,11 +205,12 @@ def visible(scope: BeliefScope, observer_project: str | None, *, widened: bool =
     No observer project is the store-wide view, for which everything is in
     view — the neutrality rule that keeps every unscoped read byte-identical.
     ``widened`` is an operator's standing judgement that the belief applies
-    everywhere; it lives in lens-side policy, never on the claim.
+    everywhere; it lives in lens-side policy, never on the claim. A scope read
+    through the join carries it as ``scope.widened``.
     """
     if observer_project is None:
         return True
-    return widened or scope.is_global or observer_project in scope.keys
+    return widened or scope.everywhere or observer_project in scope.keys
 
 
 def share_an_observer(a: BeliefScope, b: BeliefScope) -> bool:
@@ -200,7 +222,7 @@ def share_an_observer(a: BeliefScope, b: BeliefScope) -> bool:
     stamping gap, which must not switch disclosure off, exactly as it does not
     switch reconciliation off. Otherwise the two key sets must meet.
     """
-    if a.is_global or b.is_global:
+    if a.everywhere or b.everywhere:
         return True
     if a.unattributed or b.unattributed:
         return True
@@ -213,7 +235,8 @@ def same_scope(a: BeliefScope, b: BeliefScope) -> bool:
     A ``CO_EVIDENTIAL`` edge unions the two groups' sources, so it leaves both
     scopes unchanged only when they are already equal. Visibility is not
     enough: a project's belief linked to a global one becomes global. Lapsed
-    and unattributed are distinct readings and only equal themselves.
+    and unattributed are distinct readings and only equal themselves. A
+    widening is not compared: an edge does not pool it.
     """
     if a.is_global or b.is_global:
         return a.is_global and b.is_global
@@ -225,10 +248,12 @@ def same_scope(a: BeliefScope, b: BeliefScope) -> bool:
 def describe_scope(scope: BeliefScope) -> str:
     """A short operator-facing reading of a scope, for refusals and reports."""
     if scope.is_global:
-        return "global"
-    if scope.keys:
-        return "project " + ", ".join(sorted(scope.keys))
-    return "lapsed" if scope.lapsed else "unattributed"
+        own = "global"
+    elif scope.keys:
+        own = "project " + ", ".join(sorted(scope.keys))
+    else:
+        own = "lapsed" if scope.lapsed else "unattributed"
+    return f"{own}, widened to every project" if scope.widened else own
 
 
 class PairPrecondition(StrEnum):
@@ -252,11 +277,13 @@ def pair_precondition(candidate: BeliefScope, existing: BeliefScope) -> PairPrec
     A global candidate (an operator's own deposit) and an unattributed one (a
     stamping gap, which must not switch reconciliation off) pair as today. An
     existing claim that is unattributed or lapsed has no observer to protect,
-    so the subset holds trivially.
+    so the subset holds trivially. A widened claim is in view everywhere, so a
+    project's update against it is reviewed exactly as one against a global
+    claim is.
     """
-    if candidate.is_global or not candidate.keys:
+    if candidate.everywhere or not candidate.keys:
         return PairPrecondition.RECONCILE
-    if existing.is_global:
+    if existing.everywhere:
         return PairPrecondition.REVIEW
     if existing.keys <= candidate.keys:
         return PairPrecondition.RECONCILE

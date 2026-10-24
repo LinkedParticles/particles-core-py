@@ -27,6 +27,14 @@ format. Three load-bearing rules:
   to ``artifacts/schemas/context.jsonld``, decoupling the wire format from the
   SDK's snake_case. YAML-LD (deferred) is the same data model.
 
+A unit's ``schemaVersion`` names the contract its record satisfies (
+D6). ``from_unit`` accepts a unit of a compatible version (same nonzero
+major), drops and reports the keys it does not know, and stamps the decoded
+particle with the lower of the unit's version and the SDK's; it rejects a unit
+of an incompatible version with :class:`IncompatibleSchemaVersionError`.
+``to_unit`` stamps each unit with the lower of the row's version and the
+SDK's, so an SDK older than a row never claims fields it cannot carry.
+
 This module is store-free: ``to_unit`` takes the particle's subjects from the
 caller (which resolved them from a session); the store-aware export/import
 wrappers live above it.
@@ -38,6 +46,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from particles.core import schema as _core_schema
 from particles.core.jsonld_context import CONTEXT_URL as _CONTEXT_URL
 from particles.core.schema import (
     AssertionModality,
@@ -56,6 +65,11 @@ from particles.core.schema import (
     TermKind,
     UncertaintyNature,
     ValidKind,
+)
+from particles.core.schema_version import (
+    SchemaCompatibility,
+    lower_schema_version,
+    schema_compatibility,
 )
 from particles.core.scoring.confidence import CalibrationSource
 from particles.core.status import Status, StatusReason
@@ -78,6 +92,118 @@ _LEGACY_PROPERTIES_KEYS = {
 #: in ``core`` so the vocabulary codec, which store and ingest read, can name it
 #: without importing this package.
 CONTEXT_URL = _CONTEXT_URL
+
+
+#: The envelope every particle unit carries: the JSON-LD framing, the two
+#: version stamps, and the origin id (§7).
+PARTICLE_UNIT_ENVELOPE_KEYS: frozenset[str] = frozenset(
+    {"@context", "@type", "formatVersion", "schemaVersion", "sourceParticleId"}
+)
+
+#: The substrate keys :func:`from_unit` decodes. This is the only list of them:
+#: ``from_unit`` reads a unit through a view restricted to
+#: :data:`PARTICLE_UNIT_KEYS`, so a key it starts reading without being listed
+#: here decodes as absent and the round-trip tests fail, rather than the
+#: unknown-key report drifting from what the importer actually reads
+#: (D6). ``tests/test_interchange.py`` also pins this set to
+#: ``ParticleUnit`` in ``artifacts/schemas/interchange.schema.json``.
+PARTICLE_UNIT_SUBSTRATE_KEYS: frozenset[str] = frozenset(
+    {
+        "particleType",
+        "assertionModality",
+        "canonicalForm",
+        "content",
+        "confidenceValue",
+        "calibrationSource",
+        "uncertaintyNature",
+        "assertedBy",
+        "assertedAt",
+        "status",
+        "provenance",
+        "subjects",
+        "variance",
+        "calibrationMethod",
+        "calibrationRef",
+        "statusReason",
+        "uncertaintyKind",
+        "validUntil",
+        "validFrom",
+        "validKind",
+        "supersedes",
+        "basis",
+        "extractorRef",
+        "extractionProviderModel",
+        "sequenceContext",
+        "tags",
+        "contextFingerprint",
+        "properties",
+        "contributors",
+        "structuredClaim",
+    }
+)
+
+#: Every top-level key this SDK knows on a particle unit. Any other key is
+#: dropped on import and counted in the import report (D6).
+PARTICLE_UNIT_KEYS: frozenset[str] = PARTICLE_UNIT_ENVELOPE_KEYS | PARTICLE_UNIT_SUBSTRATE_KEYS
+
+
+class IncompatibleSchemaVersionError(ValueError):
+    """A unit or bundle is stamped with a version this SDK cannot read (D6).
+
+    Raised for another major, major ``0``, or a stamp that does not parse as
+    ``MAJOR.MINOR.PATCH``. A different minor of the same major is compatible
+    and never raises. ``compatibility`` says which case it is, so a caller can
+    word the remedy.
+    """
+
+    def __init__(self, what: str, stamp: object, current: str, compatibility: str) -> None:
+        self.what = what
+        self.stamp = stamp
+        self.current = current
+        self.compatibility = compatibility
+        super().__init__(self._format_message())
+
+    def _format_message(self) -> str:
+        head = (
+            f"{self.what} schemaVersion {self.stamp!r} is incompatible with this SDK's "
+            f"schema {self.current} ({self.compatibility})"
+        )
+        if self.compatibility == SchemaCompatibility.NEWER_MAJOR:
+            return f"{head}; it was written by a newer Particles SDK, so import it with one."
+        if self.compatibility == SchemaCompatibility.OLDER_MAJOR:
+            return (
+                f"{head}; re-export it from an SDK on schema major "
+                f"{self.current.split('.')[0]}, or re-extract its sources."
+            )
+        return f"{head}; a schemaVersion must be MAJOR.MINOR.PATCH with a nonzero major."
+
+
+def check_schema_version(stamp: object, *, what: str) -> SchemaCompatibility:
+    """Classify a unit's or manifest's ``schemaVersion``, raising when incompatible.
+
+    Args:
+        stamp: The ``schemaVersion`` value as found on the wire.
+        what: What carried it (``"interchange unit"``, ``"bundle manifest"``),
+            for the error message.
+
+    Raises:
+        IncompatibleSchemaVersionError: If ``stamp`` is not a string of the
+            SDK's own nonzero major (D1).
+    """
+    current = particle_schema_default()
+    compat = (
+        schema_compatibility(stamp, current)
+        if isinstance(stamp, str)
+        else SchemaCompatibility.MALFORMED
+    )
+    if not compat.compatible:
+        raise IncompatibleSchemaVersionError(what, stamp, current, compat.value)
+    return compat
+
+
+def unknown_unit_keys(unit: dict[str, Any]) -> list[str]:
+    """The top-level keys of a particle unit this SDK does not know, sorted."""
+    return sorted(set(unit) - PARTICLE_UNIT_KEYS)
 
 
 @dataclass
@@ -105,6 +231,9 @@ class ParsedUnit:
     particle: Particle
     subjects: list[SubjectRef] = field(default_factory=list)
     source_particle_id: str | None = None
+    #: Top-level keys the unit carried that this SDK does not know; they were
+    #: dropped, and the import report counts them per key (D6).
+    dropped_keys: list[str] = field(default_factory=list)
 
 
 def _ext_ref_to_json(ref: ExternalRef) -> dict[str, Any]:
@@ -135,19 +264,28 @@ def _ext_ref_from_json(obj: dict[str, Any]) -> ExternalRef:
 _CONTRIBUTOR_FIELDS = frozenset(ContributorRef.model_fields)
 
 
-def _contributor_from_json(obj: dict[str, Any]) -> ContributorRef:
+def _contributor_from_json(obj: dict[str, Any], dropped: set[str] | None = None) -> ContributorRef:
     """Construct a ``ContributorRef`` from an interchange dict, rejecting extras.
 
     Fail-closed against a hostile/malformed contributor object (security review
     F32): unknown keys raise :class:`ValueError` here rather than being silently
     dropped by Pydantic's default ``extra="ignore"``.
+
+    The one exception is a unit of a newer minor than this SDK's:
+    a key its contract added is legitimate there, so the caller passes
+    ``dropped`` and each unknown key is removed and recorded in it as
+    ``contributors[].<key>``, which the import report counts. Nothing is
+    dropped silently either way.
     """
     extra = set(obj) - _CONTRIBUTOR_FIELDS
-    if extra:
+    if extra and dropped is None:
         raise ValueError(
             "interchange contributor object carries unexpected key(s) "
             f"{sorted(extra)}; refusing to decode (security review F32)."
         )
+    if extra and dropped is not None:
+        dropped.update(f"contributors[].{key}" for key in extra)
+        obj = {key: value for key, value in obj.items() if key in _CONTRIBUTOR_FIELDS}
     return ContributorRef(**obj)
 
 
@@ -242,12 +380,16 @@ def to_unit(particle: Particle, subjects: dict[str, Subject]) -> dict[str, Any]:
     ``subjects`` maps subject_id -> Subject for the particle's ``subject_ids``;
     each becomes a portable :class:`SubjectRef`. Only the canonical substrate is
     emitted (§2). Optional fields are omitted when unset to keep units compact.
+
+    The unit is stamped with the lower of the row's ``schema_version`` and the
+    SDK's (D6): an SDK older than the row cannot carry the fields it
+    does not know, and must not claim them.
     """
     unit: dict[str, Any] = {
         "@context": CONTEXT_URL,
         "@type": "Particle",
         "formatVersion": FORMAT_VERSION,
-        "schemaVersion": particle.schema_version,
+        "schemaVersion": lower_schema_version(particle.schema_version, particle_schema_default()),
         "sourceParticleId": particle.id,
         "particleType": particle.particle_type.value,
         "assertionModality": particle.assertion_modality.value,
@@ -392,7 +534,32 @@ def from_unit(unit: dict[str, Any]) -> ParsedUnit:
     The returned particle has a freshly minted id and **no** ``subject_ids``
     (import assigns them after resolving the subject refs); the source UUID is
     returned separately as origin metadata (§3).
+
+    The unit's ``schemaVersion`` must be compatible with the SDK's (
+    D6). Top-level keys outside :data:`PARTICLE_UNIT_KEYS` are dropped and
+    named in :attr:`ParsedUnit.dropped_keys`, and the particle is stamped with
+    the lower of the unit's version and the SDK's. A unit with no
+    ``schemaVersion`` is read as the SDK's own.
+
+    Raises:
+        IncompatibleSchemaVersionError: If the unit's ``schemaVersion`` is of
+            another major, major ``0``, or malformed.
     """
+    current = particle_schema_default()
+    unit_version = unit.get("schemaVersion", current)
+    check_schema_version(unit_version, what="interchange unit")
+    dropped_keys = unknown_unit_keys(unit)
+    # A newer minor may add a key inside a contributor too; every other unit
+    # keeps the F32 refusal of unexpected contributor keys.
+    nested_dropped: set[str] | None = (
+        set()
+        if schema_compatibility(unit_version, current) is SchemaCompatibility.NEWER_MINOR
+        else None
+    )
+    # Read only through the known keys, so this function and the dropped-key
+    # report share one definition of "known" (PARTICLE_UNIT_KEYS).
+    unit = {key: value for key, value in unit.items() if key in PARTICLE_UNIT_KEYS}
+
     confidence = Confidence(
         value=unit["confidenceValue"],
         variance=unit.get("variance"),
@@ -415,7 +582,7 @@ def from_unit(unit: dict[str, Any]) -> ParsedUnit:
         asserted_at=datetime.fromisoformat(unit["assertedAt"]),
         status=Status(unit["status"]),
         status_reason=StatusReason(status_reason_raw) if status_reason_raw is not None else None,
-        schema_version=unit.get("schemaVersion", particle_schema_default()),
+        schema_version=lower_schema_version(unit_version, current),
         particle_type=ParticleType(unit.get("particleType", ParticleType.CLAIM.value)),
         assertion_modality=AssertionModality(
             unit.get("assertionModality", AssertionModality.FALSIFIABLE.value)
@@ -441,7 +608,7 @@ def from_unit(unit: dict[str, Any]) -> ParsedUnit:
         context_fingerprint=unit.get("contextFingerprint"),
         properties=_normalize_legacy_properties(unit.get("properties")),
         contributors=(
-            [_contributor_from_json(c) for c in unit["contributors"]]
+            [_contributor_from_json(c, nested_dropped) for c in unit["contributors"]]
             if "contributors" in unit
             else None
         ),
@@ -451,13 +618,18 @@ def from_unit(unit: dict[str, Any]) -> ParsedUnit:
         particle=particle,
         subjects=[_subject_ref_from_json(s) for s in unit.get("subjects", [])],
         source_particle_id=unit.get("sourceParticleId"),
+        dropped_keys=sorted([*dropped_keys, *(nested_dropped or ())]),
     )
 
 
 def particle_schema_default() -> str:
-    from particles.core.schema import SCHEMA_VERSION
+    """The SDK's own ``SCHEMA_VERSION``, read at call time.
 
-    return SCHEMA_VERSION
+    The codec, the bundle manifest and the store-aware import all read the
+    SDK's stamp through here, so a test patches the one attribute,
+    ``particles.core.schema.SCHEMA_VERSION``.
+    """
+    return _core_schema.SCHEMA_VERSION
 
 
 def subject_to_unit(subject: Subject) -> dict[str, Any]:

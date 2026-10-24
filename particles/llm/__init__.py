@@ -34,7 +34,12 @@ from particles.llm.adapters.anthropic import AnthropicProvider
 from particles.llm.adapters.local import LocalProvider
 from particles.llm.adapters.openai_compat import OpenAICompatProvider
 from particles.llm.client import get_client, set_client
-from particles.llm.errors import AccountLevelLLMError, is_account_level_failure
+from particles.llm.errors import (
+    AccountLevelLLMError,
+    is_account_level_failure,
+    is_rate_limited,
+    retry_on_rate_limit,
+)
 from particles.llm.fencing import (
     data_fence_instruction,
     fence,
@@ -46,6 +51,7 @@ from particles.llm.registry import (
     BatchCompletionProvider,
     CompletionError,
     CompletionProvider,
+    CompletionRefused,
     CompletionRequest,
     EmptyCompletionError,
     LLMPurpose,
@@ -64,9 +70,13 @@ from particles.llm.registry import (
 )
 from particles.llm.replay import ReplayMode, ReplayStats, render_replay_line, replay_scope
 from particles.llm.usage import (
+    NO_SAMPLING,
     LLMUsage,
+    Sampling,
+    SamplingObservation,
     UsageAccumulator,
     UsageRow,
+    observe_sampling,
     record_usage,
     render_usage_line,
     track_usage,
@@ -79,16 +89,20 @@ __all__ = [
     "CompletionError",
     "CompletionPool",
     "CompletionProvider",
+    "CompletionRefused",
     "CompletionRequest",
     "EmptyCompletionError",
     "LLMPurpose",
     "LLMUsage",
     "LocalProvider",
+    "NO_SAMPLING",
     "OpenAICompatProvider",
     "PurposeRefused",
     "ReplayMode",
     "ReplayStats",
     "RequestFailure",
+    "Sampling",
+    "SamplingObservation",
     "UsageAccumulator",
     "UsageRow",
     "VisionImage",
@@ -102,7 +116,9 @@ __all__ = [
     "complete_with_provider_model",
     "get_provider",
     "is_account_level_failure",
+    "is_rate_limited",
     "make_nonce",
+    "observe_sampling",
     "override_providers",
     "provider_for_selection",
     "purpose_allowed",
@@ -110,6 +126,7 @@ __all__ = [
     "render_replay_line",
     "render_usage_line",
     "replay_scope",
+    "retry_on_rate_limit",
     "selection_endpoint",
     "set_client",
     "track_usage",

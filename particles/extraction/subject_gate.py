@@ -218,6 +218,15 @@ def classify_non_entity(
     return None
 
 
+def is_file_extension(word: str) -> bool:
+    """Whether ``word`` is one of the gate's file extensions (``md``, ``py``, ``json``, …).
+
+    The module fold reads it: ``particles.exporters.markdown`` ends
+    in one, so it names a file before it names a module.
+    """
+    return bool(_FILE_EXT_RE.search(f".{word}"))
+
+
 def disposition_for(
     token_class: str,
     dispositions: Mapping[str, str] | None,

@@ -111,6 +111,52 @@ class TestVisible:
         assert visible(UNATTRIBUTED_SCOPE, "-a", widened=True)
 
 
+class TestUnattributedMarker:
+    """The compiled-in marker: unattributed whatever the configured list says."""
+
+    def test_the_marker_reads_unattributed_under_any_harness_list(self) -> None:
+        from particles.core.observer_scope import UNATTRIBUTED_MARKER
+
+        assert classify_entry([UNATTRIBUTED_MARKER], ()) is EntryScope.UNATTRIBUTED
+        assert classify_entry([UNATTRIBUTED_MARKER], HARNESS) is EntryScope.UNATTRIBUTED
+
+    def test_a_key_outranks_the_marker(self) -> None:
+        from particles.core.observer_scope import UNATTRIBUTED_MARKER
+
+        assert classify_entry([UNATTRIBUTED_MARKER, project_tag("-a")], ()) is EntryScope.KEYED
+
+
+class TestWidenedScope:
+    """A widening rides on the scope the join returns."""
+
+    WIDE_B = BeliefScope(keys=frozenset({"-b"}), widened=True)
+
+    def test_a_widened_belief_is_in_view_everywhere(self) -> None:
+        assert visible(self.WIDE_B, "-a")
+        assert self.WIDE_B.everywhere and not self.WIDE_B.is_global
+        assert not BeliefScope(widened=True).unattributed
+
+    def test_a_projects_update_against_a_widened_claim_is_reviewed(self) -> None:
+        own = BeliefScope(keys=frozenset({"-b"}), widened=True)
+        assert pair_precondition(keyed("-b"), own) is PairPrecondition.REVIEW
+        assert pair_precondition(keyed("-b"), keyed("-b")) is PairPrecondition.RECONCILE
+        assert pair_precondition(self.WIDE_B, keyed("-a")) is PairPrecondition.RECONCILE
+
+    def test_a_widened_belief_shares_an_observer_with_anyone(self) -> None:
+        from particles.core.observer_scope import share_an_observer
+
+        assert share_an_observer(self.WIDE_B, keyed("-a"))
+        assert not share_an_observer(keyed("-b"), keyed("-a"))
+
+    def test_a_widening_is_neither_pooled_nor_inherited(self) -> None:
+        assert join((self.WIDE_B, keyed("-a"))) == keyed("-a", "-b")
+        assert meet((self.WIDE_B, keyed("-b"))) == keyed("-b")
+        assert same_scope(self.WIDE_B, keyed("-b"))
+
+    def test_the_description_names_the_widening(self) -> None:
+        assert describe_scope(self.WIDE_B) == "project -b, widened to every project"
+
+
 _keys = st.frozensets(st.sampled_from(["-a", "-b", "-c"]))
 _scopes = st.builds(BeliefScope, is_global=st.booleans(), keys=_keys)
 

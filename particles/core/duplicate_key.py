@@ -13,8 +13,10 @@ path 4 folds one that was already written. Both are defined over the same
 One notion of "the same claim, twice" for the whole SDK:
 
 * :func:`normalize_content` — the conservative content key. Whitespace runs
-  collapse and sentence-final punctuation is trimmed; **case and wording are
-  preserved**. This is *exact*-content identity, not near-duplicate merging.
+  collapse, sentence-final punctuation is trimmed, and typographic variants
+  fold (quotation marks dropped, curly apostrophes, dashes and the ellipsis
+  spelled one way); **case and wording are preserved**. This is
+  *exact*-content identity, not near-duplicate merging.
 * :func:`content_hash` — SHA-256 over the normalized key, stored on
   ``particles.content_norm_hash`` so the extract-time suppression lookup
   is one indexed probe instead of a scan.
@@ -48,24 +50,65 @@ both already depend on. Pure — no I/O, no logging, per ``core/AGENTS.md``.
 from __future__ import annotations
 
 import hashlib
+import unicodedata
 from collections.abc import Iterable
 
 # Trailing punctuation trimmed during normalization. Conservative: sentence-final
 # marks only, so "worse." and "worse" collapse but distinct claims never do.
 _TRAILING_PUNCT = ".,;:!?\"'"
 
+# Double quotation marks, in every script's spelling, are dropped outright: a
+# restatement that quotes a title or a literal and one that does not are the
+# same sentence (measured a vault note's claim retired and re-minted
+# for exactly that difference). Single quotes are *folded*, never dropped,
+# because the same mark is an apostrophe and "the dog's bowl" is not "the
+# dogs' bowl"; a claim that quotes with single marks therefore still differs
+# from its unquoted twin. The prime is not folded: as ``'`` it would be trimmed
+# as a trailing mark, and ``f′`` would key equal to ``f``.
+_DROPPED_QUOTES = '"\u201c\u201d\u201e\u201f\u00ab\u00bb\u2039\u203a\u300c\u300d\u300e\u300f\uff02'
+_SINGLE_QUOTES = "\u2018\u2019\u201a\u201b"
+# Hyphen, non-breaking hyphen, figure dash, en and em dash, horizontal bar, and
+# the minus sign all read as one dash: "options 1–3" is "options 1-3".
+_DASHES = "\u2010\u2011\u2012\u2013\u2014\u2015\u2212"
+# Invisible characters that ``str.split`` does not treat as whitespace: zero-width
+# space, word joiner, byte-order mark, soft hyphen.
+_INVISIBLE = "\u200b\u2060\ufeff\u00ad"
+
+_TYPOGRAPHIC_FOLD = str.maketrans(
+    {
+        **dict.fromkeys(_DROPPED_QUOTES + _INVISIBLE),
+        **dict.fromkeys(_SINGLE_QUOTES, "'"),
+        **dict.fromkeys(_DASHES, "-"),
+        "\u2026": "...",
+    }
+)
+
 
 def normalize_content(content: str) -> str:
-    """Conservative exact-content key: collapse whitespace, trim trailing marks.
+    """Conservative exact-content key: fold typography, collapse whitespace, trim.
 
     Case and word order are intentionally preserved — this is *exact*-content
     identity, not near-duplicate merging: cosine was measured not to order
     duplicate-likelihood below identity, so there is no safe
     similarity tier below this one. Two strings collapse only when they differ
-    by nothing
-    more than whitespace runs or a sentence-final punctuation mark.
+    by nothing more than:
+
+    * Unicode composition (NFC: a precomposed and a decomposed ``é``);
+    * typography — double quotation marks present or absent, a curly or a
+      straight apostrophe, a dash spelled as hyphen, en dash, em dash or minus,
+      an ellipsis as one character or three, an invisible zero-width mark;
+    * whitespace runs; or
+    * a sentence-final punctuation mark.
+
+    A trailing ellipsis is trimmed like any trailing run of periods, which the
+    key has always done for three dots. Compatibility folding (NFKC) is
+    deliberately not applied: it rewrites
+    ``m²`` as ``m2`` and ``½`` as ``1/2``, which change what a claim says.
+    The fold is versioned with the stored ``content_norm_hash`` it keys
+    (migration 055 re-keyed the rows the typographic fold changed).
     """
-    collapsed = " ".join(content.split())
+    folded = unicodedata.normalize("NFC", content).translate(_TYPOGRAPHIC_FOLD)
+    collapsed = " ".join(folded.split())
     return collapsed.rstrip(_TRAILING_PUNCT).rstrip()
 
 

@@ -277,6 +277,58 @@ def trust_statement_source(preferred: Particle | None) -> str | None:
     return _source_entry_id(preferred)
 
 
+def can_be_kept(particle: Particle) -> bool:
+    """Whether a resolution that keeps ``particle`` leaves it ACTIVE.
+
+    An ACTIVE claim stays, and a quarantined one is promoted. Any
+    other claim left ACTIVE for a reason of its own (its source moved on, a
+    person retracted it, it was merged), and a conflict verdict does not undo
+    that, so keeping it would close the record with the claim still hidden.
+    """
+    return particle.status is Status.ACTIVE or is_quarantined(particle)
+
+
+def refusal_reason(
+    action: ResolutionAction,
+    particle_a: Particle | None,
+    particle_b: Particle | None,
+    *,
+    retired_value: bool = False,
+) -> str | None:
+    """Why review refuses ``action`` on this record, or None when it may run.
+
+    PREFER_A demotes B and never re-promotes A, so it needs A ACTIVE.
+    PREFER_B needs a B it can keep: ACTIVE or quarantined. A B whose ref
+    dangles (a pre-ADR-0117 wrapper) still resolves, as it always has; the
+    excerpt is all that remains of it. On a retired-value hold
+    (``retired_value``) A is the retired claim by design and
+    PREFER_A means the retirement stands, so it is never refused there. The
+    curation queue withholds the same actions, so the verb and
+    the queue refuse alike.
+    """
+    if retired_value and action is ResolutionAction.PREFER_A:
+        return None
+    match action:
+        case ResolutionAction.PREFER_A:
+            side, member = "A", particle_a
+            if member is None:
+                return "claim A is no longer in the store, so it cannot be kept"
+        case ResolutionAction.PREFER_B:
+            side, member = "B", particle_b
+            if member is None:
+                return None
+        case _:
+            return None
+    if can_be_kept(member):
+        return None
+    reason = f" / {member.status_reason.value}" if member.status_reason is not None else ""
+    return (
+        f"claim {side} is {member.status.value}{reason}, and a conflict verdict does "
+        f"not restore it, so {action.value} would close the conflict with neither "
+        "claim ACTIVE"
+    )
+
+
 def decide_resolution(
     action: ResolutionAction,
     inconsistency: Particle,
@@ -449,6 +501,10 @@ def decide_cascade(
         return None
     a, b = pair
     winner, loser = (a, b) if diff > 0 else (b, a)
+    if not can_be_kept(winner):
+        # The higher-trust claim already left ACTIVE (its source moved on):
+        # demoting the other would leave neither.
+        return None
     return CascadeVerdict(
         winner=winner,
         loser=loser,

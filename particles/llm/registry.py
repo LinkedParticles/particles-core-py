@@ -111,6 +111,24 @@ class EmptyCompletionError(CompletionError):
     """
 
 
+class CompletionRefused(CompletionError):
+    """The model declined the request: its safety classifiers refused the content.
+
+    A judgement about the content by one model, not a transport failure, so it
+    is neither an :class:`EmptyCompletionError` nor transient: the same bytes
+    sent to the same model are refused again, and a larger budget changes
+    nothing, so no call site re-issues it. It is a
+    :class:`CompletionError`, so every existing fallback still applies.
+    ``provider_model`` is the pairing that refused, and
+    ``category`` the provider's refusal category when it reports one.
+    """
+
+    def __init__(self, message: str, *, provider_model: str, category: str | None = None) -> None:
+        super().__init__(message)
+        self.provider_model = provider_model
+        self.category = category
+
+
 class RequestFailure(StrEnum):
     """Why one request of a :func:`complete_many` set came back ``None``.
 
@@ -125,8 +143,11 @@ class RequestFailure(StrEnum):
     """No reply: the request errored, expired or was cancelled, or the call failed."""
     EMPTY = "empty"
     """The model replied with no text: a reply that spent its whole ``max_tokens``
-    before the answer (a thinking model), or a refusal. The same request at the
-    same budget tends to reproduce it."""
+    before the answer (a thinking model). The same request at the same budget
+    tends to reproduce it."""
+    REFUSED = "refused"
+    """The model declined the request (``stop_reason=refusal``). Terminal: never
+    retried at a larger budget nor re-queued."""
 
 
 @dataclass(frozen=True)
@@ -548,7 +569,7 @@ async def complete_with_provider_model(
     """
     provider = get_provider(purpose)
     # The adapter reports the response's usage; this tags it with the purpose.
-    with purpose_scope(purpose):
+    with purpose_scope(purpose, temperature_requested=temperature is not None):
         text = await provider.complete(
             prompt,
             max_tokens=max_tokens,
@@ -632,7 +653,7 @@ async def complete_many_with_provider_model(
     if not requests:
         return [], ""
 
-    with purpose_scope(purpose):
+    with purpose_scope(purpose, temperature_requested=temperature is not None):
         results, provider_model, failures = await _complete_many_scoped(
             get_provider(purpose),
             purpose,
@@ -775,7 +796,9 @@ async def run_sequential(
             log.info("Completion failed for one request of %d: %s", len(requests), exc)
             out.append(None)
             failures.append(
-                RequestFailure.EMPTY
+                RequestFailure.REFUSED
+                if isinstance(exc, CompletionRefused)
+                else RequestFailure.EMPTY
                 if isinstance(exc, EmptyCompletionError)
                 else RequestFailure.UNAVAILABLE
             )

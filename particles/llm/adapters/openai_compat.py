@@ -58,6 +58,7 @@ from particles.http import egress_client
 from particles.llm.logprobs import active_capture, record_logprobs
 from particles.llm.registry import (
     CompletionError,
+    CompletionRefused,
     EmptyCompletionError,
     VisionImage,
     budget_hint,
@@ -443,7 +444,10 @@ async def _post_with_retry(
             else:
                 if resp.status_code == 200:
                     return _extract_text(
-                        resp.json(), provider_model=provider_model, max_tokens=max_tokens
+                        resp.json(),
+                        provider_model=provider_model,
+                        max_tokens=max_tokens,
+                        temperature_sent="temperature" in body,
                     )
                 last_status = resp.status_code
                 last_detail = _scrub_response_body(resp.text)
@@ -473,6 +477,7 @@ def _extract_text(
     *,
     provider_model: str = "<unknown>",
     max_tokens: int | None = None,
+    temperature_sent: bool | None = None,
 ) -> str:
     """Pull ``choices[0].message.content`` from an OpenAI-compatible response.
 
@@ -506,8 +511,17 @@ def _extract_text(
     truncated = finish_reason == "length"
     # Billed whether or not the reply carries text, so counted before the
     # empty-reply raise below.
-    _record_payload_usage(payload, provider_model, truncated=truncated)
+    _record_payload_usage(
+        payload, provider_model, truncated=truncated, temperature_sent=temperature_sent
+    )
     record_logprobs(provider_model, payload)
+    if finish_reason == "content_filter":
+        # The endpoint's content filter declined: a judgement about the
+        # content, never retried at a larger budget.
+        raise CompletionRefused(
+            f"LLM endpoint {provider_model} declined the request (finish_reason=content_filter)",
+            provider_model=provider_model,
+        )
     if truncated:
         # The span opened by ``complete()`` is still current here, so the fact
         # reaches telemetry as well as the log (no-op without an OTel SDK).
@@ -542,7 +556,13 @@ def _token_count(mapping: object, name: str) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
 
 
-def _record_payload_usage(payload: object, provider_model: str, *, truncated: bool) -> None:
+def _record_payload_usage(
+    payload: object,
+    provider_model: str,
+    *,
+    truncated: bool,
+    temperature_sent: bool | None = None,
+) -> None:
     """Report a ``chat/completions`` reply's ``usage`` to the open usage scopes.
 
     ``usage`` is optional on many OpenAI-compatible servers; a reply without
@@ -561,4 +581,5 @@ def _record_payload_usage(payload: object, provider_model: str, *, truncated: bo
         output_tokens=_token_count(usage, "completion_tokens"),
         cache_read_tokens=cached,
         hit_max_tokens=truncated,
+        temperature_sent=temperature_sent,
     )

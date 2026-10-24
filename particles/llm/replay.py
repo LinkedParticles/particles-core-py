@@ -249,6 +249,9 @@ class _Usage:
     cache_read_tokens: int = 0
     hit_max_tokens: bool = False
     batched: bool = False
+    #: Whether the recorded request carried a temperature; ``None``
+    #: for an entry recorded before this was kept, or when nobody said.
+    temperature_sent: bool | None = None
 
 
 def _entry_path(directory: Path, key: str) -> Path:
@@ -278,7 +281,12 @@ def _read_entry(directory: Path, key: str) -> tuple[str, _Usage] | None:
         cache_read_tokens=int(usage.get("cache_read_tokens", 0)),
         hit_max_tokens=bool(usage.get("hit_max_tokens", False)),
         batched=bool(usage.get("batched", False)),
+        temperature_sent=_optional_bool(usage.get("temperature_sent")),
     )
+
+
+def _optional_bool(value: object) -> bool | None:
+    return value if isinstance(value, bool) else None
 
 
 def _write_entry(
@@ -299,6 +307,7 @@ def _write_entry(
             "cache_read_tokens": usage.cache_read_tokens,
             "hit_max_tokens": usage.hit_max_tokens,
             "batched": usage.batched,
+            "temperature_sent": usage.temperature_sent,
         },
     }
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-", suffix=".json")
@@ -321,7 +330,20 @@ def _summed(rows: Sequence[UsageRow]) -> _Usage:
         cache_read_tokens=sum(r.cache_read_tokens for r in rows),
         hit_max_tokens=any(r.max_tokens_stops for r in rows),
         batched=any(r.batched for r in rows),
+        temperature_sent=_sent(rows),
     )
+
+
+def _sent(rows: Sequence[UsageRow]) -> bool | None:
+    """Whether the measured call sent the temperature it asked for.
+
+    ``None`` when it asked for none: a replay of it then reports ``unset``
+    from the registry's own flag, which is the same request.
+    """
+    requested = sum(r.temperature_requested for r in rows)
+    if not requested:
+        return None
+    return not any(r.temperature_dropped for r in rows)
 
 
 def _shares(total: _Usage, n: int, stops: int = 0) -> list[_Usage]:
@@ -351,6 +373,7 @@ def _shares(total: _Usage, n: int, stops: int = 0) -> list[_Usage]:
             cache_read_tokens=columns[3][i],
             hit_max_tokens=i < stops,
             batched=total.batched,
+            temperature_sent=total.temperature_sent,
         )
         for i in range(n)
     ]
@@ -366,6 +389,7 @@ def _report_replayed(provider_model: str, usage: _Usage) -> None:
         hit_max_tokens=usage.hit_max_tokens,
         batched=usage.batched,
         replayed=True,
+        temperature_sent=usage.temperature_sent,
     )
 
 

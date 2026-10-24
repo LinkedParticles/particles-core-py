@@ -207,18 +207,22 @@ def entry_labels(policy: EgressPolicy) -> tuple[str, ...]:
     return tuple(e.value if e.port is None else f"{e.value}:{e.port}" for e in policy.entries)
 
 
-_policy_cache: tuple[int, EgressPolicy] | None = None
+# Keyed on the config object itself, compared with ``is``. An ``id()`` key
+# is reused once the old object is collected, so a fresh ``NetworkConfig``
+# allocated at the freed address would be served the stale policy. Holding
+# the reference keeps the key alive, so its address can never be reused.
+_policy_cache: tuple[NetworkConfig, EgressPolicy] | None = None
 
 
 def current_policy() -> EgressPolicy:
     """The policy for the current config, compiled once per config object."""
     global _policy_cache
-    cfg = get_config()
+    network = get_config().network
     cached = _policy_cache
-    if cached is not None and cached[0] == id(cfg.network):
+    if cached is not None and cached[0] is network:
         return cached[1]
-    policy = compile_policy(cfg.network)
-    _policy_cache = (id(cfg.network), policy)
+    policy = compile_policy(network)
+    _policy_cache = (network, policy)
     return policy
 
 

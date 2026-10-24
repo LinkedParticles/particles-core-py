@@ -70,6 +70,11 @@ class ProbeKind(StrEnum):
     #: candidate set, by :func:`subject_link_key`; its answer is a QID, not a
     #: yes or no.
     SUBJECT_LINK = "subject_link"
+    #: The duplicate judge's reading of a restatement pair: is the new
+    #: generation's candidate the same claim as the earlier generation's?
+    #: ``True`` is ``SAME``, ``False`` is ``DIFFERENT``; an
+    #: abstention is not recorded.
+    DUPLICATE = "duplicate"
 
     @property
     def symmetric(self) -> bool:
@@ -78,7 +83,12 @@ class ProbeKind(StrEnum):
 
 
 _SYMMETRIC = frozenset(
-    {ProbeKind.CONTRADICTION, ProbeKind.SECOND_READING, ProbeKind.RECONCILE_CONTRADICTION}
+    {
+        ProbeKind.CONTRADICTION,
+        ProbeKind.SECOND_READING,
+        ProbeKind.RECONCILE_CONTRADICTION,
+        ProbeKind.DUPLICATE,
+    }
 )
 
 

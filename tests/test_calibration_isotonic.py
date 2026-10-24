@@ -99,7 +99,7 @@ def test_record_round_trips_and_stamps_the_method() -> None:
         ),
         "entry",
         "snapshot",
-        "claude-code-agent",
+        "general-extractor",
         calibration=record,
     )
     assert particle.confidence.value == pytest.approx(0.6)

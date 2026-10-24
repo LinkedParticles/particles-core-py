@@ -64,6 +64,7 @@ from particles.core.validity import (
 )
 from particles.extraction import polarity as _polarity_module
 from particles.extraction import scope as _scope_module
+from particles.extraction import session_artifacts as _session_artifacts_module
 from particles.extraction import session_state as _session_state_module
 from particles.extraction import structure as _structure_module
 from particles.extraction.components import (
@@ -86,6 +87,7 @@ from particles.extraction.scope import (
     SCOPE_DOCUMENT_META,
     SCOPE_KEY,
 )
+from particles.extraction.session_artifacts import name_session_artifacts
 from particles.extraction.session_state import drop_session_state
 from particles.extraction.structure import bind_subject_id, parse_structured_claim_payload
 from particles.extraction.tool_turns import TOOL_TURN_RULE, mark_tool_turns
@@ -99,7 +101,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 EXTRACTOR_ID = "general-extractor"
-EXTRACTOR_VERSION = "0.18.0"
+EXTRACTOR_VERSION = "0.19.0"
 # 0.4.0: prompt now preserves URL schemes.
 # 0.5.0: HTML chunking moves to paragraph boundaries with hash-input
 #        normalisation and routes through extract_with_carry_forward.
@@ -200,6 +202,18 @@ EXTRACTOR_VERSION = "0.18.0"
 #        as ``as-of``). Every other source's prompt and output are
 #        byte-for-byte 0.17.0, so a reindex is worth running only on the
 #        transcripts a window read should find.
+# 0.19.0: session artifacts are named. On a session source the
+#        prompt gains one rule (``prompt.session_artifacts``): a definite
+#        description of something the session worked on ("the pull request",
+#        "the commit", "the version") is replaced by the name THIS source
+#        gives it, that name and never the description goes in subjects, and
+#        a claim reporting an act performed in the session opens with the
+#        REFERENCE DATE. After extraction, on the session-state source types,
+#        a claim that opens with a description of a pull request and carries
+#        one pull-request URL is rewritten to name it (``owner/repo#N``), and
+#        a bare description subject ("the user", "the commit") is stripped.
+#        Every other source's prompt and output are byte-for-byte 0.18.0, so a
+#        reindex is worth running only on session transcripts.
 #: The interval every emitted ``confidence_value`` is clamped into
 #: (D1). Strict interiority is the whole point: ``calibration.is_saturated``
 #: treats a value within ``_EPS = 1e-7`` of an endpoint as immovable, so
@@ -517,6 +531,36 @@ _SESSION_VALIDITY_RULE = """
   Never use "session" for a STATE: a present-tense state is "as-of" as above.
   When unsure whether the act was performed in the session, OMIT the start."""
 
+# on a session transcript, a definite description of something the
+# session worked on ("the pull request") names a different thing in every
+# session, so two sessions' true records read as one claim with two values.
+# Independent of the validity rule: the REFERENCE DATE it cites is in every
+# prompt (the validity rule or ``_REFERENCE_DATE_RULE``). The examples name
+# nothing a test fixture uses, as in ``REFERENCE_RULE``.
+_SESSION_ARTIFACT_RULE = """
+- SESSION ARTIFACTS: this source is a working session's transcript, and each
+  claim is read later beside the records of many other sessions. A definite
+  description of something the session worked on ("the pull request", "the
+  PR", "the commit", "the branch", "the version", "the release", "the ADR")
+  points at a different thing in every session, so never leave one as the
+  referent of a claim when THIS source names the thing:
+  - write the thing's own name in its place: "The pull request was created at
+    https://github.com/acme/widgets/pull/326" becomes "Pull request
+    acme/widgets#326 was created at https://github.com/acme/widgets/pull/326";
+    "The commit fixed the parser" becomes "Commit 3f9c2ab fixed the parser"
+    when the source gives the hash; "The version was bumped to 1.4.0" becomes
+    "The acme-widgets version was bumped to 1.4.0" when the source names the
+    package; the same for a branch, a record or a file, by its name or path;
+  - put that name in "subjects", never the description: "acme/widgets#326",
+    not "the pull request". Never list a bare description ("the user", "the
+    assistant", "the session", "the repository") as a subject;
+  - open a claim that reports an act performed in the session with the
+    REFERENCE DATE ("On 2026-03-14, pull request acme/widgets#326 was
+    merged"), so two sessions' records of two acts never read as one claim
+    with two values. A present-tense state keeps its own wording.
+  When the source does not name the thing, keep the description. Never invent
+  a number, a hash, a version or a name."""
+
 _STRUCTURE_RULE = """
 - structured_claim: re-express the claim's relational core as ONE
   subject-predicate-object triple. This is an ANNOTATION on the claim, never a
@@ -580,6 +624,7 @@ PROMPT_POLARITY = "prompt.polarity"
 PROMPT_STANCE = "prompt.stance"
 PROMPT_VALIDITY = "prompt.validity"
 PROMPT_SESSION_VALIDITY = "prompt.session_validity"
+PROMPT_SESSION_ARTIFACTS = "prompt.session_artifacts"
 PROMPT_REFERENCE_DATE = "prompt.reference_date"
 PROMPT_STRUCTURE = "prompt.structure"
 PROMPT_TOOL_TURNS = "prompt.tool_turns"
@@ -644,6 +689,10 @@ def extract_prompt_components(
         # rule it extends.
         PromptComponent(PROMPT_SESSION_VALIDITY, _SESSION_VALIDITY_RULE)
         if validity_enabled and session_source
+        else None,
+        # only on a session transcript.
+        PromptComponent(PROMPT_SESSION_ARTIFACTS, _SESSION_ARTIFACT_RULE)
+        if session_source
         else None,
         PromptComponent(PROMPT_STRUCTURE, _STRUCTURE_RULE, _STRUCTURE_SCHEMA_FIELD)
         if structure_enabled
@@ -815,7 +864,13 @@ def _parse_code_texts() -> tuple[str, ...]:
         _drop_session_state_candidates,
         candidate_to_particle,
     )
-    modules = (_polarity_module, _scope_module, _session_state_module, _structure_module)
+    modules = (
+        _polarity_module,
+        _scope_module,
+        _session_state_module,
+        _session_artifacts_module,
+        _structure_module,
+    )
     return tuple(source_text(f) for f in (*functions, *modules))
 
 
@@ -2100,10 +2155,12 @@ class GeneralExtractor:
 
 
 def _drop_session_state_candidates(result: ExtractionResult, content: bytes) -> None:
-    """Remove momentary session-state claims from ``result`` in place.
+    """Remove momentary session-state claims from ``result`` in place, then name artifacts.
 
     Worktree names are read from the raw source bytes, so a kept claim loses a
     subject named after a worktree even when no dropped claim spelled its path.
+    The kept claims then name the pull request a description stands for and
+    lose any bare description subject.
     """
     filtered = drop_session_state(result.candidates, content.decode("utf-8", errors="replace"))
     result.candidates = filtered.candidates
@@ -2112,6 +2169,12 @@ def _drop_session_state_candidates(result: ExtractionResult, content: bytes) -> 
         result.quality_notes.append(
             f"session state: {filtered.dropped} claim(s) dropped,"
             f" {filtered.subjects_stripped} worktree subject(s) stripped"
+        )
+    artifacts = name_session_artifacts(result.candidates)
+    if artifacts.named or artifacts.subjects_stripped:
+        result.quality_notes.append(
+            f"session artifacts: {artifacts.named} pull request(s) named,"
+            f" {artifacts.subjects_stripped} description subject(s) stripped"
         )
 
 
@@ -2438,6 +2501,24 @@ class ReplyTally:
     """Replies (after any retry) cut at the output budget: some claims were lost."""
     retried: int = 0
     """Replies re-issued once at ``extraction.retry_max_tokens``."""
+    answered: int = 0
+    """Calls the model answered with text, whatever the reply's shape."""
+    refusals: list[Refusal] = field(default_factory=list)
+    """Calls the model declined, one per refused call."""
+
+    @property
+    def refused(self) -> int:
+        """How many calls the model declined."""
+        return len(self.refusals)
+
+
+@dataclass(frozen=True)
+class Refusal:
+    """One extraction call the model declined."""
+
+    purpose: str
+    provider_model: str
+    category: str | None
 
 
 _REPLY_TALLY: ContextVar[ReplyTally | None] = ContextVar("particles_reply_tally", default=None)
@@ -2454,14 +2535,48 @@ def tally_replies() -> Iterator[ReplyTally]:
         _REPLY_TALLY.reset(token)
 
 
-def _record_reply(shape: ReplyShape, *, retried: bool = False) -> None:
+def _record_reply(shape: ReplyShape, *, retried: bool = False, answered: bool = True) -> None:
     tally = _REPLY_TALLY.get()
     if tally is None:
         return
+    if answered:
+        tally.answered += 1
     if shape == "truncated":
         tally.truncated += 1
     if retried:
         tally.retried += 1
+
+
+def record_answered() -> None:
+    """Count one call the model answered with a complete reply.
+
+    ``_settle_reply`` counts every other answered call; a seam that returns a
+    complete reply without settling it calls this, so a pass with one refused
+    call and one answered one is never read as refusal-only.
+    """
+    tally = _REPLY_TALLY.get()
+    if tally is not None:
+        tally.answered += 1
+
+
+def record_refusal(
+    provider_model: str, category: str | None, *, purpose: str = "extraction"
+) -> None:
+    """Record a declined extraction call on the open :class:`ReplyTally`.
+
+    Called at the completion seams (``_call_llm``, ``_pooled_extract``, the
+    journal's ``_call_journal_llm``), so a third-party extractor that delegates
+    to them is covered without a change. The refused call still counts as a
+    transient failure in ``ExtractionResult.transient_error_count``.
+    """
+    log.warning(
+        "Extraction call declined by %s (stop_reason=refusal%s)",
+        provider_model or "the extraction model",
+        f", category={category}" if category else "",
+    )
+    tally = _REPLY_TALLY.get()
+    if tally is not None:
+        tally.refusals.append(Refusal(purpose, provider_model, category))
 
 
 @dataclass
@@ -2499,6 +2614,30 @@ def _finish_llm_reply(
     return _FinishedReply(candidates, notes, shape == "unparsed", shape)
 
 
+async def complete_extraction(prompt: str, **kwargs: Any) -> tuple[str, str]:
+    """One ``extraction`` completion with its pairing, waiting out a rate limit.
+
+    :func:`particles.llm.complete_with_provider_model` on the ``extraction``
+    purpose, sent again after a wait when it is answered with HTTP 429, up to
+    ``extraction.rate_limit_retries`` times. A 429 says nothing about
+    the source, so it must not leave the snapshot PENDING the way a failed call
+    does. Every other failure propagates unchanged. Both extraction seams
+    (``_call_llm`` here and the journal extractor's) call this.
+    """
+    # Deferred import (test-mock seam, tests/AGENTS.md § Mocking strategy): the
+    # extraction tests patch ``particles.llm.complete_with_provider_model``.
+    from particles.llm import complete_with_provider_model, retry_on_rate_limit
+
+    cfg = get_config().extraction
+    return await retry_on_rate_limit(
+        lambda: complete_with_provider_model("extraction", prompt, **kwargs),
+        retries=cfg.rate_limit_retries,
+        backoff_seconds=cfg.rate_limit_backoff_seconds,
+        max_wait_seconds=cfg.rate_limit_max_wait_seconds,
+        label="Extraction call",
+    )
+
+
 async def _call_llm(
     text: str,
     images: list[VisionImage] | None = None,
@@ -2525,8 +2664,8 @@ async def _call_llm(
     """
     from particles.llm import (
         AccountLevelLLMError,
+        CompletionRefused,
         EmptyCompletionError,
-        complete_with_provider_model,
         is_account_level_failure,
     )
 
@@ -2545,8 +2684,7 @@ async def _call_llm(
     # back off the response.
     provider_model = ""
     try:
-        raw, provider_model = await complete_with_provider_model(
-            "extraction",
+        raw, provider_model = await complete_extraction(
             planned.request.prompt,
             max_tokens=planned.max_tokens,
             system=planned.request.system,
@@ -2565,6 +2703,11 @@ async def _call_llm(
         if is_account_level_failure(exc):
             log.error("Extraction unavailable (account-level): %s", exc)
             raise AccountLevelLLMError(exc) from exc
+        if isinstance(exc, CompletionRefused):
+            # A judgement about the content: never re-issued at the larger
+            # budget below.
+            record_refusal(exc.provider_model, exc.category)
+            return [], [f"API error: {exc}"], True
         if not isinstance(exc, EmptyCompletionError):
             log.error("Extraction API call failed: %s", exc)
             return [], [f"API error: {exc}"], True
@@ -2574,6 +2717,7 @@ async def _call_llm(
         first = _finish_llm_reply(raw, provider_model, images)
         first_error = None
         if first.shape == "complete":
+            record_answered()
             return first.candidates, first.notes, first.transient
 
     # A reply with no text, cut at the budget, or unparseable is a budget
@@ -2591,8 +2735,7 @@ async def _call_llm(
         retry_budget,
     )
     try:
-        raw, provider_model = await complete_with_provider_model(
-            "extraction",
+        raw, provider_model = await complete_extraction(
             planned.request.prompt,
             max_tokens=retry_budget,
             system=planned.request.system,
@@ -2618,7 +2761,8 @@ def _settle_reply(
 ) -> tuple[list[CandidateParticle], list[str], bool]:
     """Record the final reply of a ``_call_llm`` on the tally and return its triple."""
     if reply is None:
-        _record_reply("unparsed", retried=retried)
+        # No reply came back, so the call is not an answered one.
+        _record_reply("unparsed", retried=retried, answered=False)
         return [], [f"API error: {error}"], True
     _record_reply(reply.shape, retried=retried)
     if reply.shape == "truncated":
@@ -2738,7 +2882,10 @@ async def _pooled_extract(
     retried = set(retry_at)
     for i, head in enumerate(firsts):
         if i not in retried:
-            if head is None:
+            if head is None and i < len(failures) and failures[i] is RequestFailure.REFUSED:
+                record_refusal(provider_model, None)
+                settled.append(([], ["API error: the model declined the request"], True))
+            elif head is None:
                 # Unavailable, or empty with no larger budget to retry at:
                 # the per-request transient every aggregation layer propagates.
                 reason = (

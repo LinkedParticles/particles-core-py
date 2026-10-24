@@ -18,27 +18,42 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from particles.core.schema_version import (
+    SchemaCompatibility,
+    parse_schema_version,
+    schema_compatibility,
+    stamp_sort_key,
+)
 from particles.core.scoring.confidence import CalibrationSource
 from particles.core.status import Status, StatusReason
 
 SCHEMA_VERSION = "1.0.0"
 
+#: The first SDK release that compares ``schema_version`` by major (
+#: D9). Every SDK published before it refuses a store holding any other stamp,
+#: so ``SCHEMA_VERSION`` may move past ``1.0.0`` only in a later release, and
+#: only once this one is on PyPI: ``tests/test_schema_version.py`` and
+#: ``release_publish.py --publish`` enforce the two halves.
+TOLERANT_GUARD_SINCE = "1.208.0"
+
 
 class SchemaVersionMismatchError(Exception):
-    """Raised when the SDK refuses to operate on a store carrying older particles.
+    """Raised when an operation meets a store it cannot read correctly.
 
-    (scrap-and-re-extract upgrade policy), the query / extract /
-    review / reindex operations MUST refuse to run when the store contains
-    ACTIVE particles whose ``schema_version`` does not match the current SDK
-    ``SCHEMA_VERSION``. The exception carries the actionable operator message
-    that surfaces through the CLI, FastAPI, and MCP layers — they all let it
-    bubble up; the CLI translates it to a clean exit; FastAPI/MCP emit the
-    str() as the error payload.
+    The query / extract / review / reindex / reconcile operations refuse to
+    run when the store holds ACTIVE particles whose ``schema_version`` is
+    *incompatible* with the SDK's: another major, or a stamp that does not
+    parse. A different minor of the same major is compatible and
+    never raises. The exception carries the operator message, which differs
+    by direction: a store behind the SDK is rebuilt by scrap-and-re-extract,
+    and a store ahead of it needs a newer SDK, never a
+    ``db init --force`` that would destroy records this SDK cannot rebuild.
+    The CLI, FastAPI and MCP layers let it bubble up; the CLI translates it to
+    a clean exit, FastAPI and MCP emit the str() as the error payload.
 
-    Lint deliberately does NOT raise this — it reports `SCHEMA_VERSION_MISMATCH`
+    Lint deliberately does NOT raise this: it reports `SCHEMA_VERSION_MISMATCH`
     findings via `_report_schema_versions` so the operator can diagnose first
-    (per the L-STR-07 check). The "refuse" policy applies to the operations
-    that would produce wrong results on mismatched data.
+    (the L-STR-07 check).
     """
 
     def __init__(
@@ -51,26 +66,45 @@ class SchemaVersionMismatchError(Exception):
         self.found_versions = found_versions
         super().__init__(self._format_message())
 
+    def _incompatible(self, *kinds: SchemaCompatibility) -> list[tuple[str, int]]:
+        # Sorted by value for deterministic output (helps tests and the
+        # operator's eye). The census is small (~1-3 entries typically).
+        return sorted(
+            (
+                (v, c)
+                for v, c in self.found_versions.items()
+                if schema_compatibility(v, self.current_version) in kinds
+            ),
+            key=lambda vc: stamp_sort_key(vc[0]),
+        )
+
     def _format_message(self) -> str:
-        # Sorted for deterministic output (helps tests and the operator's
-        # eye). The dict is small (~1-3 entries typically); sort cost is
-        # negligible.
-        mismatched = sorted(
-            ((v, c) for v, c in self.found_versions.items() if v != self.current_version),
-            key=lambda x: x[0],
-        )
-        total = sum(c for _, c in mismatched)
-        breakdown = ", ".join(f"{c} at v{v}" for v, c in mismatched)
-        return (
+        behind = self._incompatible(SchemaCompatibility.OLDER_MAJOR, SchemaCompatibility.MALFORMED)
+        ahead = self._incompatible(SchemaCompatibility.NEWER_MAJOR)
+        total = sum(c for _, c in behind + ahead)
+        breakdown = ", ".join(f"{c} at v{v}" for v, c in behind + ahead)
+        lines = [
             f"Particle store contains {total} ACTIVE particles whose "
-            f"schema_version does not match the current SDK "
-            f"(SDK is at v{self.current_version}; store has {breakdown}). "
-            f" the v0.3.x → v1.0.0 upgrade path is "
-            f"scrap-and-re-extract. Run:\n"
-            f"  particles db init --force    # confirms before dropping\n"
-            f"  particles extract --all-pending\n"
-            f"The corpus is preserved; only the particle store is rebuilt."
-        )
+            f"schema_version is incompatible with the current SDK "
+            f"(SDK is at v{self.current_version}; store has {breakdown})."
+        ]
+        if behind:
+            lines.append(
+                "For the particles on an older major schema: the "
+                "upgrade path across a major schema version is "
+                "scrap-and-re-extract. Run:\n"
+                "  particles db init --force    # confirms before dropping\n"
+                "  particles extract --all-pending\n"
+                "The corpus is preserved; only the particle store is rebuilt."
+            )
+        if ahead:
+            lines.append(
+                "For the particles on a newer major schema: they were written by "
+                "a newer Particles SDK. Upgrade this SDK to one at "
+                f"v{ahead[-1][0].split('.')[0]}.x to read them. Do not rebuild "
+                "the store from this SDK: it cannot re-create those particles."
+            )
+        return "\n".join(lines)
 
 
 def _new_uuid() -> str:
@@ -191,6 +225,12 @@ class FetchPolicy(StrEnum):
 class WarcRecordType(StrEnum):
     RESPONSE = "RESPONSE"
     REVISIT = "REVISIT"
+    # a completed vault walk looked for the source and did not
+    # find it. No blob and no ``archive_path``; ``refers_to`` names the entry's
+    # last RESPONSE and ``content_hash`` is the empty-body digest, which no
+    # content-hash lookup ever matches. It owes one piece of work (retiring the
+    # entry's claims), so it is written PENDING.
+    ABSENT = "ABSENT"
 
 
 class ExtractionStatus(StrEnum):
@@ -280,6 +320,12 @@ class RelationCreatedBy(StrEnum):
     # misattribute a deterministic merge to a model) and from AUTO_CLUSTER_V1
     # (reserved for the clustering pass).
     EXACT_DUPLICATE = "EXACT_DUPLICATE"
+    # `particles links dedup --reread --apply` — two readings of one
+    # passage of an APPEND_ONLY entry, judged one claim by the judge
+    # with no update reading saying the value changed. Kept distinct from
+    # EXACT_DUPLICATE (no key equality) and LLM_JUDGE (a link `links suggest
+    # --apply` writes, which a revert must never delete).
+    REREAD_DUPLICATE = "REREAD_DUPLICATE"
     # a confirmed contradiction the observer precondition declined
     # to reconcile — two projects state different values and each keeps its own.
     # Written on a CONTRADICTS edge; the probe verdict it records was already
@@ -675,8 +721,11 @@ class Particle(BaseModel):
     @field_validator("schema_version")
     @classmethod
     def _check_schema_version(cls, v: str) -> str:
-        if not v:
-            raise ValueError("schema_version must not be empty")
+        # MAJOR.MINOR.PATCH, as the published schema's pattern requires: the
+        # compatibility guard's index probe sees only the major prefix, so a
+        # stamp no comparison can parse must never be written (D3).
+        if parse_schema_version(v) is None:
+            raise ValueError(f"schema_version must be MAJOR.MINOR.PATCH, got {v!r}")
         return v
 
     @model_validator(mode="after")
@@ -739,7 +788,7 @@ class Snapshot(BaseModel):
     last_modified: datetime | None = None
     warc_record_type: WarcRecordType = WarcRecordType.RESPONSE
     archive_path: str | None = None
-    refers_to: str | None = None  # WARC-Refers-To snapshot_id for REVISIT
+    refers_to: str | None = None  # WARC-Refers-To snapshot_id for REVISIT / ABSENT
     extraction_status: ExtractionStatus = ExtractionStatus.PENDING
     # UGC author metadata (§6.4)
     author_id: str | None = None  # e.g. "github:torvalds"
@@ -898,6 +947,17 @@ class ExtractorCalibration(BaseModel):
             pairs in ascending order, when ``transform`` is ``"isotonic"``.
             ``temperature`` is then 1.0 and unused. ``None`` on
             every temperature record.
+        label_judge: The equivalence judge that labelled the fitted pairs:
+            ``embedding@<threshold>``, or ``llm:<provider:model>``
+            for the LLM judge. ``None`` on a record persisted before this key.
+        label_temperature: What the LLM judge's calls sent, in the
+            probe-ledger vocabulary: ``sent`` (a fixed temperature was
+            received, which does not make the labels reproducible), ``dropped``
+            (asked for and refused, so the judge sampled at its default) or
+            ``unset``. ``None`` for the embedding judge, which makes no model
+            call and is deterministic, and on a record from before this key.
+        runs: Independent benchmark passes pooled into the fit.
+            ``None`` on a record persisted before this key.
     """
 
     temperature: float = Field(gt=0.0)
@@ -914,6 +974,9 @@ class ExtractorCalibration(BaseModel):
     heldout_error_after: float | None = Field(default=None, ge=0.0, le=1.0)
     extractor_version: str | None = None
     breakpoints: list[tuple[float, float]] | None = None
+    label_judge: str | None = None
+    label_temperature: str | None = None
+    runs: int | None = Field(default=None, ge=1)
 
 
 class ExtractorRecord(BaseModel):
@@ -1612,6 +1675,11 @@ class ObserverScopeNote(BaseModel):
     lapsed: int = 0
     """Candidates some source once stated and none still does —
     in view for no project, and distinct from a stamping gap."""
+    attribution: str | None = None
+    """Set on an as-of read: which attribution the projects come from. The
+    lens reads today's project keys and widenings at every instant, so an
+    as-of result answers what the store believed then, scoped by today's
+    attribution, not what a session in that project saw then."""
 
 
 class AsOfNote(BaseModel):
@@ -2351,6 +2419,9 @@ class QualityReport(BaseModel):
     snapshots_in_progress: int
     snapshots_complete: int
     snapshots_failed: int
+    # Of ``snapshots_pending``, those held because the extraction model refused
+    # every call of their last pass. Still owed.
+    snapshots_held_refused: int = 0
     # Subjects
     total_subjects: int
     subjects_without_particles: int
@@ -2562,6 +2633,10 @@ class DedupReport(BaseModel):
     links_created: int = 0
     deferred_groups: int = 0
     deferred_redundant: int = 0
+    # Groups left unmerged because a member was written by a newer schema
+    # minor than this SDK's (D2): an older SDK never replaces a
+    # newer record with a copy it chose. Zero unless the store is ahead.
+    held_newer_schema_groups: int = 0
     warnings: list[str] = Field(default_factory=list)
 
 

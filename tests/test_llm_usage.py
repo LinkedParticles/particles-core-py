@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Generator
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -23,7 +24,7 @@ import anthropic
 import pytest
 
 from particles import llm
-from particles.config import ProviderSelection, TokenPrice, get_config
+from particles.config import ProviderSelection, TokenPrice, get_config, reset_config
 from particles.llm.adapters.anthropic import AnthropicProvider
 from particles.llm.adapters.openai_compat import _extract_text
 from particles.llm.usage import (
@@ -31,6 +32,8 @@ from particles.llm.usage import (
     LLMUsage,
     UsageRow,
     format_tokens,
+    observe_sampling,
+    purpose_scope,
     record_usage,
     render_usage_line,
     track_usage,
@@ -200,6 +203,203 @@ class TestAccumulator:
         # $1/$5 per MTok: 2M in + 0.2M out = $3.00 at list price, halved.
         assert row.cost_usd == pytest.approx(1.50)
         assert "2 batched" in render_usage_line(snap)
+
+
+_TEMPERATURE_REJECTION = "`temperature` is deprecated for this model."
+
+
+def _rejecting_client() -> MagicMock:
+    """A client that 400s on any call carrying ``temperature``."""
+
+    def _create(**kwargs: object) -> object:
+        if kwargs.get("extra_body") is not None:
+            exc = RuntimeError(_TEMPERATURE_REJECTION)
+            exc.status_code = 400  # type: ignore[attr-defined]
+            raise exc
+        return _message(input_tokens=10, output_tokens=2)
+
+    client = MagicMock(spec=anthropic.Anthropic)
+    client.messages = MagicMock()
+    client.messages.create = MagicMock(side_effect=_create)
+    return client
+
+
+class TestSampling:
+    """What each response sent, counted per slice and observed per block."""
+
+    @pytest.fixture(autouse=True)
+    def _forget_temperature_memo(self) -> Generator[None, None, None]:
+        from particles.llm.adapters import anthropic as adapter
+
+        adapter._TEMPERATURE_UNSUPPORTED.clear()
+        yield
+        adapter._TEMPERATURE_UNSUPPORTED.clear()
+
+    async def test_a_sent_temperature_is_requested_and_not_dropped(self) -> None:
+        llm.set_client(_client(_message(input_tokens=10, output_tokens=2)))
+        with track_usage() as usage, observe_sampling() as seen:
+            await llm.complete("semantic_lint", "p", max_tokens=8, temperature=0.0)
+        row = usage.snapshot().rows[0]
+        assert (row.temperature_requested, row.temperature_dropped) == (1, 0)
+        assert seen.value() == "sent"
+        assert "Fixed temperature not sent" not in render_usage_line(usage.snapshot())
+
+    async def test_a_refused_temperature_is_counted_once_as_dropped(self) -> None:
+        llm.set_client(_rejecting_client())
+        with track_usage() as usage, observe_sampling() as seen:
+            await llm.complete("semantic_lint", "p", max_tokens=8, temperature=0.0)
+            await llm.complete("semantic_lint", "q", max_tokens=8, temperature=0.0)
+        snap = usage.snapshot()
+        row = snap.rows[0]
+        # The refused attempt is not billed and not counted; the retry is.
+        assert (row.calls, row.temperature_requested, row.temperature_dropped) == (2, 2, 2)
+        assert snap.temperature_dropped == 2
+        assert seen.value() == "dropped"
+        assert "Fixed temperature not sent (semantic lint: 2 of 2 calls)" in render_usage_line(snap)
+
+    async def test_a_call_that_asks_for_none_counts_in_neither(self) -> None:
+        llm.set_client(_client(_message(input_tokens=10, output_tokens=2)))
+        with track_usage() as usage, observe_sampling() as seen:
+            await llm.complete("extraction", "p", max_tokens=8)
+        row = usage.snapshot().rows[0]
+        assert (row.temperature_requested, row.temperature_dropped) == (0, 0)
+        assert seen.value() == "unset"
+
+    async def test_a_call_outside_the_registry_is_not_claimed(self) -> None:
+        llm.set_client(_client(_message(input_tokens=10, output_tokens=2)))
+        with observe_sampling() as seen:
+            await AnthropicProvider(model="claude-haiku-4-5").complete(
+                "p", max_tokens=8, temperature=0.0
+            )
+        assert seen.value() is None
+
+    def test_no_call_and_disagreeing_calls_observe_nothing(self) -> None:
+        with observe_sampling() as empty:
+            pass
+        assert empty.value() is None
+        with (
+            observe_sampling() as mixed,
+            purpose_scope("semantic_lint", temperature_requested=True),
+        ):
+            record_usage("anthropic:m", temperature_sent=True)
+            record_usage("anthropic:m", temperature_sent=False)
+        assert mixed.value() is None
+        with (
+            observe_sampling() as silent,
+            purpose_scope("semantic_lint", temperature_requested=True),
+        ):
+            record_usage("anthropic:m")
+        assert silent.value() is None
+
+    def test_concurrent_blocks_see_only_their_own_calls(self) -> None:
+        async def one(sent: bool) -> str | None:
+            with (
+                observe_sampling() as seen,
+                purpose_scope("semantic_lint", temperature_requested=True),
+            ):
+                await asyncio.sleep(0)
+                record_usage("anthropic:m", temperature_sent=sent)
+            return seen.value()
+
+        async def both() -> list[str | None]:
+            return list(await asyncio.gather(one(True), one(False)))
+
+        assert asyncio.run(both()) == ["sent", "dropped"]
+
+    async def test_a_batch_rerun_without_temperature_is_dropped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("PARTICLES_CONFIG", str(_batch_config_file(tmp_path)))
+        reset_config()
+        first = [_errored(str(i)) for i in range(2)]
+        second = [
+            SimpleNamespace(
+                custom_id=str(i),
+                result=SimpleNamespace(
+                    type="succeeded", message=_message(input_tokens=10, output_tokens=2)
+                ),
+            )
+            for i in range(2)
+        ]
+        client = MagicMock(spec=anthropic.Anthropic)
+        client.messages = MagicMock()
+        client.messages.batches.create.side_effect = [
+            SimpleNamespace(id="b1"),
+            SimpleNamespace(id="b2"),
+        ]
+        client.messages.batches.retrieve.return_value = SimpleNamespace(processing_status="ended")
+        by_batch = {"b1": first, "b2": second}
+        client.messages.batches.results.side_effect = lambda batch_id: iter(by_batch[batch_id])
+        llm.set_client(client)
+        requests = [llm.CompletionRequest(prompt=f"p{i}") for i in range(2)]
+        with track_usage() as usage, observe_sampling() as seen:
+            out = await llm.complete_many(
+                "semantic_lint", requests, max_tokens=8, temperature=0.0, latency_tolerant=True
+            )
+        assert out == ["ok", "ok"]
+        row = usage.snapshot().rows[0]
+        assert (row.batched, row.temperature_requested, row.temperature_dropped) == (True, 2, 2)
+        assert seen.value() == "dropped"
+
+    def test_openai_compat_reports_what_it_sent(self) -> None:
+        payload = {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+        with (
+            track_usage() as usage,
+            observe_sampling() as seen,
+            purpose_scope("semantic_lint", temperature_requested=True),
+        ):
+            _extract_text(payload, provider_model="local:m", temperature_sent=True)
+            _extract_text(payload, provider_model="local:m", temperature_sent=False)
+        row = usage.snapshot().rows[0]
+        assert (row.temperature_requested, row.temperature_dropped) == (2, 1)
+        assert seen.value() is None
+
+    def test_a_replay_entry_keeps_what_was_sent(self, tmp_path: Path) -> None:
+        from particles.llm.replay import _read_entry, _summed, _Usage, _write_entry
+
+        rows = [
+            UsageRow(
+                purpose="p",
+                provider="a",
+                model="m",
+                calls=1,
+                temperature_requested=1,
+                temperature_dropped=1,
+            )
+        ]
+        usage = _summed(rows)
+        assert usage.temperature_sent is False
+        _write_entry(tmp_path, "ab" * 32, purpose="p", provider_model="a:m", text="t", usage=usage)
+        entry = _read_entry(tmp_path, "ab" * 32)
+        assert entry is not None and entry[1].temperature_sent is False
+        # An entry recorded before the field existed says nothing.
+        legacy = _Usage()
+        _write_entry(tmp_path, "cd" * 32, purpose="p", provider_model="a:m", text="t", usage=legacy)
+        entry = _read_entry(tmp_path, "cd" * 32)
+        assert entry is not None and entry[1].temperature_sent is None
+
+    def test_rows_recorded_before_the_counts_load(self) -> None:
+        row = UsageRow.model_validate({"purpose": "p", "provider": "a", "model": "m", "calls": 3})
+        assert (row.temperature_requested, row.temperature_dropped) == (0, 0)
+
+
+def _batch_config_file(tmp_path: Path) -> Path:
+    config = tmp_path / "config.yaml"
+    config.write_text("llm:\n  batch:\n    min_requests: 2\n    poll_interval_seconds: 0.01\n")
+    return config
+
+
+def _errored(custom_id: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        custom_id=custom_id,
+        result=SimpleNamespace(
+            type="errored",
+            error=SimpleNamespace(
+                type="error",
+                error=SimpleNamespace(type="invalid_request_error", message=_TEMPERATURE_REJECTION),
+            ),
+        ),
+    )
 
 
 class TestOpenAICompatUsage:

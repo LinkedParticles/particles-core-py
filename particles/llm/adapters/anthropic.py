@@ -39,7 +39,7 @@ from opentelemetry import metrics, trace
 
 from particles.llm.batch_budget import current_batch_wait_budget
 from particles.llm.registry import (
-    CompletionError,
+    CompletionRefused,
     CompletionRequest,
     EmptyCompletionError,
     RequestFailure,
@@ -107,6 +107,22 @@ def _is_unsupported_temperature(exc: Exception) -> bool:
     if getattr(exc, "status_code", None) != 400:
         return False
     return "temperature" in str(exc).lower()
+
+
+def _is_unsupported_temperature_result(result: object) -> bool:
+    """True when a Message Batches entry errored on the ``temperature`` parameter.
+
+    The batch counterpart of :func:`_is_unsupported_temperature`. A batch
+    accepts a request the model will refuse, so the 400 the single-call path
+    raises arrives here as one ``errored`` entry per request, carrying an
+    ``invalid_request_error`` that names the parameter.
+    """
+    if getattr(result, "type", None) != "errored":
+        return False
+    error = getattr(getattr(result, "error", None), "error", None)
+    if getattr(error, "type", None) != "invalid_request_error":
+        return False
+    return "temperature" in str(getattr(error, "message", "")).lower()
 
 
 @dataclass(frozen=True)
@@ -224,10 +240,17 @@ class AnthropicProvider:
                     self.model,
                     exc,
                 )
+                temp_arg = omit
                 resp = _create(omit)
             # Billed whatever happens next (a refusal or an empty reply is
-            # still paid for), so it is counted before either raises.
-            _record_message_usage(self.provider_model, resp, batched=False)
+            # still paid for), so it is counted before either raises. What it
+            # sent is reported with it.
+            _record_message_usage(
+                self.provider_model,
+                resp,
+                batched=False,
+                temperature_sent=not isinstance(temp_arg, Omit),
+            )
             # Record prompt-cache usage for verification/observability without
             # widening the port's return; the widening is deferred.
             usage = getattr(resp, "usage", None)
@@ -242,10 +265,12 @@ class AnthropicProvider:
                 # absent or None even on a refusal; guard every hop.
                 details = getattr(resp, "stop_details", None)
                 category = getattr(details, "category", None) if details is not None else None
-                raise CompletionError(
+                raise CompletionRefused(
                     "Anthropic declined the request (stop_reason=refusal"
                     + (f", category={category}" if category else "")
-                    + ") — the model's safety classifiers refused this content"
+                    + ") — the model's safety classifiers refused this content",
+                    provider_model=self.provider_model,
+                    category=str(category) if category else None,
                 )
             if stop_reason == "max_tokens":
                 # Budget exhaustion returns HTTP 200 with text that stops
@@ -330,7 +355,8 @@ class AnthropicProvider:
 
         ``failures_out`` is extended with why each ``None`` came back: a reply
         with no text block is :attr:`RequestFailure.EMPTY` (a budget spent on
-        thinking, or a refusal), anything that never produced a reply is
+        thinking), a refused one :attr:`RequestFailure.REFUSED`, and
+        anything that never produced a reply is
         :attr:`RequestFailure.UNAVAILABLE`.
         """
         del response_schema, opts
@@ -422,6 +448,10 @@ class AnthropicProvider:
         if budget is not None:
             max_wait, capped_by_budget = budget.wait_cap(max_wait)
 
+        # honour the same per-model memo `complete` populates. A batch
+        # sent before any single call in the process cannot know it yet; a
+        # rejection then comes back per request and is learned below.
+        batch_temp = self._temperature_arg(temperature)
         # ``custom_id`` is this chunk's index as a string; each chunk is its own
         # batch, so the ids only have to be unique within it.
         params: list[dict[str, Any]] = []
@@ -436,12 +466,6 @@ class AnthropicProvider:
             sys_arg = _system_arg(request.system, request.cache_prefix)
             if not isinstance(sys_arg, Omit):
                 body["system"] = sys_arg
-            # honour the same per-model memo `complete` populates. A
-            # batch submission is all-or-nothing, so a rejected parameter fails
-            # the whole job rather than one pair — there is no per-request retry
-            # to fall back on, which is why this path only reads the memo and
-            # never learns from a failure of its own.
-            batch_temp = self._temperature_arg(temperature)
             if not isinstance(batch_temp, Omit):
                 body["temperature"] = batch_temp
             params.append({"custom_id": str(i), "params": body})
@@ -510,8 +534,15 @@ class AnthropicProvider:
                         budget.record_cancellation(kept=0, rerun=0, lost=len(requests))
                     return [None] * len(requests), [RequestFailure.UNAVAILABLE] * len(requests)
                 canceled_ids: set[str] = set()
+                temperature_ids: set[str] = set()
                 by_id = await asyncio.to_thread(
-                    self._collect, batch_id, max_tokens, self.provider_model, canceled_ids
+                    self._collect,
+                    batch_id,
+                    max_tokens,
+                    self.provider_model,
+                    canceled_ids,
+                    temperature_ids,
+                    not isinstance(batch_temp, Omit),
                 )
             finally:
                 _llm_duration.record(time.perf_counter() - started, {"model": self.model})
@@ -519,6 +550,19 @@ class AnthropicProvider:
         replies = [by_id.get(str(i), _MISSING_REPLY) for i in range(len(requests))]
         texts = [r.text for r in replies]
         failures = [r.failure for r in replies]
+        if temperature_ids and not isinstance(batch_temp, Omit):
+            await self._rerun_without_temperature(
+                batch_id,
+                requests,
+                texts,
+                failures,
+                temperature_ids,
+                max_tokens=max_tokens,
+                poll_interval=poll_interval,
+                max_wait=max_wait,
+                cancel_grace=cancel_grace,
+                rerun_max_output_tokens=rerun_max_output_tokens,
+            )
         if cancelled:
             await self._settle_cancelled(
                 batch_id,
@@ -531,6 +575,59 @@ class AnthropicProvider:
                 rerun_max_output_tokens=rerun_max_output_tokens,
             )
         return texts, failures
+
+    async def _rerun_without_temperature(
+        self,
+        batch_id: str,
+        requests: Sequence[CompletionRequest],
+        texts: list[str | None],
+        failures: list[RequestFailure | None],
+        rejected_ids: set[str],
+        *,
+        max_tokens: int,
+        poll_interval: float,
+        max_wait: float,
+        cancel_grace: float,
+        rerun_max_output_tokens: int,
+    ) -> None:
+        """Learn that this model refuses ``temperature`` and re-run what it refused.
+
+        Fills ``texts`` / ``failures`` in place. The batch path learns from its
+        own failure, exactly as :meth:`complete` does, because a batch is often
+        the first call a process makes on a purpose: the consolidation census
+        probes every pair in one batch before any single ``semantic_lint``
+        call, and without this every probe in it came back unanswered.
+
+        The refused requests go out again as a batch, not sequentially: an
+        errored request is not billed, and time has not run out the way it has
+        for a cancelled batch's remainder, so the batch discount still applies.
+        The re-run goes through :meth:`_run_batch`, so a run's batch-wait budget
+        still decides between batch and sequential for it. It cannot recurse:
+        the memo now omits the parameter, and only a batch that sent it learns.
+        """
+        _TEMPERATURE_UNSUPPORTED.add(self.model)
+        rerun = [i for i in range(len(requests)) if str(i) in rejected_ids]
+        log.warning(
+            "Anthropic model %s rejected the temperature parameter in batch %s; "
+            "re-running its %d request(s) without it and omitting it for the rest "
+            "of this process. Sampling is now the model's default, so calls that "
+            "relied on temperature=0 are no longer deterministic.",
+            self.model,
+            batch_id,
+            len(rerun),
+        )
+        re_texts, re_failures = await self._run_batch(
+            [requests[i] for i in rerun],
+            max_tokens=max_tokens,
+            temperature=None,
+            poll_interval=poll_interval,
+            max_wait=max_wait,
+            cancel_grace=cancel_grace,
+            rerun_max_output_tokens=rerun_max_output_tokens,
+        )
+        for i, text, failure in zip(rerun, re_texts, re_failures, strict=True):
+            texts[i] = text
+            failures[i] = failure
 
     async def _settle_cancelled(
         self,
@@ -674,6 +771,8 @@ class AnthropicProvider:
         max_tokens: int,
         provider_model: str,
         canceled_out: set[str] | None = None,
+        temperature_out: set[str] | None = None,
+        temperature_sent: bool | None = None,
     ) -> dict[str, _BatchReply]:
         """Read a finished batch's results into ``{custom_id: _BatchReply}``.
 
@@ -686,6 +785,10 @@ class AnthropicProvider:
         recorded as batched (billed at the batch discount). ``canceled_out``,
         when given, collects the ids whose result was ``canceled``: the
         remainder a cancelled batch may re-run.
+        ``temperature_out``, when given, collects the ids that errored because
+        the model refuses ``temperature``. ``temperature_sent`` is
+        whether this batch's requests carried one, reported with each
+        succeeded request's usage.
         """
         from particles.llm.client import get_client
 
@@ -703,10 +806,14 @@ class AnthropicProvider:
                 )
                 if canceled_out is not None and result.type == "canceled":
                     canceled_out.add(custom_id)
+                if temperature_out is not None and _is_unsupported_temperature_result(result):
+                    temperature_out.add(custom_id)
                 out[custom_id] = _BatchReply(None, RequestFailure.UNAVAILABLE)
                 continue
             message = result.message
-            _record_message_usage(provider_model, message, batched=True)
+            _record_message_usage(
+                provider_model, message, batched=True, temperature_sent=temperature_sent
+            )
             stop_reason = getattr(message, "stop_reason", None)
             if stop_reason == "max_tokens":
                 # Same masquerade as the single-shot path: a truncated batch
@@ -721,10 +828,18 @@ class AnthropicProvider:
                     custom_id,
                     max_tokens,
                 )
+            if stop_reason == "refusal":
+                # A judgement about the content, terminal for this request:
+                # never retried at a larger budget nor re-queued.
+                log.info(
+                    "Batch %s request %s was refused (stop_reason=refusal)", batch_id, custom_id
+                )
+                out[custom_id] = _BatchReply(None, RequestFailure.REFUSED)
+                continue
             text_block = next((b for b in message.content if hasattr(b, "text")), None)
             if text_block is None:
-                # No text block: a refusal, or an answer that spent its whole
-                # max_tokens on thinking. Same treatment as an errored request.
+                # No text block: an answer that spent its whole max_tokens on
+                # thinking. Same treatment as an errored request.
                 log.info(
                     "Batch %s request %s carried no text block (stop_reason=%s)",
                     batch_id,
@@ -765,7 +880,13 @@ def _usage_tokens(usage: object, name: str) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
-def _record_message_usage(provider_model: str, message: object, *, batched: bool) -> None:
+def _record_message_usage(
+    provider_model: str,
+    message: object,
+    *,
+    batched: bool,
+    temperature_sent: bool | None = None,
+) -> None:
     """Report one Messages API response's ``usage`` to the open usage scopes."""
     usage = getattr(message, "usage", None)
     record_usage(
@@ -776,6 +897,7 @@ def _record_message_usage(provider_model: str, message: object, *, batched: bool
         cache_read_tokens=_usage_tokens(usage, "cache_read_input_tokens"),
         hit_max_tokens=getattr(message, "stop_reason", None) == "max_tokens",
         batched=batched,
+        temperature_sent=temperature_sent,
     )
 
 

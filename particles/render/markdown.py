@@ -1131,6 +1131,8 @@ def observer_scope_line(note: ObserverScopeNote) -> str:
         line += f"; {note.unattributed} unattributed"
     if note.lapsed:
         line += f"; {note.lapsed} lapsed (no source states them any more)"
+    if note.attribution:
+        line += f". {note.attribution.rstrip('.')}"
     return line + "._"
 
 
@@ -1154,6 +1156,7 @@ def render_digest_located(
     total_active: int,
     observer: ObserverScopeNote | None = None,
     spend_line: str | None = None,
+    refused_line: str | None = None,
 ) -> tuple[str, list[int]]:
     """Render the digest, and where each entry's line starts in it.
 
@@ -1181,6 +1184,10 @@ def render_digest_located(
     the caller; it closes the digest as one italic line. ``None`` (no run has
     recorded usage yet) leaves the output byte-identical to before.
 
+    ``refused_line`` says how many sources are not in memory
+    because the extraction model declined them, as one italic line before the
+    spend line. ``None`` leaves the output byte-identical to before.
+
     Pure: no session and no clock — ``asserted_at`` renders as its date, and
     recency is already folded into the effective-confidence ordering, so the
     output is deterministic for a given input.
@@ -1194,6 +1201,8 @@ def render_digest_located(
             else f"in `{store}`"
         )
         empty = [header, "", *scope_lines, f"_No ACTIVE beliefs {where}._"]
+        if refused_line is not None:
+            empty += ["", f"_{refused_line}_"]
         if spend_line is not None:
             empty += ["", f"_{spend_line}_"]
         return "\n".join(empty) + "\n", []
@@ -1231,6 +1240,8 @@ def render_digest_located(
             f"_Showing the top {shown} of {total_active} by effective confidence; "
             f"{total_active - shown} not shown._",
         ]
+    if refused_line is not None:
+        lines += ["", f"_{refused_line}_"]
     if spend_line is not None:
         lines += ["", f"_{spend_line}_"]
     # Each line is joined by one "\n", so a line starts after the lengths of

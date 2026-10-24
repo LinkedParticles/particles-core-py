@@ -51,6 +51,7 @@ from particles.llm.registry import (
     RequestFailure,
     complete_many_with_provider_model,
 )
+from particles.llm.usage import SamplingObservation, current_observations, observing
 
 log = logging.getLogger(__name__)
 
@@ -81,6 +82,10 @@ class _ParkedGroup:
     response_schema: dict[str, Any] | None
     future: asyncio.Future[GroupResult]
     failures: list[RequestFailure | None] = field(default_factory=list)
+    #: The caller's open sampling observations, so the merged
+    #: batch reports what it sent to the caller rather than to the task that
+    #: happened to dispatch it.
+    observations: tuple[SamplingObservation, ...] = ()
 
 
 class CompletionPool:
@@ -194,6 +199,7 @@ class CompletionPool:
             temperature=temperature,
             response_schema=response_schema,
             future=future,
+            observations=current_observations(),
         )
         registered = _IDLE.get()
         idle = registered[1] if registered is not None and registered[0] is self else None
@@ -267,16 +273,18 @@ class CompletionPool:
                 self._purpose,
             )
             failures: list[RequestFailure | None] = []
+            observers = tuple(o for group in key_groups for o in group.observations)
             try:
-                results, provider_model = await complete_many_with_provider_model(
-                    self._purpose,
-                    merged,
-                    max_tokens=first.max_tokens,
-                    temperature=first.temperature,
-                    response_schema=first.response_schema,
-                    latency_tolerant=True,
-                    failures_out=failures,
-                )
+                with observing(observers):
+                    results, provider_model = await complete_many_with_provider_model(
+                        self._purpose,
+                        merged,
+                        max_tokens=first.max_tokens,
+                        temperature=first.temperature,
+                        response_schema=first.response_schema,
+                        latency_tolerant=True,
+                        failures_out=failures,
+                    )
             except Exception as exc:  # noqa: BLE001 — routed into every group's future
                 for group in key_groups:
                     if not group.future.done():

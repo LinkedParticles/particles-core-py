@@ -73,8 +73,11 @@ from particles.extraction.general import (
     _split_into_paragraph_chunks,
     _strip_obsidian_frontmatter,
     candidate_to_particle,
+    complete_extraction,
     content_to_text,
     path_component_digests,
+    record_answered,
+    record_refusal,
     routing_component_digest,
     source_text,
 )
@@ -414,7 +417,7 @@ async def _call_journal_llm(text: str) -> tuple[list[CandidateParticle], list[st
     """
     from particles.llm import (
         AccountLevelLLMError,
-        complete_with_provider_model,
+        CompletionRefused,
         fenced_prompt,
         is_account_level_failure,
     )
@@ -432,8 +435,8 @@ async def _call_journal_llm(text: str) -> tuple[list[CandidateParticle], list[st
     # here for the same reason as ``general.py::_call_llm``.
     provider_model = ""
     try:
-        raw, provider_model = await complete_with_provider_model(
-            "extraction", user, max_tokens=cfg.max_tokens, system=system
+        raw, provider_model = await complete_extraction(
+            user, max_tokens=cfg.max_tokens, system=system
         )
     except Exception as exc:
         # Account-level failures abort rather than degrading to a per-call
@@ -441,9 +444,13 @@ async def _call_journal_llm(text: str) -> tuple[list[CandidateParticle], list[st
         if is_account_level_failure(exc):
             log.error("Journal extraction unavailable (account-level): %s", exc)
             raise AccountLevelLLMError(exc) from exc
+        if isinstance(exc, CompletionRefused):
+            record_refusal(exc.provider_model, exc.category)
+            return [], [f"API error: {exc}"], True
         log.error("Journal extraction API call failed: %s", exc)
         return [], [f"API error: {exc}"], True
 
+    record_answered()
     log.debug("Raw journal LLM response (%d chars):\n%s", len(raw), raw)
     candidates, notes = _parse_journal_response(raw)
     for candidate in candidates:

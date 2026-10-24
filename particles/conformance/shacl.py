@@ -10,6 +10,12 @@ Validates JSON-LD serialised records against the five normative SHACL shapes:
   § Amendment).
 
 Shapes are loaded from artifacts/schemas/shacl/*.ttl relative to the repo root.
+
+A particle document is judged against the contract this SDK knows (
+D7): one stamped with an incompatible ``schemaVersion`` does not conform, as
+not judgeable against these shapes, and one stamped with a newer minor is
+validated as it stands (the shapes are open, so properties added after the
+SDK's minor are ignored) and carries a note saying they were not checked.
 """
 
 from __future__ import annotations
@@ -19,6 +25,12 @@ import logging
 from typing import Any
 
 from particles.conformance._resources import schemas_dir
+from particles.conformance.jsonschema import (
+    classify_record_version,
+    not_judgeable_message,
+    sdk_schema_version,
+)
+from particles.core.schema_version import SchemaCompatibility
 
 log = logging.getLogger(__name__)
 
@@ -37,18 +49,46 @@ _SHAPE_FILES = {
 
 
 class ValidationResult:
-    def __init__(self, conforms: bool, report_text: str, violations: list[str]) -> None:
+    def __init__(
+        self,
+        conforms: bool,
+        report_text: str,
+        violations: list[str],
+        notes: list[str] | None = None,
+    ) -> None:
         self.conforms = conforms
         self.report_text = report_text
         self.violations = violations
+        #: Informational remarks that do not affect ``conforms`` (D7).
+        self.notes = notes if notes is not None else []
 
     def __repr__(self) -> str:
         return f"ValidationResult(conforms={self.conforms}, violations={len(self.violations)})"
 
 
 def validate_particle(particle_jsonld: dict[str, Any]) -> ValidationResult:
-    """Validate a particle JSON-LD document against ParticleShape."""
-    return _validate(particle_jsonld, "ParticleShape")
+    """Validate a particle JSON-LD document against ParticleShape.
+
+    The document's ``schemaVersion`` decides whether the shape can judge it
+    (D7): an incompatible stamp does not conform, and a newer minor
+    passes or fails on what the shape constrains, with a note.
+    """
+    stamp = particle_jsonld.get("particles:schemaVersion", particle_jsonld.get("schemaVersion"))
+    if stamp is None:
+        return _validate(particle_jsonld, "ParticleShape")
+    compat = classify_record_version(stamp)
+    if not compat.compatible:
+        message = not_judgeable_message(stamp, compat)
+        return ValidationResult(conforms=False, report_text=message, violations=[message])
+    result = _validate(particle_jsonld, "ParticleShape")
+    if compat is SchemaCompatibility.NEWER_MINOR:
+        current = sdk_schema_version()
+        result.notes.append(
+            f"record schema version {stamp} is a newer minor than this SDK's schema "
+            f"{current}: properties added after {current} "
+            "were not checked (ParticleShape is open, so they are ignored)."
+        )
+    return result
 
 
 def validate_subject(subject_jsonld: dict[str, Any]) -> ValidationResult:

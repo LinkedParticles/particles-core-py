@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -19,10 +20,17 @@ from particles.core.held_release import (
     blocking_from_payload,
     decide_release,
     is_due,
+    is_generation_hold,
     qualifies,
 )
 from particles.core.observer_scope import PairPrecondition
-from particles.core.schema import Confidence, Particle, UncertaintyNature
+from particles.core.schema import (
+    Confidence,
+    Particle,
+    ProvenanceRef,
+    ProvenanceRefType,
+    UncertaintyNature,
+)
 from particles.core.scoring.confidence import CalibrationSource
 from particles.core.status import Status, StatusReason
 
@@ -144,3 +152,70 @@ class TestDecide:
         decision = decide_release([declined, unread])
         assert decision.action is ReleaseAction.RELEASE
         assert decision.declined == ("c",)
+
+
+# ---------------------------------------------------------------------------
+# a hold the generation cascade orphaned before
+# ---------------------------------------------------------------------------
+
+
+def _at(day: int) -> datetime:
+    return datetime(2026, 10, day, tzinfo=UTC)
+
+
+def _sourced(p: Particle, *refs: tuple[str, str | None]) -> Particle:
+    return p.model_copy(
+        update={
+            "provenance": [
+                ProvenanceRef(type=ProvenanceRefType.SOURCE, corpus_entry_id=e, snapshot_id=s)
+                for e, s in refs
+            ]
+        }
+    )
+
+
+CAPTURED = {"s1": _at(1), "s2": _at(2), "t1": _at(3)}
+CASCADED = _p(Status.PROVENANCE_STALE, StatusReason.RETRACTED_DEPENDENCY)
+
+
+class TestGenerationHold:
+    def _hold(self, a: Particle, b: Particle, current: dict[str, str] | None = None) -> bool:
+        return is_generation_hold(
+            a, b, current={"E": "s2"} if current is None else current, captured=CAPTURED
+        )
+
+    def test_an_older_generation_of_the_same_entry_is_one(self) -> None:
+        assert self._hold(_sourced(CASCADED, ("E", "s1")), _sourced(HELD, ("E", "s2")))
+
+    def test_it_qualifies_only_when_the_shell_says_so(self) -> None:
+        assert qualifies(RECORD, CASCADED, HELD, generation=True)
+        assert not qualifies(RECORD, CASCADED, HELD)
+
+    def test_another_reason_is_not(self) -> None:
+        a = _sourced(_p(Status.RETRACTED, StatusReason.EXPLICIT_RETRACTION), ("E", "s1"))
+        assert not self._hold(a, _sourced(HELD, ("E", "s2")))
+
+    def test_two_entries_are_not(self) -> None:
+        assert not self._hold(
+            _sourced(CASCADED, ("E", "s1"), ("F", "t1")), _sourced(HELD, ("E", "s2"))
+        )
+        assert not self._hold(_sourced(CASCADED, ("F", "t1")), _sourced(HELD, ("E", "s2")))
+
+    def test_an_entry_with_no_current_generation_is_not(self) -> None:
+        """Not MUTABLE, never extracted, or its current record is an absence."""
+        a, b = _sourced(CASCADED, ("E", "s1")), _sourced(HELD, ("E", "s2"))
+        assert not self._hold(a, b, current={})
+
+    def test_an_entry_that_moved_past_the_held_claim_is_not(self) -> None:
+        """A quarantined claim is never carried forward, so a release would read as lapsed."""
+        a, b = _sourced(CASCADED, ("E", "s1")), _sourced(HELD, ("E", "s2"))
+        assert not self._hold(a, b, current={"E": "s3"})
+
+    def test_the_held_claim_must_be_the_newer_generation(self) -> None:
+        assert not self._hold(
+            _sourced(CASCADED, ("E", "s2")), _sourced(HELD, ("E", "s1")), current={"E": "s1"}
+        )
+
+    def test_an_undated_ref_keeps_it_out(self) -> None:
+        assert not self._hold(_sourced(CASCADED, ("E", None)), _sourced(HELD, ("E", "s2")))
+        assert not self._hold(_sourced(CASCADED, ("E", "s9")), _sourced(HELD, ("E", "s2")))

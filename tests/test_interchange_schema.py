@@ -145,3 +145,16 @@ def test_wrong_type_discriminator_fails() -> None:
     unit["@type"] = "Widget"
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.Draft202012Validator(_load_schema()).validate(unit)
+
+
+def test_codec_known_keys_are_the_schema_particle_unit_properties() -> None:
+    """The keys the importer knows are exactly the ones ``ParticleUnit`` declares.
+
+    ``from_unit`` reads a unit only through ``PARTICLE_UNIT_KEYS`` and reports
+    every other key as dropped (D6), so this pins that one constant to
+    the published contract from the other side.
+    """
+    from particles.interchange.codec import PARTICLE_UNIT_KEYS
+
+    declared = set(_load_schema()["$defs"]["ParticleUnit"]["properties"])
+    assert declared == PARTICLE_UNIT_KEYS

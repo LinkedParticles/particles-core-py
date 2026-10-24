@@ -27,15 +27,26 @@ reported too, flagged ``replayed`` with the usage it was recorded with. It
 lands in a row of its own, priced at what it would have cost, and is kept out
 of the run's spend so the usage line shows the saving instead of undercounting
 the work.
+
+**Sampling**. The registry records whether the caller asked for a
+fixed temperature (:func:`purpose_scope`), and each adapter says whether it
+sent one. A slice counts the calls that asked (``temperature_requested``) and,
+of those, the calls the provider received without it (``temperature_dropped``):
+a model that refuses the parameter, or an OpenAI-compatible entry with
+``send_temperature: false``. A call that asked for none counts in neither.
+:func:`observe_sampling` reads the same fact for the calls inside one block,
+which is how a probe-ledger row names what its answer was sampled under.
 """
 
 from __future__ import annotations
 
 import contextlib
 import threading
+from collections import Counter
 from collections.abc import Iterator
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -44,6 +55,17 @@ from particles.core.schema import StoreLLMSpend
 #: Purpose recorded for a call made outside the registry (a directly-constructed
 #: adapter). Kept visible rather than dropped: it is still spend.
 UNATTRIBUTED = "unattributed"
+
+#: What one call sent, as a probe-ledger row records it.
+#: ``sent``: the caller asked for a fixed temperature and the provider received
+#: it, which does not make the reply reproducible. ``dropped``:
+#: the caller asked and the provider did not receive it. ``unset``: the caller
+#: asked for none. ``none`` is written by a rung that makes no model call and
+#: is never observed here.
+Sampling = Literal["sent", "dropped", "unset", "none"]
+
+#: The ledger value of a row a non-model rung wrote.
+NO_SAMPLING: Sampling = "none"
 
 
 class UsageRow(BaseModel):
@@ -69,6 +91,11 @@ class UsageRow(BaseModel):
     #: Responses that stopped at the token ceiling (``stop_reason=max_tokens``
     #: or ``finish_reason=length``): the reply was cut off mid-text.
     max_tokens_stops: int = 0
+    #: Responses whose caller asked for a fixed temperature.
+    temperature_requested: int = 0
+    #: Of those, the responses the provider received without it: the model
+    #: refuses the parameter, or the endpoint is configured not to send it.
+    temperature_dropped: int = 0
     #: List price of this slice in US$, ``None`` when the model has no entry.
     #: For a replayed slice this is what the calls would have cost, not spend.
     cost_usd: float | None = None
@@ -104,6 +131,11 @@ class LLMUsage(BaseModel):
         return sum(row.max_tokens_stops for row in self.rows)
 
     @property
+    def temperature_dropped(self) -> int:
+        """Responses whose requested temperature was not sent, across every row."""
+        return sum(row.temperature_dropped for row in self.rows)
+
+    @property
     def priced_cost_usd(self) -> float:
         """List price of the priced rows only.
 
@@ -124,6 +156,8 @@ class _Counts:
     cache_creation_tokens: int = 0
     cache_read_tokens: int = 0
     max_tokens_stops: int = 0
+    temperature_requested: int = 0
+    temperature_dropped: int = 0
 
 
 _Key = tuple[str, str, str, bool, bool]  # (purpose, provider, model, batched, replayed)
@@ -153,6 +187,8 @@ class UsageAccumulator:
         cache_read_tokens: int,
         hit_max_tokens: bool,
         replayed: bool = False,
+        sampling: Sampling | None = None,
+        temperature_requested: bool = False,
     ) -> None:
         """Add one response's usage to the slice it belongs to."""
         key = (purpose, provider, model, batched, replayed)
@@ -164,11 +200,28 @@ class UsageAccumulator:
             counts.cache_creation_tokens += cache_creation_tokens
             counts.cache_read_tokens += cache_read_tokens
             counts.max_tokens_stops += int(hit_max_tokens)
+            counts.temperature_requested += int(temperature_requested)
+            counts.temperature_dropped += int(sampling == "dropped")
+
+    def take(self) -> LLMUsage:
+        """The totals so far, then start counting from zero.
+
+        For a caller that runs passes one after another inside one scope and
+        wants each pass's usage on its own (``extractor benchmark --runs N``
+        writes one run file per pass).
+        """
+        with self._lock:
+            counts, self._counts = self._counts, {}
+        return self._priced(sorted(counts.items()))
 
     def snapshot(self) -> LLMUsage:
         """The totals so far, priced at the configured list prices (read now)."""
         with self._lock:
             items = sorted(self._counts.items())
+        return self._priced(items)
+
+    @staticmethod
+    def _priced(items: list[tuple[_Key, _Counts]]) -> LLMUsage:
         rows: list[UsageRow] = []
         unpriced: list[str] = []
         total: float | None = 0.0
@@ -197,6 +250,8 @@ class UsageAccumulator:
                     cache_creation_tokens=counts.cache_creation_tokens,
                     cache_read_tokens=counts.cache_read_tokens,
                     max_tokens_stops=counts.max_tokens_stops,
+                    temperature_requested=counts.temperature_requested,
+                    temperature_dropped=counts.temperature_dropped,
                     cost_usd=cost,
                 )
             )
@@ -207,6 +262,49 @@ _ACCUMULATORS: ContextVar[tuple[UsageAccumulator, ...]] = ContextVar(
     "particles_llm_usage_accumulators", default=()
 )
 _PURPOSE: ContextVar[str | None] = ContextVar("particles_llm_usage_purpose", default=None)
+#: Whether the call in flight asked for a fixed temperature; ``None`` outside
+#: the registry, where nobody said.
+_TEMPERATURE_REQUESTED: ContextVar[bool | None] = ContextVar(
+    "particles_llm_usage_temperature_requested", default=None
+)
+
+
+@dataclass
+class SamplingObservation:
+    """What the calls inside one :func:`observe_sampling` block sent.
+
+    Filled at each response by :func:`record_usage`, so the value describes
+    the calls that answered, whichever provider served them: an override, a
+    replayed entry, or the configured adapter. Thread-safe for the same reason
+    the accumulator is.
+    """
+
+    counts: Counter[str] = field(default_factory=Counter)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def _add(self, sampling: Sampling | None) -> None:
+        with self._lock:
+            self.counts[sampling or "unknown"] += 1
+
+    def value(self) -> Sampling | None:
+        """The one value every observed call shares, or ``None``.
+
+        ``None`` when no call reported (an in-process provider records no
+        usage, or every answer came from the ledger), when one did not say,
+        or when the calls disagree. A ledger row then records ``NULL`` rather
+        than a value no call established.
+        """
+        with self._lock:
+            seen = set(self.counts)
+        if len(seen) != 1:
+            return None
+        only = seen.pop()
+        return None if only == "unknown" else only  # type: ignore[return-value]
+
+
+_OBSERVATIONS: ContextVar[tuple[SamplingObservation, ...]] = ContextVar(
+    "particles_llm_usage_observations", default=()
+)
 
 
 @contextlib.contextmanager
@@ -225,16 +323,78 @@ def track_usage() -> Iterator[UsageAccumulator]:
 
 
 @contextlib.contextmanager
-def purpose_scope(purpose: str) -> Iterator[None]:
-    """Attribute the completions made inside the block to ``purpose``.
+def observe_sampling(
+    observation: SamplingObservation | None = None,
+) -> Iterator[SamplingObservation]:
+    """Record what the completions made inside the block sent.
 
-    Set by the registry around each provider call, never by a call site.
+    Opened by a write site around the calls whose answers it records, the
+    :func:`track_usage` pattern: tasks and threads spawned inside see it,
+    concurrent blocks never see each other's calls. Read
+    :meth:`SamplingObservation.value` after the calls. Pass ``observation``
+    to keep adding to one already opened, for a loop that records its answers
+    between calls.
     """
-    token = _PURPOSE.set(purpose)
+    observation = observation if observation is not None else SamplingObservation()
+    token = _OBSERVATIONS.set((*_OBSERVATIONS.get(), observation))
+    try:
+        yield observation
+    finally:
+        _OBSERVATIONS.reset(token)
+
+
+def current_observations() -> tuple[SamplingObservation, ...]:
+    """The :func:`observe_sampling` blocks open in this context."""
+    return _OBSERVATIONS.get()
+
+
+@contextlib.contextmanager
+def observing(observations: tuple[SamplingObservation, ...]) -> Iterator[None]:
+    """Report the calls made inside the block to exactly ``observations``.
+
+    For a call made on several callers' behalf in a task none of them runs:
+    the completion pool's merged batch reports to each parked
+    caller's own blocks, instead of to whichever caller woke the dispatch.
+    """
+    unique = tuple({id(o): o for o in observations}.values())
+    token = _OBSERVATIONS.set(unique)
     try:
         yield
     finally:
+        _OBSERVATIONS.reset(token)
+
+
+@contextlib.contextmanager
+def purpose_scope(purpose: str, *, temperature_requested: bool | None = None) -> Iterator[None]:
+    """Attribute the completions made inside the block to ``purpose``.
+
+    ``temperature_requested`` says whether the caller asked for a fixed
+    temperature, so a response can be counted as sent or dropped.
+    Set by the registry around each provider call, never by a call site.
+    """
+    token = _PURPOSE.set(purpose)
+    requested = _TEMPERATURE_REQUESTED.set(temperature_requested)
+    try:
+        yield
+    finally:
+        _TEMPERATURE_REQUESTED.reset(requested)
         _PURPOSE.reset(token)
+
+
+def sampling_of(temperature_sent: bool | None) -> Sampling | None:
+    """What a response sent, given whether its adapter sent a temperature.
+
+    ``None`` when nobody said: the call was made outside the registry, or
+    the caller asked and the adapter did not report what it sent.
+    """
+    requested = _TEMPERATURE_REQUESTED.get()
+    if requested is None:
+        return None
+    if not requested:
+        return "unset"
+    if temperature_sent is None:
+        return None
+    return "sent" if temperature_sent else "dropped"
 
 
 def current_purpose() -> str | None:
@@ -252,13 +412,19 @@ def record_usage(
     hit_max_tokens: bool = False,
     batched: bool = False,
     replayed: bool = False,
+    temperature_sent: bool | None = None,
 ) -> None:
     """Report one response's usage to every open :func:`track_usage` scope.
 
     ``provider_model`` is the adapter's ``"<provider>:<model>"`` key. Called by
     the adapters, and by the replay cache with ``replayed=True`` for a
     completion it served without a call; a no-op when no scope is open.
+    ``temperature_sent`` is whether the request that produced this response
+    carried a temperature; ``None`` when the reporter cannot say.
     """
+    sampling = sampling_of(temperature_sent)
+    for observation in _OBSERVATIONS.get():
+        observation._add(sampling)
     accumulators = _ACCUMULATORS.get()
     if not accumulators:
         return
@@ -276,6 +442,8 @@ def record_usage(
             cache_read_tokens=max(0, cache_read_tokens),
             hit_max_tokens=hit_max_tokens,
             replayed=replayed,
+            sampling=sampling,
+            temperature_requested=bool(_TEMPERATURE_REQUESTED.get()),
         )
 
 
@@ -385,7 +553,33 @@ def render_usage_line(usage: LLMUsage) -> str:
             f" {_plural(stops, 'reply', 'replies')} stopped at max_tokens and may be cut off; "
             "raise the token budget."
         )
+    line += _dropped_clause(usage)
     return line
+
+
+def _dropped_clause(usage: LLMUsage) -> str:
+    """`` semantic lint: 200 of 200 calls asked for a fixed temperature …``.
+
+    Empty when every requested temperature was sent. One clause per purpose
+    that dropped one, so a reader sees which checks sampled at the default.
+    """
+    by_purpose: dict[str, list[int]] = {}
+    for row in usage.rows:
+        if row.temperature_requested:
+            counts = by_purpose.setdefault(row.purpose, [0, 0])
+            counts[0] += row.temperature_requested
+            counts[1] += row.temperature_dropped
+    parts = [
+        f"{purpose.replace('_', ' ')}: {dropped} of {_plural(requested, 'call')}"
+        for purpose, (requested, dropped) in by_purpose.items()
+        if dropped
+    ]
+    if not parts:
+        return ""
+    return (
+        f" Fixed temperature not sent ({'; '.join(parts)}): "
+        "the model or endpoint does not take one, so these calls sampled at the default."
+    )
 
 
 def render_store_spend_line(spend: StoreLLMSpend) -> str:

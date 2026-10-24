@@ -584,11 +584,19 @@ _LIST_PRICES_PER_MTOK: dict[str, tuple[float, float]] = {
 # 2026-10 provider survey's 18 calls against claude-sonnet-5's 111,950 on the same
 # calls (0.534). The extraction figure is the memory benchmark's 6,700 scaled the
 # same way. The claude-sonnet-4-6 entries come from paired run
-# (docs/benchmarks/default-model-adr0317-2026-10-13.md).
-_SHIPPED_CHARS_PER_TOKEN: dict[str, float] = {"claude-sonnet-5-5": 2.98}
+# (docs/benchmarks/default-model-adr0317-2026-10-13.md). The claude-haiku-5-5
+# entries come from gate (2026-10-22): on 40 byte-identical
+# extraction prompts it billed the same input tokens as claude-sonnet-5-5
+# (124k each), so the same tokenizer factor, and wrote 1.63 times its output
+# (196k against 120k), so 0.534 × 1.63.
+_SHIPPED_CHARS_PER_TOKEN: dict[str, float] = {
+    "claude-sonnet-5-5": 2.98,
+    "claude-haiku-5-5": 2.98,
+}
 _SHIPPED_OUTPUT_SCALE: dict[str, float] = {
     "claude-sonnet-5-5": 0.534,
     "claude-sonnet-4-6": 0.800,
+    "claude-haiku-5-5": 0.87,
 }
 _SHIPPED_EXTRACTION_OUTPUT_TOKENS: dict[str, int] = {
     "claude-sonnet-5-5": 3_578,
@@ -918,6 +926,47 @@ class RetiredValueQuarantineConfig(BaseModel):
     enabled: bool = True
 
 
+class RestatementConfig(BaseModel):
+    """The restatement match of a re-extracted ``MUTABLE`` source.
+
+    Before the generation cascade retires an earlier claim, each new candidate
+    is paired with the nearest earlier-generation claim of the same entry, and
+    the duplicate ladder asks whether the two are one claim: the §6.10 key
+    first, then the judge. A ``SAME`` keeps the earlier claim and
+    records the new snapshot on it instead of minting a copy. A pair the judge
+    reads ``DIFFERENT`` whose two update readings say ``CHANGES`` is retired by
+    update, with the new claim's ``supersedes`` naming it.
+    """
+
+    #: The whole match; ``false`` restores the behaviour before the match existed.
+    enabled: bool = True
+    #: Content cosine (the normalised scale) below which a pair is not
+    #: asked. Starts at the ``paraphrase_floor``; the replay fixture
+    #: tunes it.
+    floor: float = Field(default=0.70, ge=0.0, le=1.0)
+    #: Pairs per pass that reach the model judge, highest cosine first. The
+    #: rest keep the old behaviour and are disclosed as unasked.
+    max_judged: int = Field(default=64, ge=0)
+    #: Pairs per judge call.
+    judge_batch: int = Field(default=25, ge=1)
+    #: Whether a model-judged ``SAME`` carries the earlier claim. ``false``
+    #: holds the judge in its admission period: verdicts are recorded and the
+    #: would-be carries counted, and the pass writes as if it had said
+    #: ``DIFFERENT``. The owner sets it once the judge meets bar.
+    #: The §6.10 key rung carries regardless.
+    judge_admitted: bool = False
+    #: The ``DIFFERENT``-pair lineage write (an update retirement naming the
+    #: new claim). The update readings are asked either way: a ``SAME`` needs
+    #: them as its guard.
+    lineage: bool = True
+
+
+class GenerationConfig(BaseModel):
+    """How a new generation of a ``MUTABLE`` source replaces the old."""
+
+    restatement: RestatementConfig = Field(default_factory=RestatementConfig)
+
+
 class ExtractionConfig(BaseModel):
     # Total output allowance per extraction call. The reply itself runs to 2 to
     # 3.5 tokens per source character (measured 2026-09-25 on claude-sonnet-5),
@@ -946,6 +995,18 @@ class ExtractionConfig(BaseModel):
     # of 3.5 answer tokens a character plus thinking, and is the output limit
     # of claude-haiku-4-5, the smallest of the Claude models routed here.
     retry_max_tokens: int = Field(default=64000, ge=0)
+    # An extraction call answered with HTTP 429 (rate limited) is sent again
+    # after a wait, up to this many times, before it counts as a failed call
+    # and leaves its snapshot PENDING. A 429 says nothing about the
+    # source, and a run that sends several calls at once
+    # (``audit.extraction_concurrency``) meets one sooner. The wait is the
+    # reply's ``retry-after`` when it carries one, else
+    # ``rate_limit_backoff_seconds`` doubled per attempt, and never more than
+    # ``rate_limit_max_wait_seconds``. The provider SDK's own short retries run
+    # first, inside each attempt. 0 restores the old single attempt.
+    rate_limit_retries: int = Field(default=4, ge=0)
+    rate_limit_backoff_seconds: float = Field(default=10.0, ge=0.0)
+    rate_limit_max_wait_seconds: float = Field(default=120.0, ge=0.0)
     similarity_threshold: float = 0.80
     pdf_page_overlap_lines: int = 5
     # PDF hardening (security): a malicious PDF can carry an enormous page
@@ -983,6 +1044,14 @@ class ExtractionConfig(BaseModel):
     # max_llm_calls_per_source=8) but short enough that operator
     # recovery is quick.
     stale_in_progress_minutes: float = 30.0
+    # a source whose every extraction call the model refused is
+    # recorded, and ``extract --all-pending``, the consolidation catch-up and
+    # the audit skip it until the extraction model or the content changes, or
+    # this many days pass since the last refusal (a provider's classifier can
+    # change behind an unchanged model id). Naming the entry, or
+    # ``--retry-refused``, sends it at once. 0 turns the hold off. A chosen
+    # figure: it cuts a held note to one call a month against one a night.
+    refusal_retry_days: float = Field(default=30.0, ge=0.0)
     # Cost-estimate assumption, not a runtime knob: the general extractor's
     # fixed system prompt (rules + modality / polarity / stance / structure /
     # validity addenda, ~8k chars) is re-sent on every call, so an estimate
@@ -1018,12 +1087,6 @@ class ExtractionConfig(BaseModel):
     # The largest delta chunk sent in one call. Each chunk after the first
     # takes the end of the chunk before it as its context.
     append_chunk_chars: int = Field(default=7500, ge=1000)
-    # the agent extractor's prompt (the Stop hook's ask and its API
-    # proxy) tells the model how many claims text of its size usually yields,
-    # as a thoroughness guide, never a quota. 1.9 is the median claims per
-    # 1000 characters of the general extractor's transcript deltas in the
-    # maintainers' store (262 reads, measured 2026-10-16).
-    agent_expected_claims_per_kchar: float = Field(default=1.9, gt=0.0)
     # a pair the §6.6 contradiction probe confirms is read a second
     # time, before the write loop, with each claim's source kind, name, time
     # and passage (on ``llm.verification``). A pair the reading does not
@@ -1047,8 +1110,20 @@ class ExtractionConfig(BaseModel):
     # Source types whose extracted claims are screened for an agent session's
     # momentary working state (current worktree, cwd, branch), which is true
     # for minutes and never a durable belief. CONVERSATION only: a coding-agent
-    # transcript is where that narration appears. Empty disables the filter.
+    # transcript is where that narration appears. The same types get the
+    # session-artifact rewrite: a described pull request is named
+    # by its URL and a bare description is never a Subject. Empty disables both.
     session_state_source_types: list[str] = Field(default_factory=lambda: ["CONVERSATION"])
+    # `extract --all-pending` asks before it spends when its
+    # estimate exceeds this many calls (the audit's threshold, for the same
+    # question). A run without a terminal stops there unless given --yes or
+    # --budget-usd. 0 asks before any call.
+    confirm_call_threshold: int = Field(default=50, ge=0)
+    # the model the estimate prices beside the configured one,
+    # as "provider:model", offered through `extract --extraction-model`. It
+    # passed extraction and subject-resolution bars against
+    # claude-sonnet-5-5 on 2026-10-22. None prints the configured model only.
+    alternative_model: str | None = "anthropic:claude-haiku-5-5"
 
 
 class ExtractionScopeConfig(BaseModel):
@@ -1368,6 +1443,30 @@ class ImportProjectConfig(BaseModel):
             ".ruff_cache",
         ]
     )
+
+
+class ImportVaultConfig(BaseModel):
+    """The guards on the absences ``import vault`` records (§7).
+
+    A completed vault walk that no longer finds a previously imported note
+    records an absence, which retires the note's claims at the next
+    extraction. An unmounted volume, a sync client that has not finished, or a
+    root typed one level too deep look exactly like deleting every note, so two
+    rules decide whether a walk may record what it found; when either refuses,
+    the walk records none and exits 1, and ``--confirm-absent`` records them.
+
+    Both numbers are a judgement, not a measurement: no imported vault had been
+    observed when they were chosen. Every import that records absences logs the
+    count and the fraction, so they can be tuned from evidence.
+    """
+
+    confirm_absent: Literal["first", "always"] = "first"
+    """``first`` asks for ``--confirm-absent`` before the first absence ever
+    recorded under a root; ``always`` asks whenever a walk finds absences."""
+    max_absent_fraction: float = Field(default=0.25, ge=0.0, le=1.0)
+    """After that, refuse to record absence for more than this fraction of the
+    notes previously imported under the walked root (and for at least five
+    notes, a fixed floor) unless ``--confirm-absent`` is passed."""
 
 
 class MigrationConfig(BaseModel):
@@ -1706,6 +1805,47 @@ class UtilityMiningConfig(BaseModel):
     estimate_chars_per_token: float = Field(default=2.1, gt=0.0)
 
 
+class UtilityMonitorConfig(BaseModel):
+    """The nightly rank-lift monitor: is the configured ``λ`` still doing its job?
+
+    A read-only consolidation pass checks, in every view a session renders, that
+    the head holds the beliefs the agent keeps applying *outside* it, and that it
+    keeps room for beliefs that have not earned use yet. It reports; it never
+    changes ``λ``.
+
+    The **cohort** is the view's ACTIVE beliefs applied in at least
+    ``min_sessions`` distinct sessions within the utility half-life whose
+    recorded session-start context did not include the belief. Credit
+    earned through the head only says the head kept what it showed, so it does
+    not count. The head passes the floor when it holds at least ``capture`` of
+    the cohort, and the ceiling when at least ``entry_share`` of its slots hold
+    beliefs with no use yet (the exposure loop: a belief earns use only
+    by being shown). A view whose cohort is smaller than ``min_cohort`` reports
+    ``cold`` and gets no verdict.
+
+    The defaults were chosen on one store (findings 5 and 6), where
+    every variant tried gave the same verdict; they are thresholds on a report,
+    never on a rank.
+
+    ``head_sizes`` empty means the sizes the install declares: the projection
+    manifest's default ``top_k`` (60), ``agent_memory.projection.max_lines`` and
+    ``mcp.recall.digest_max_beliefs``. List them when a manifest uses others.
+    ``max_views`` caps the views one run evaluates (store-wide plus project
+    keys, largest first); the rest rotate into later runs. ``targets`` are belief
+    ids whose rank is reported and whose entering or leaving a head is disclosed,
+    never judged.
+    """
+
+    enabled: bool = True
+    min_sessions: int = Field(default=2, ge=1)
+    capture: float = Field(default=0.75, gt=0.0, le=1.0)
+    min_cohort: int = Field(default=3, ge=1)
+    entry_share: float = Field(default=0.25, ge=0.0, lt=1.0)
+    max_views: int = Field(default=4, ge=1)
+    head_sizes: list[int] = Field(default_factory=list)
+    targets: list[str] = Field(default_factory=list)
+
+
 class UtilityConfig(BaseModel):
     """Usefulness (outcome-learning) lens config (composition).
 
@@ -1735,6 +1875,7 @@ class UtilityConfig(BaseModel):
     default: UtilityRuleConfig = Field(default_factory=UtilityRuleConfig)
     mining: UtilityMiningConfig = Field(default_factory=UtilityMiningConfig)
     explicit_weight: float = Field(default=25.0, ge=0)
+    monitor: UtilityMonitorConfig = Field(default_factory=UtilityMonitorConfig)
 
 
 class OwnerLensConfig(BaseModel):
@@ -1756,7 +1897,8 @@ class OwnerLensConfig(BaseModel):
     seam, valid up to multi-tenant line.
 
     A **list**, not a scalar, because a viewer's Subject fragments in practice
-    ("Jeff" / "Jeff Gage") until the N→1 merge lands. Entries are
+    ("Jeff" / "Jeff Gage") until an operator folds the fragments together with
+    ``particles subjects merge``. Entries are
     canonical names or Subject ids and resolve **locally only** — never a live
     authority lookup, since the digest is a zero-LLM, zero-network surface.
     Resolve-or-inert: if nothing resolves the
@@ -2598,6 +2740,26 @@ class AutoMergeConfig(BaseModel):
     max_per_run: int = 500
 
 
+class RereadMergeConfig(BaseModel):
+    """The judged merge of one append-only entry's re-read duplicates.
+
+    ``links dedup --reread``: a census, a paid ``--judge`` step that writes
+    probe-ledger verdicts only, and an ``--apply`` that merges from the ledger.
+    ``--apply`` also needs ``auto_merge.enabled``.
+    """
+
+    # which cosine strata the judge is admitted on. `none` until
+    # the owner's labels give a 95 % Wilson lower bound of at least 0.95 on the
+    # judge's SAME verdicts in a stratum; `high` admits pairs at 0.97 and
+    # above, `all` admits every pair.
+    admitted: Literal["none", "high", "all"] = "none"
+    # questions one `--judge` run may put to the duplicate judge.
+    # A capped run says how many remain; re-run to continue.
+    max_judged: int = Field(default=2000, ge=0)
+    # Pairs per duplicate-judge call.
+    judge_batch: int = Field(default=25, ge=1)
+
+
 class LinksSuggestConfig(BaseModel):
     # cosine-similarity threshold for proposing CO_EVIDENTIAL link
     # candidates between same-Subject particles via `particles links suggest`.
@@ -2618,6 +2780,9 @@ class LinksSuggestConfig(BaseModel):
     apply_confirm_threshold: int = 10
     # exact-duplicate auto-merge. Default OFF.
     auto_merge: AutoMergeConfig = Field(default_factory=AutoMergeConfig)
+    # the judged merge of re-read duplicates. Admitted on no stratum
+    # by default.
+    reread: RereadMergeConfig = Field(default_factory=RereadMergeConfig)
 
 
 class VocabularyConfig(BaseModel):
@@ -2873,66 +3038,6 @@ class ClaudeCodeHarvestConfig(BaseModel):
     catchup_limit: int = Field(default=5, ge=0)
 
 
-class AgentExtractionConfig(BaseModel):
-    """Agent-side extraction at a Stop hook.
-
-    The in-session agent extracts a span of its own deposited transcript, so a
-    Claude Code user needs no API key for extraction. The ask defaults below
-    come from the 2026-10-09 offline replay and store query
-    (``docs/benchmarks/agent-extraction-defaults-2026-10-09.md``); the
-    agent-dependent ones are confirmed by a shadow week before ``on`` becomes
-    the keyless default.
-    """
-
-    # off: nothing asks. shadow: ask and verify, write and mark nothing, log
-    # what would have happened. on: ask, verify, and write.
-    mode: Literal["off", "shadow", "on"] = "off"
-    # Ask only when the distilled transcript has grown this much past what was
-    # extracted. Replay: 8000 gives about 1.7 asks per active hour.
-    min_new_chars: int = Field(default=8000, ge=1)
-    # Seconds between asks in one session.
-    min_interval_seconds: int = Field(default=600, ge=0)
-    # Waive the interval while more than one span is owed (catch-up asks), and
-    # only after an answer that moved the ask's start.
-    # Replay: recovers a quarter to two fifths of the backlog.
-    catch_up: bool = True
-    # Cap on asks per session, applied only where a background extractor can
-    # take the rest. A keyless install is never capped: a cap there leaves
-    # everything after the last ask unextracted (replay: 35 to 51 % uncovered).
-    max_asks_per_session: int | None = Field(default=6, ge=1)
-    # Largest span one ask carries, in bytes of distilled text. The span's text
-    # rides in the ask, so this bounds the context one ask costs.
-    max_span_chars: int = Field(default=40_000, ge=1000)
-    # An ask unanswered after this many seconds is expired.
-    ask_ttl_seconds: int = Field(default=900, ge=60)
-    # A submission covers its span only with at least this many accepted claims
-    # per 1000 characters. 1.27 is the 10th percentile of the general
-    # extractor's own transcript deltas in the maintainers' store (262 delta
-    # reads, measured 2026-10-16; it was 2.7 on 2026-10-09, before the
-    # session-state and tool-turn filters thinned transcript extraction).
-    min_claims_per_kchar: float = Field(default=1.27, ge=0.0)
-    # ...and with no more than this share of candidates dropped for evidence
-    # not found in the span. Placeholder until the shadow week measures it.
-    max_evidence_drop_ratio: float = Field(default=0.5, ge=0.0, le=1.0)
-    # In shadow mode, keep each submission's accepted candidates (claim text,
-    # stated confidence, evidence) in a local JSONL file, so a later labelling
-    # pass can fit a calibration map on real session claims. The
-    # operator event log keeps counts only. Off writes nothing.
-    keep_shadow_candidates: bool = True
-    # None ⇒ ``<claude_code.state_dir>/agent-extraction-shadow.jsonl``.
-    shadow_candidates_path: str | None = None
-
-    @field_validator("mode", mode="before")
-    @classmethod
-    def _yaml_booleans(cls, value: object) -> object:
-        """Read YAML's unquoted ``on`` / ``off``, which parse as booleans, as the modes."""
-        if value is True:
-            return "on"
-        if value is False:
-            return "off"
-        return value
-
-
 class ClaudeCodeConfig(BaseModel):
     """Claude Code hook integration.
 
@@ -2960,13 +3065,13 @@ class ClaudeCodeConfig(BaseModel):
     # timeout. On expiry the hook logs and exits 0 with no output — a memory
     # outage must cost an empty digest, never a hung session start.
     hook_deadline_seconds: float = Field(default=10.0, gt=0.0)
-    # What a session's digest and MEMORY.md region see. ``store`` is
-    # the whole store, as before. ``project`` reads through the session's
-    # project observer: global beliefs plus those observed in this project.
-    # Engages only once ``particles memory rescope`` has run on the store.
-    observer_scope: Literal["store", "project"] = "store"
+    # What a session's digest and MEMORY.md region see. ``project``
+    # (the default since) reads through the session's project
+    # observer: global beliefs plus those observed in this project. ``store``
+    # is the whole store, as before. Engages only once ``particles memory
+    # rescope`` has run on the store.
+    observer_scope: Literal["store", "project"] = "project"
     harvest: ClaudeCodeHarvestConfig = Field(default_factory=ClaudeCodeHarvestConfig)
-    agent_extraction: AgentExtractionConfig = Field(default_factory=AgentExtractionConfig)
 
 
 class AgentMemoryProjectionGitConfig(BaseModel):
@@ -3009,6 +3114,12 @@ class AgentMemoryProjectionConfig(BaseModel):
     here are **init-time defaults** baked into the ``memory.yaml`` that
     ``particles init claude-code`` writes; editing the manifest afterwards is
     the supported tuning path.
+
+    ``exclude_source_tags`` is the exception, deliberately: it is
+    read at **render time**, so it reaches existing installs without a manifest
+    edit. The convention it sets: a knob limiting what any install's region may
+    contain lives here, in config; a knob shaping one install's sections lives
+    in the manifest.
     """
 
     # Master switch: render + splice the memory-index region during the
@@ -3024,12 +3135,28 @@ class AgentMemoryProjectionConfig(BaseModel):
     # generated memory.yaml, not read at render time (the manifest wins).
     max_lines: int = Field(default=120, ge=1)
     min_confidence: float = Field(default=0.30, ge=0.0, le=1.0)
-    # Fold-and-archive (default-on): after a cycle's harvest of
-    # MEMORY.md succeeded, agent-authored lines outside the projected region
-    # are *moved* — never destroyed — to `<state_dir>/MEMORY.archive.md`
-    # (append-only, itself harvested next cycle). False keeps authored lines
-    # in place; the projected region is still rendered.
+    # Fold-and-archive (as amended, default-on): a
+    # memory-index pointer outside the projected region is *moved*, never
+    # destroyed, to the project's `MEMORY.archive.md` while the region just
+    # rendered shows a belief its file's current, extracted snapshot states,
+    # and is brought back once it does not. Other lines are never moved.
+    # False turns both halves off; the projected region is still rendered.
     fold_authored_lines: bool = True
+    # Memory types whose pointers never fold (option d): a pointer
+    # whose target file's frontmatter `metadata.type` is in this list stays in
+    # MEMORY.md whatever the region shows, and one already archived comes
+    # back. The region ranks by confidence, which does not keep a standing
+    # rule in view. A target with no type follows the rule above. Compared
+    # case-insensitively; [] restores the plain fold rule above.
+    never_fold_types: list[str] = Field(default_factory=lambda: ["feedback", "user"])
+    # Source tags the region never selects from: a belief whose
+    # current sources all carry one of these is dropped before the cut (one no
+    # source states any more is judged by the sources that ever did; one with
+    # no source at all is kept). The default keeps the rule files
+    # (AGENTS.md / CLAUDE.md, tagged `rule-file`) out: operating documentation
+    # the harness serves from the files themselves. Read at render time, not
+    # baked into memory.yaml. [] restores the unfiltered region.
+    exclude_source_tags: list[str] = Field(default_factory=lambda: ["rule-file"])
     # Optional git-versioned history of the projected view (opt-in).
     git: AgentMemoryProjectionGitConfig = Field(default_factory=AgentMemoryProjectionGitConfig)
 
@@ -3203,6 +3330,16 @@ class AuditConfig(BaseModel):
     # 0 probes nothing (disclosed the same way). `particles lint` is not
     # affected: cost gating is the audit's concern, lint stays exhaustive.
     max_contradiction_probes: int = Field(default=50, ge=0)
+    # How many harvested snapshots' extraction calls run at once.
+    # The calls are independent, and at one at a time they were the whole of
+    # the 2026-09-25 first run's 66 minutes (96 memory files, ~39 s a call).
+    # Only the model calls overlap: each snapshot's reconcile-and-write pass
+    # still runs alone, in harvest order, after the passes before it, so the
+    # store has one writer and a result does not depend on the setting. An
+    # account's rate limit bounds the gain (a 429 backs off and retries, see
+    # ``extraction.rate_limit_retries``). 1 is the serial loop; an in-memory
+    # store always runs serially.
+    extraction_concurrency: int = Field(default=4, ge=1)
     # (the ruling, order, do not drop): under a probe
     # cap the census probes the pairs some single reader sees first (the
     # observer precondition reconciles or reviews them) and
@@ -3306,8 +3443,10 @@ class AuditConfig(BaseModel):
     # output. Raise this if a run's usage line shows probes averaging more.
     estimate_probe_input_tokens: int = Field(default=350, ge=0)
     estimate_probe_output_tokens: int = Field(default=250, ge=0)
-    # Wall time, for the time the estimate prints. Calls run one at a time, and
-    # an extraction call's time is mostly the output it writes, so extraction
+    # Wall time, for the time the estimate prints. It is timed as if the calls
+    # ran one at a time, as they did when these rates were measured, so it is an
+    # upper bound under extraction_concurrency above. An
+    # extraction call's time is mostly the output it writes, so extraction
     # is timed by output tokens rather than per call or per file. 125 tokens a
     # second plus 1.5 s per probe (short haiku replies) reproduces the
     # 2026-09-25 run's 96 minutes and the 22 minutes one 49k-character ADR took
@@ -4198,6 +4337,7 @@ class ParticlesConfig(BaseModel):
     agent_memory: AgentMemoryConfig = Field(default_factory=AgentMemoryConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     extraction: ExtractionConfig = Field(default_factory=ExtractionConfig)
+    generation: GenerationConfig = Field(default_factory=GenerationConfig)
     extraction_scope: ExtractionScopeConfig = Field(default_factory=ExtractionScopeConfig)
     extraction_modality: ExtractionModalityConfig = Field(default_factory=ExtractionModalityConfig)
     modality_regeneration: ModalityRegenerationConfig = Field(
@@ -4216,6 +4356,7 @@ class ParticlesConfig(BaseModel):
     document_precedence: DocumentPrecedenceConfig = Field(default_factory=DocumentPrecedenceConfig)
     journal_extractor: JournalExtractorConfig = Field(default_factory=JournalExtractorConfig)
     import_project: ImportProjectConfig = Field(default_factory=ImportProjectConfig)
+    import_vault: ImportVaultConfig = Field(default_factory=ImportVaultConfig)
     web_clipper: WebClipperConfig = Field(default_factory=WebClipperConfig)
     migration: MigrationConfig = Field(default_factory=MigrationConfig)
     trust: TrustConfig = Field(default_factory=TrustConfig)
@@ -4597,7 +4738,7 @@ def validate_config() -> tuple[Path | None, ParticlesConfig]:
 def _migrate_legacy_keys(raw: dict[str, Any]) -> None:
     """Migrate deprecated config keys in-place, logging a one-time warning.
 
-    Five migrations are active:
+    Six migrations are active:
 
     * ``lint.co_evidential_candidate_threshold`` was renamed to
       ``links_suggest.candidate_threshold``.
@@ -4619,6 +4760,11 @@ def _migrate_legacy_keys(raw: dict[str, Any]) -> None:
       ``audit.estimate_output_tokens_per_source_char``); see
       :func:`_migrate_audit_output_keys`.
 
+    * ``claude_code.agent_extraction`` and
+      ``extraction.agent_expected_claims_per_kchar`` configured agent-side
+      extraction, which was removed (deprecated); they are dropped
+      with a warning by :func:`_drop_retired_agent_extraction_keys`.
+
     Each old key is honoured only when its new home is unset, so an operator
     who has already moved to the new key wins. The shims may be removed once
     their deprecation cycle ends.
@@ -4628,6 +4774,32 @@ def _migrate_legacy_keys(raw: dict[str, Any]) -> None:
     _migrate_query_answer_max_tokens(raw)
     _migrate_shared_estimate_keys(raw)
     _migrate_audit_output_keys(raw)
+    _drop_retired_agent_extraction_keys(raw)
+
+
+def _drop_retired_agent_extraction_keys(raw: dict[str, Any]) -> None:
+    """Drop the keys of agent-side extraction, removed with deprecation.
+
+    ``claude_code.agent_extraction`` and ``extraction.agent_expected_claims_per_kchar``
+    configured a feature that no longer exists. They would be ignored anyway,
+    so this only says so once, letting an operator delete them on purpose.
+    """
+    dropped: list[str] = []
+    claude_code = raw.get("claude_code")
+    if isinstance(claude_code, dict) and claude_code.pop("agent_extraction", None) is not None:
+        dropped.append("claude_code.agent_extraction")
+    extraction = raw.get("extraction")
+    if (
+        isinstance(extraction, dict)
+        and extraction.pop("agent_expected_claims_per_kchar", None) is not None
+    ):
+        dropped.append("extraction.agent_expected_claims_per_kchar")
+    if dropped:
+        log.warning(
+            "config: %s configured agent-side extraction, which was removed; "
+            "the setting has no effect and can be deleted.",
+            " and ".join(f"'{k}'" for k in dropped),
+        )
 
 
 def _migrate_co_evidential_threshold(raw: dict[str, Any]) -> None:

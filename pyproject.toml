@@ -19,7 +19,7 @@
 # version and advance together.
 [project]
 name = "linkedparticles-core"
-version = "1.192.28"
+version = "1.210.1"
 description = "Store-free client library for Particles: define, validate, serialize, and extract provenance-tracked belief particles"
 readme = "README.md"
 requires-python = ">=3.11"

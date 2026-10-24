@@ -11,7 +11,9 @@ question of each such record: does anything ACTIVE still contradict the held
 claim? This module holds every decision that needs no store, so each is
 testable on plain values (D2):
 
-* which records the pass examines (:func:`qualifies`);
+* which records the pass examines (:func:`qualifies`), including a record
+  whose partner the generation cascade retired for a newer generation of the
+  held claim's own source (:func:`is_generation_hold`);
 * whether a record already examined is due again (:func:`is_due`);
 * what the probes and second readings say about one record
   (:func:`decide_release`).
@@ -23,12 +25,13 @@ from __future__ import annotations
 
 from collections.abc import Container, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 
 from particles.core.conflict_review import is_quarantined, is_retired_value
 from particles.core.contradiction_disclosure import is_census_record
 from particles.core.observer_scope import PairPrecondition
-from particles.core.schema import Particle
+from particles.core.schema import Particle, ProvenanceRefType
 from particles.core.status import Status, StatusReason
 
 #: The retirements an autonomous pass writes: rung 2.5 and its sweep,
@@ -44,14 +47,63 @@ AUTONOMOUS_RETIREMENTS: frozenset[StatusReason] = frozenset(
 )
 
 
-def qualifies(record: Particle, a: Particle | None, b: Particle | None) -> bool:
+def _aware(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+def is_generation_hold(
+    a: Particle, b: Particle, *, current: Mapping[str, str], captured: Mapping[str, datetime]
+) -> bool:
+    """Whether A was retired for the current generation of B's own source.
+
+    The pair the write path now settles by generation, written
+    before that rule: B was held behind A, both read from one ``MUTABLE``
+    entry, and the generation cascade then retired A ``RETRACTED_DEPENDENCY``
+    because B's snapshot no longer stated it. Such a record never
+    released, since the cascade is not one of :data:`AUTONOMOUS_RETIREMENTS`.
+
+    Every ``SOURCE`` ref of both claims names that one entry, so A was stated
+    by no other source; every snapshot A's refs name was captured before every
+    snapshot B's refs name; and one of B's refs names the entry's current
+    generation. ``current`` maps each ``MUTABLE`` entry to that snapshot. A
+    hold whose entry has moved past B's snapshot stays out: a quarantined claim
+    is never carried forward, so whether the newer text still states B is
+    unknown, and a released B would be read as lapsed. ``captured`` maps
+    snapshot ids to capture times; a ref it cannot date keeps the record out,
+    the safe direction.
+    """
+    if a.status_reason is not StatusReason.RETRACTED_DEPENDENCY:
+        return False
+    a_refs = [r for r in a.provenance if r.type is ProvenanceRefType.SOURCE]
+    b_refs = [r for r in b.provenance if r.type is ProvenanceRefType.SOURCE]
+    entries = {r.corpus_entry_id for r in a_refs + b_refs}
+    if not a_refs or not b_refs or len(entries) != 1:
+        return False
+    (entry_id,) = entries
+    if entry_id is None or entry_id not in current:
+        return False
+    if not any(r.snapshot_id == current[entry_id] for r in b_refs):
+        return False
+    a_at = [captured.get(r.snapshot_id) if r.snapshot_id else None for r in a_refs]
+    b_at = [captured.get(r.snapshot_id) if r.snapshot_id else None for r in b_refs]
+    if any(at is None for at in a_at + b_at):
+        return False
+    return max(_aware(at) for at in a_at if at) < min(_aware(at) for at in b_at if at)
+
+
+def qualifies(
+    record: Particle, a: Particle | None, b: Particle | None, *, generation: bool = False
+) -> bool:
     """Whether the release pass examines ``record``.
 
     An open write-time record: still ``INCONSISTENCY``, neither a census
     record nor a retired-value hold, with B quarantined and A retired by an
     autonomous pass. The two named exclusions are already implied by the side
     conditions; they are checked anyway, as the trust cascade checks its own,
-    so that a later record shape cannot qualify by accident.
+    so that a later record shape cannot qualify by accident. ``generation``
+    is :func:`is_generation_hold` for the pair, which the shell decides from
+    the entry and snapshot rows: such a record is examined too, and its held
+    claim is still checked against the whole store before it is released.
     """
     if record.status is not Status.INCONSISTENCY:
         return False
@@ -59,7 +111,9 @@ def qualifies(record: Particle, a: Particle | None, b: Particle | None) -> bool:
         return False
     if a is None or b is None or not is_quarantined(b):
         return False
-    return a.status is not Status.ACTIVE and a.status_reason in AUTONOMOUS_RETIREMENTS
+    if a.status is Status.ACTIVE:
+        return False
+    return a.status_reason in AUTONOMOUS_RETIREMENTS or generation
 
 
 def is_due(prior_blocking: Sequence[str] | None, active_ids: Container[str]) -> bool:

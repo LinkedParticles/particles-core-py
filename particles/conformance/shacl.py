@@ -120,12 +120,19 @@ def _validate(doc: dict[str, Any], shape_name: str) -> ValidationResult:
         import pyshacl  # type: ignore[import-untyped,unused-ignore]
         import rdflib
 
+        from particles.extraction.rdf import no_remote_retrieval
+
         # Use Graph (not Dataset) for the data side: our particle documents are
         # flat JSON-LD with no @graph array, so a single default graph is enough.
         # Dataset triggers rdflib's own DeprecationWarnings for default_context
         # and identifier in current rdflib releases.
         data_graph = rdflib.Graph()
-        data_graph.parse(data=json.dumps(doc), format="json-ld")
+        # The document is caller-supplied, so a string @context or an @import
+        # in it would make rdflib fetch that URL, with no SSRF check (D43,
+        # SECURITY_REVIEW_20261023-1). The serializers below embed the context
+        # inline; a document that names one remotely is refused, not fetched.
+        with no_remote_retrieval():
+            data_graph.parse(data=json.dumps(doc), format="json-ld")
         shapes_graph = rdflib.Graph().parse(str(shape_path), format="turtle")
 
         conforms, report_graph, report_text = pyshacl.validate(

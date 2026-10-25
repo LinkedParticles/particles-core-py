@@ -214,9 +214,10 @@ claim — only re-express its relational core.
 
 Rules:
 - Emit ONE triple, for the claim's single main assertion.
-- subject: the entity the claim is about. Prefer one of the SUBJECTS listed
-  below, verbatim, so the triple binds to the same entity the claim does. Use a
-  URI (e.g. wd:Q42) only if the claim itself supplies one.
+- subject: the entity the claim is about. Prefer one of the names in the
+  subjects segment of the user message, verbatim, so the triple binds to the
+  same entity the claim does. Use a URI (e.g. wd:Q42) only if the claim itself
+  supplies one.
 - predicate: the relation, as a short lowercase verb phrase ("was minted at",
   "has weight"). Use an ontology URI only when the claim itself names one.
 - object: the value or entity the relation points at.
@@ -249,15 +250,19 @@ async def structure_content(content: str, subject_names: list[str]) -> Structure
     Returns:
         The stamped annotation, or ``None``.
     """
-    from particles.llm import complete, fenced_prompt
+    from particles.llm import complete, data_fence_instruction, fence, make_nonce
 
-    instructions = _STRUCTURIZE_PROMPT
-    if subject_names:
-        instructions += "\n\nSUBJECTS: " + ", ".join(subject_names)
     # Same F3 hardening as extraction: trusted instructions in the system turn,
     # the stored claim (which came from an untrusted source) fenced in the user
     # turn, so an injected instruction inside a claim cannot steer the call.
-    system, user = fenced_prompt(instructions, content, label="claim")
+    # The subject names are stored text too (an extracted name, or a public
+    # label), so they ride their own fence under the same nonce rather than the
+    # system turn (security review N33).
+    nonce = make_nonce()
+    system = f"{_STRUCTURIZE_PROMPT}\n\n{data_fence_instruction(nonce)}"
+    user = fence(content, nonce, label="claim")
+    if subject_names:
+        user += "\n\n" + fence("\n".join(subject_names), nonce, label="subjects")
     # One small JSON object, given the shared probe budget rather than one sized
     # to it: ``extraction`` can route to a model that thinks by default, whose
     # thinking spends from ``max_tokens`` and could leave 512 with no text.

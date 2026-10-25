@@ -49,6 +49,7 @@ import re
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import cache
 from typing import Any
 
 import httpx
@@ -64,6 +65,7 @@ from particles.llm.registry import (
     budget_hint,
 )
 from particles.llm.usage import record_usage
+from particles.url_safety import is_cleartext_remote
 
 log = logging.getLogger(__name__)
 
@@ -110,6 +112,47 @@ class OpenAICompatCompletionError(CompletionError):
     def __init__(self, message: str, *, status_code: int | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+class PlaintextKeyRefused(CompletionError):
+    """The adapter refused to send the entry's API key over non-loopback ``http://``.
+
+    Raised before any request (N12, SECURITY_REVIEW_20261024-1), the provider-key
+    counterpart of the engine client's ``PlaintextTokenRefused``.
+    """
+
+
+@cache
+def _warn_plaintext_key_once(name: str, base_url: str) -> None:
+    """One warning per entry and URL when ``allow_plaintext_key`` lets a key through."""
+    log.warning(
+        "The API key for llm.providers.%s is being sent over an unencrypted "
+        "connection to %s (allow_plaintext_key is set). Anyone on the network "
+        "path can read it.",
+        name,
+        base_url,
+    )
+
+
+def _check_plaintext_key(name: str, base_url: str, *, allow: bool) -> None:
+    """Refuse a provider key bound for a cleartext, non-loopback URL (N12).
+
+    No-op for ``https://`` and for a loopback host (a local Ollama, or an SSH /
+    Tailscale forward). Otherwise raises :class:`PlaintextKeyRefused`, unless
+    the entry sets ``allow_plaintext_key``, in which case it warns once.
+    """
+    if not is_cleartext_remote(base_url):
+        return
+    if allow:
+        _warn_plaintext_key_once(name, base_url)
+        return
+    raise PlaintextKeyRefused(
+        f"Refusing to send the llm.providers.{name} API key to {base_url} over "
+        "unencrypted http://. Use https://, or reach the endpoint through a "
+        "loopback hop (an SSH or Tailscale forward to http://127.0.0.1). To send "
+        f"it anyway on a network you trust end to end, set "
+        f"llm.providers.{name}.allow_plaintext_key: true."
+    )
 
 
 # HTTP statuses worth retrying: rate limit + transient server errors. A 4xx
@@ -351,6 +394,7 @@ class OpenAICompatProvider:
 
         headers = {"Content-Type": "application/json"}
         if api_key is not None:
+            _check_plaintext_key(self.name, cfg.base_url, allow=cfg.allow_plaintext_key)
             headers["Authorization"] = f"Bearer {api_key}"
 
         url = f"{cfg.base_url.rstrip('/')}/chat/completions"

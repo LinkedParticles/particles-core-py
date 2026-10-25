@@ -16,9 +16,11 @@ from __future__ import annotations
 import ipaddress
 import logging
 import os
+import stat
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any, Literal, TypeVar
+from typing import Any, Literal, NamedTuple, TypeVar
+from urllib.parse import urlsplit
 
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -222,6 +224,25 @@ class ApiConfig(BaseModel):
     audit log), and ``/digest`` (the provenance-ranked belief digest) — are
     gated by the bearer **regardless** of this flag; under the ``dev-key``
     loopback skip they stay open for local development.
+
+    ``allowed_origins`` lists browser origins (``scheme://host[:port]``) whose
+    cross-site requests the engine serves without a verified bearer. Every gated
+    route refuses a cross-site browser request otherwise (security review
+    2026-10-23: any web page could POST a multipart deposit to a dev-key
+    loopback engine). The engine's own web UI at ``/app`` is same-origin and
+    needs no entry. **Default empty**; a wildcard or ``null`` is rejected.
+
+    ``allowed_hosts`` lists the ``Host`` header names (no port) the engine
+    answers on, beside the loopback names (``localhost``, ``127.0.0.0/8``,
+    ``::1``), which are always allowed so a local health probe keeps working.
+    A ``*.`` prefix matches any subdomain (``*.tailnet.example``). The check
+    covers every path, ``/health`` and ``/app`` included, and is what refuses a
+    DNS-rebinding page: such a page reaches the engine's address under its own
+    hostname (security review 2026-10-24, N1). Under the dev-key skip only the
+    loopback names and these entries are served, whatever this list holds.
+    With a real ``PARTICLES_API_KEY`` and an empty list (the default) no
+    ``Host`` is refused; set it on a non-loopback deployment whose reads are
+    open, and include the name your health probe sends.
     """
 
     max_request_body_bytes: int = 25 * 1024 * 1024  # 25 MiB
@@ -229,6 +250,57 @@ class ApiConfig(BaseModel):
     trusted_proxies: list[str] = Field(default_factory=list)
     rate_limit_per_minute: int = 60
     require_auth_for_reads: bool = False
+    allowed_origins: list[str] = Field(default_factory=list)
+    allowed_hosts: list[str] = Field(default_factory=list)
+
+    @field_validator("allowed_hosts")
+    @classmethod
+    def _validate_allowed_hosts(cls, value: list[str]) -> list[str]:
+        """Accept bare host names, optionally with a leading ``*.`` wildcard.
+
+        A ``Host`` header is compared without its port, so an entry carrying a
+        scheme, a path or a port could never match. A bare ``*`` would match
+        every rebinding page, which is the attack the list exists to refuse.
+        """
+        normalized: list[str] = []
+        for entry in value:
+            host = entry.strip().lower()
+            bare = host.removeprefix("*.")
+            # A bracketed IPv6 literal carries colons of its own.
+            forbidden = "/@ " if bare.startswith("[") and bare.endswith("]") else "/:@ "
+            if not bare or "*" in bare or any(c in bare for c in forbidden):
+                raise ValueError(
+                    f"api.allowed_hosts entry {entry!r} is not a host name; give a "
+                    "bare name with no scheme or port, e.g. engine.example.org or "
+                    "*.tailnet.example"
+                )
+            normalized.append(host)
+        return normalized
+
+    @field_validator("allowed_origins")
+    @classmethod
+    def _validate_allowed_origins(cls, value: list[str]) -> list[str]:
+        """Accept only exact ``scheme://host[:port]`` origins.
+
+        A browser sends exactly that form, so anything else (a path, a
+        wildcard, the opaque ``null`` origin a sandboxed frame or a ``file:``
+        page sends) could never match a real origin, or would match every page.
+        """
+        for entry in value:
+            parts = urlsplit(entry.strip())
+            if (
+                not parts.scheme
+                or not parts.netloc
+                or "*" in entry
+                or parts.path not in ("", "/")
+                or parts.query
+                or parts.fragment
+            ):
+                raise ValueError(
+                    f"api.allowed_origins entry {entry!r} is not an origin; give "
+                    "scheme://host[:port], e.g. https://notes.example.org"
+                )
+        return value
 
     @field_validator("trusted_proxies")
     @classmethod
@@ -319,10 +391,18 @@ class EngineConfig(BaseModel):
     bearer token the client presents is a *secret* and is read via
     ``particles.secrets.get_engine_token_optional`` (``PARTICLES_ENGINE_TOKEN``)
     — never a field here, never in ``config.yaml``.
+
+    ``allow_plaintext_token`` lets the bearer ride a non-loopback ``http://``
+    URL, with a warning. Off by default: without it the client refuses to send
+    the token there at all (completing the June review's F18), so
+    a token reaches a remote engine only over ``https://`` or a loopback hop
+    (an SSH or Tailscale forward). Set it only for an engine on a network you
+    trust end to end.
     """
 
     base_url: str | None = None
     timeout_seconds: float = 60.0
+    allow_plaintext_token: bool = False
 
 
 class ObservabilityConfig(BaseModel):
@@ -359,6 +439,11 @@ class ObservabilityConfig(BaseModel):
     # local collector, or a SaaS ingest URL). Non-secret; the credential is the
     # PARTICLES_OTEL_EXPORTER_HEADERS secret. Unset ⇒ the OTLP SDK default endpoint.
     endpoint: str | None = None
+    # Exporter headers (PARTICLES_OTEL_EXPORTER_HEADERS, OTEL_EXPORTER_OTLP_*HEADERS)
+    # are refused over a non-loopback http:// endpoint: no OTLP exporter is
+    # installed and one WARNING names why (N12). True sends them anyway, with
+    # the warning, for a collector on a network you trust end to end.
+    allow_plaintext_headers: bool = False
     # Per-signal enables — turn off a signal without disabling the whole layer.
     traces: bool = True
     metrics: bool = True
@@ -428,6 +513,10 @@ class OpenAICompatProviderConfig(BaseModel):
     # OpenAI-compatible base URL; the adapter appends ``/chat/completions``.
     # Default targets a local Ollama server (the case).
     base_url: str = "http://localhost:11434/v1"
+    # The entry's API key is refused over a non-loopback http:// base_url, before
+    # any request (N12; the engine token's rule). True sends it
+    # anyway, with a warning, for an endpoint on a network you trust end to end.
+    allow_plaintext_key: bool = False
     # Per-request wall-clock timeout (seconds). Local models on modest hardware
     # can be slow, so the default is generous.
     timeout_seconds: float = 120.0
@@ -1490,6 +1579,14 @@ class MigrationConfig(BaseModel):
     # Deliberately low. A migrated belief is second-hand: this store never saw
     # the claim made, cannot check it, and did not calibrate the number.
     import_confidence: float = Field(default=0.35, ge=0.0, le=1.0)
+    # Bounds on one export (security review N23). An export larger than
+    # ``max_bytes`` is not parsed, and the mapping stops at ``max_candidates``
+    # with a quality note naming what it left out. Each candidate is reconciled
+    # with an embedding and the §6.6 ladder, and an HTTP text deposit typed
+    # ``MCP_MEMORY_EXPORT`` reaches this extractor too, so the export is not
+    # trusted to be small.
+    max_bytes: int = Field(default=32 * 1024 * 1024, ge=1)
+    max_candidates: int = Field(default=10_000, ge=1)
 
 
 class WebClipperConfig(BaseModel):
@@ -2872,6 +2969,31 @@ class LocalRefreshConfig(BaseModel):
     # *identity* rather than of content, which an unattended pass should decline
     # to follow rather than silently ingest.
     follow_symlinks: bool = False
+    # Extra directories (or files) the refresh may read, beyond the derived
+    # roots. The tier reads a ``file://`` entry only when its resolved path is
+    # under one of these or a derived root (security review D2): the rule-file
+    # roots (``rule_sources.paths``, the roots ``rules sync`` and
+    # ``init claude-code`` recorded, the main checkout of a recorded worktree,
+    # and ``~/.claude``; never the working directory), admitting only
+    # files named in ``rule_sources.filenames`` there, and ``*.md`` under
+    # ``~/.claude/projects`` (the Claude Code memory files). A file deposited
+    # with ``--fetch-policy LAZY`` anywhere else needs its directory named here.
+    # ``~`` and ``$VAR`` are expanded. An entry outside every root is skipped
+    # like a missing file and logged.
+    allowed_roots: list[str] = Field(default_factory=list)
+
+
+class LocalFilesConfig(BaseModel):
+    """Bounds on the local files the corpus reads itself (security review C9).
+
+    Every local read the corpus makes goes through one descriptor-checked reader
+    (``particles.corpus.local_read``): a file deposit, a vault, web-clipper or
+    project walk, a rule-file intake and the local refresh tier. ``max_bytes``
+    caps the file it will read; a larger file is refused before a byte is read
+    and reported like any unreadable file.
+    """
+
+    max_bytes: int = Field(default=256 * 1024 * 1024, ge=1)
 
 
 class RuleSourcesConfig(BaseModel):
@@ -2938,7 +3060,8 @@ class McpWriteConfig(BaseModel):
     enabled_stores: list[str] = Field(default_factory=list)
     # Seeded AUTHOR-scoped trust_rank for a new asserter identity (§6/§6a).
     agent_trust_rank: float = Field(default=0.8, ge=0.0, le=1.0)
-    # Whether retract/supersede may target another identity's particles (§6).
+    # Whether retract / supersede / tag / untag / link may target another
+    # identity's particles, and link_remove another writer's link (§6).
     allow_cross_asserter: bool = False
     # The server-bound asserting principal stamped onto asserted_by / author_id
     # / event actor — NOT a per-call client argument (§4a/§6, M3).
@@ -3012,6 +3135,18 @@ class McpMemoryCompatConfig(BaseModel):
 
 
 class McpConfig(BaseModel):
+    """MCP server surfaces.
+
+    ``rate_limit_per_minute`` caps, per server process, the tool calls that can
+    drive a paid model call: a ``query`` with a question (the NL response), a
+    ``particle_assert`` / ``particle_supersede`` (the §6.6 contradiction
+    probe), and every write of the memory-server façade. One token bucket per
+    process, refilling over a minute, so an agent looping on a tool (a prompt
+    injection, a runaway plan) spends at most this many such calls a minute
+    (security review D30). ``0`` disables it. Other reads are not counted.
+    """
+
+    rate_limit_per_minute: int = Field(default=60, ge=0)
     write: McpWriteConfig = Field(default_factory=McpWriteConfig)
     recall: McpRecallConfig = Field(default_factory=McpRecallConfig)
     memory_compat: McpMemoryCompatConfig = Field(default_factory=McpMemoryCompatConfig)
@@ -4299,9 +4434,16 @@ class CliConfig(BaseModel):
     config rather than behind a flag; set to 0 to disable entirely. The
     heartbeat is already suppressed whenever stderr is not a TTY, so this knob
     only matters for interactive use.
+
+    ``warn_unused_config`` controls the one warning a process prints when a
+    Particles ``config.yaml`` sits in its working directory or an ancestor and
+    is not read (settings come only from ``PARTICLES_CONFIG`` or
+    ``~/.particles/config.yaml``). Only a file the loader reads can turn it
+    off, so a file it ignores never can.
     """
 
     heartbeat_seconds: float = Field(default=20.0, ge=0)
+    warn_unused_config: bool = True
 
 
 class SourcePassageConfig(BaseModel):
@@ -4407,6 +4549,7 @@ class ParticlesConfig(BaseModel):
     benchmark: BenchmarkConfig = Field(default_factory=BenchmarkConfig)
     refetch_floors: dict[str, int] = Field(default_factory=lambda: dict(_DEFAULT_REFETCH_FLOORS))
     local_refresh: LocalRefreshConfig = Field(default_factory=LocalRefreshConfig)
+    local_files: LocalFilesConfig = Field(default_factory=LocalFilesConfig)
     rule_sources: RuleSourcesConfig = Field(default_factory=RuleSourcesConfig)
 
     def reconciliation_mode_for(self, store: str | None) -> str:
@@ -4488,6 +4631,7 @@ class ParticlesConfig(BaseModel):
 #: carve itself is reserved, not taken.
 CLIENT_SECTIONS: frozenset[str] = frozenset(
     {
+        "cli",
         "confidence",
         "content_age_decay",
         "contestedness",
@@ -4587,47 +4731,263 @@ def env_override_names() -> frozenset[str]:
     return frozenset(name for name, _section, _field in _ENV_OVERRIDES)
 
 
+#: Environment variables that choose where a secret, a prompt or telemetry is
+#: sent, and beat the config file a process pins: the two Particles overrides
+#: above, plus the ones the Anthropic and OpenTelemetry SDKs read themselves.
+ENDPOINT_ENV_VARS: tuple[str, ...] = (
+    "PARTICLES_ENGINE_BASE_URL",
+    "PARTICLES_OBSERVABILITY_ENDPOINT",
+    "ANTHROPIC_BASE_URL",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+)
+
+
+def _endpoint_origin(value: str) -> str:
+    """``scheme://host[:port]`` of an endpoint value, without any userinfo or path."""
+    try:
+        parts = urlsplit(value)
+        host = parts.hostname or ""
+        port = f":{parts.port}" if parts.port is not None else ""
+    except ValueError:
+        return "(unparseable)"
+    return f"{parts.scheme}://{host}{port}" if parts.scheme and host else "(unparseable)"
+
+
+def environment_notes() -> list[str]:
+    """What this process's environment changes about its config, for the diagnostics.
+
+    ``config validate`` and ``hook doctor`` print these: a relative
+    ``PARTICLES_CONFIG`` (read against the working directory), every set
+    override from :data:`_ENV_OVERRIDES`, and each endpoint variable that
+    sends a secret or the prompts somewhere other than the pinned file says
+    (security review N15, N16). An entry starting with ``⚠`` deserves a look.
+    """
+    notes: list[str] = []
+    explicit = os.environ.get("PARTICLES_CONFIG")
+    if explicit and not Path(explicit).is_absolute():
+        notes.append(
+            f"⚠ PARTICLES_CONFIG is relative ({explicit}) and is read against the working "
+            "directory; set an absolute path"
+        )
+    overrides = sorted(name for name in env_override_names() if name in os.environ)
+    if overrides:
+        notes.append("overrides set: " + ", ".join(overrides))
+    for name in ENDPOINT_ENV_VARS:
+        value = os.environ.get(name)
+        if value:
+            notes.append(f"⚠ {name} sends to {_endpoint_origin(value)}, overriding the config file")
+    return notes
+
+
 # ---------------------------------------------------------------------------
 # Loader
 # ---------------------------------------------------------------------------
 
 
+def user_config_path() -> Path:
+    """The per-user config file, ``~/.particles/config.yaml``.
+
+    Fixed under the home directory, beside the per-user state Particles already
+    keeps there, and never configurable from a config. Computed per call so a
+    test that swaps ``HOME`` sees its own.
+    """
+    return Path.home() / ".particles" / "config.yaml"
+
+
 def _find_config_file() -> Path | None:
-    """Resolve the ``config.yaml`` this process should load.
+    """Resolve the ``config.yaml`` this process loads.
 
-    Order: ``PARTICLES_CONFIG`` (absolute authority — a named file that does
-    not exist resolves to ``None`` rather than falling through), then the
-    working directory, then the nearest ancestor holding a ``config.yaml``,
-    first match wins.
+    Order: ``PARTICLES_CONFIG``, then the user file
+    (:func:`user_config_path`), then nothing (compiled defaults).
+    ``PARTICLES_CONFIG`` is absolute authority: a named file that does not
+    exist resolves to ``None`` rather than falling through to the user file,
+    and :func:`_load_config` reports it.
 
-    The upward walk exists because falling back to compiled defaults is
-    *silent*: a process launched from a subdirectory — a git worktree, a hook
-    spawn, a ``cd`` into ``scripts/`` — used to lose every knob the operator
-    set at the repo root, and the divergence surfaced weeks later as blobs
-    written somewhere nobody looks (the 2026-07-18 sharding incident).
-
-    The walk stops after examining the directory that holds a ``.git`` entry,
-    so a ``config.yaml`` in ``$HOME`` never becomes the ambient config for
-    every project beneath it: a config at a repo root is a deliberate project
-    setting, one above it is an accident waiting to be inherited.
+    Nothing is read from the working directory or its ancestors. The loader
+    used to walk up from the working directory, which let a cloned
+    repository that ships a ``config.yaml`` configure every unpinned process run
+    inside it: rebind the engine, provider and telemetry endpoints the secrets
+    are sent to, or turn on the MCP write tools (security review 2026-10-23,
+    findings D1, D6, D8 and D15). A nearby file that is no longer read is
+    reported instead (:func:`nearby_unused_config`).
     """
     explicit = os.environ.get("PARTICLES_CONFIG")
     if explicit:
         p = Path(explicit)
         return p if p.exists() else None
+    user = user_config_path()
+    return user if user.exists() else None
 
-    start = Path.cwd()
+
+#: Largest nearby file :func:`nearby_unused_config` will parse to see whether it
+#: is a Particles config. A larger file is not reported; it is read for no
+#: other purpose.
+_NEARBY_CONFIG_MAX_BYTES = 1024 * 1024
+
+
+def _read_bounded_regular_file(path: Path, limit: int) -> bytes | None:
+    """At most ``limit`` bytes of ``path``, or ``None`` when it is not a small regular file.
+
+    The file is opened non-blocking and checked with ``fstat`` on the open
+    descriptor, so a FIFO or device swapped in after an ``is_file()`` check
+    can neither hang the read nor feed it without end (security review N14).
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        chunks: list[bytes] = []
+        remaining = limit + 1
+        while remaining > 0:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    data = b"".join(chunks)
+    return None if len(data) > limit else data
+
+
+def _names_a_particles_section(path: Path) -> bool:
+    """Whether ``path`` is a YAML mapping naming at least one Particles section.
+
+    ``yaml.safe_load`` builds plain values only, so parsing a file nobody
+    vouched for applies nothing. It can still fail in ways a YAML error does
+    not cover (a deeply nested document raises ``RecursionError``), and this
+    only decides whether to print a warning, so any failure means "no"
+    (security review N14).
+    """
+    data = _read_bounded_regular_file(path, _NEARBY_CONFIG_MAX_BYTES)
+    if data is None:
+        return False
+    try:
+        loaded = yaml.safe_load(data.decode("utf-8"))
+    except Exception:  # noqa: BLE001 - a warning path must never fail the load
+        return False
+    return isinstance(loaded, dict) and any(key in ParticlesConfig.model_fields for key in loaded)
+
+
+def nearby_unused_config(loaded: Path | None = None) -> Path | None:
+    """The nearest Particles ``config.yaml`` around the working directory, if unread.
+
+    Looks in the working directory and its ancestors, stopping after the
+    directory that holds a ``.git`` entry (a file in a git worktree), the
+    bounds walk used. Returns the nearest ``config.yaml`` when it
+    names a Particles section and is not the file the loader read (``loaded``);
+    another tool's ``config.yaml`` returns ``None``. Never applies anything.
+    """
+    loaded_real = loaded.resolve() if loaded is not None else None
+    try:
+        start = Path.cwd()
+    except OSError:  # the working directory was removed
+        return None
     for directory in (start, *start.parents):
         candidate = directory / "config.yaml"
-        if candidate.exists():
-            return candidate
-        # `exists()`, not `is_dir()`: in a git worktree (and in a submodule)
-        # `.git` is a *file* containing a `gitdir:` pointer. That is precisely
-        # the case this bound has to catch, since worktrees are where the
-        # subdirectory-launch problem showed up.
+        if candidate.is_file():
+            if loaded_real is not None and candidate.resolve() == loaded_real:
+                return None
+            return candidate if _names_a_particles_section(candidate) else None
         if (directory / ".git").exists():
             return None
     return None
+
+
+class ConfigResolution(NamedTuple):
+    """Where this process's settings come from, for ``config validate`` and ``hook doctor``.
+
+    ``origin`` is ``"PARTICLES_CONFIG"``, ``"user file"`` or ``"none"``
+    (compiled defaults). ``missing`` is the path ``PARTICLES_CONFIG`` names when
+    that file does not exist; ``ignored`` is a nearby Particles config the
+    loader does not read (:func:`nearby_unused_config`).
+    """
+
+    path: Path | None
+    origin: str
+    missing: Path | None
+    ignored: Path | None
+
+
+def describe_config_resolution() -> ConfigResolution:
+    """Resolve the config origin without loading or caching it."""
+    explicit = os.environ.get("PARTICLES_CONFIG")
+    path = _find_config_file()
+    if explicit:
+        origin = "PARTICLES_CONFIG" if path is not None else "none"
+        missing = None if path is not None else Path(explicit)
+        return ConfigResolution(path, origin, missing, None)
+    origin = "user file" if path is not None else "none"
+    return ConfigResolution(path, origin, None, nearby_unused_config(path))
+
+
+_warned_resolution: set[str] = set()
+_resolution_warnings: list[str] = []
+
+
+def _warn_resolution_once(key: str, message: str) -> None:
+    """Log one config-resolution warning per process, and keep it for the hook log."""
+    if key in _warned_resolution:
+        return
+    _warned_resolution.add(key)
+    _resolution_warnings.append(message)
+    log.warning("%s", message)
+
+
+def config_resolution_warnings() -> list[str]:
+    """The config-resolution warnings this process has emitted (§3).
+
+    The lifecycle hooks print nothing but their own output, so they copy these
+    into the hook log instead.
+    """
+    return list(_resolution_warnings)
+
+
+def _report_resolution(config_path: Path | None, cfg: ParticlesConfig) -> None:
+    """Warn about a missing or relative ``PARTICLES_CONFIG``, or a nearby config left unread."""
+    explicit = os.environ.get("PARTICLES_CONFIG")
+    if explicit:
+        if config_path is not None and not Path(explicit).is_absolute():
+            _warn_resolution_once(
+                f"relative:{explicit}",
+                f"PARTICLES_CONFIG names a relative path ({explicit}), so it is read against "
+                f"the working directory as {config_path.resolve()}; a cloned repository with "
+                "a file at that path would configure this process. Set an absolute path.",
+            )
+        if config_path is None:
+            hint = (
+                " The shell does not expand `~` inside quotes; write $HOME/... instead."
+                if explicit.startswith("~")
+                else ""
+            )
+            _warn_resolution_once(
+                f"missing:{explicit}",
+                f"PARTICLES_CONFIG names {explicit}, which does not exist; "
+                f"running on compiled defaults.{hint}",
+            )
+        return
+    if not cfg.cli.warn_unused_config:
+        return
+    try:
+        nearby = nearby_unused_config(config_path)
+    except Exception:  # noqa: BLE001 - a warning path must never fail the load (N14)
+        log.debug("nearby config check failed", exc_info=True)
+        return
+    if nearby is not None:
+        _warn_resolution_once(
+            f"ignored:{nearby}",
+            f"Ignoring {nearby}: Particles no longer reads config.yaml from the working "
+            f"directory. To use it, set PARTICLES_CONFIG={nearby}, or move it to "
+            f"{user_config_path()}.",
+        )
 
 
 def sqlite_file_path(url: str) -> str | None:
@@ -4645,6 +5005,28 @@ def sqlite_file_path(url: str) -> str | None:
     if not path or path == ":memory:":
         return None
     return path
+
+
+def describe_default_store() -> str:
+    """Where the ``default`` store is, for a startup or diagnostic line.
+
+    A file-backed SQLite store reads as its absolute path, marked when the
+    configured path is relative and so names a different file in each working
+    directory. Any other DSN reads as its scheme only, so no credential in it
+    is printed.
+    """
+    url = get_config().storage.database_url
+    db_file = sqlite_file_path(url)
+    if db_file is None:
+        return f"{url.split(':', 1)[0]} database"
+    path = Path(db_file).expanduser()
+    if path.is_absolute():
+        return str(path)
+    try:
+        here = Path.cwd() / path
+    except OSError:
+        here = path
+    return f"{os.path.normpath(here)} (relative to the working directory)"
 
 
 def resolve_store_adjacent_path(value: str) -> Path:
@@ -4714,7 +5096,9 @@ def _load_config() -> ParticlesConfig:
             else:
                 raw[section][field] = value
 
-    return ParticlesConfig.model_validate(raw)
+    cfg = ParticlesConfig.model_validate(raw)
+    _report_resolution(config_path, cfg)
+    return cfg
 
 
 def validate_config() -> tuple[Path | None, ParticlesConfig]:

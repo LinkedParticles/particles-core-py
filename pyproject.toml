@@ -19,7 +19,7 @@
 # version and advance together.
 [project]
 name = "linkedparticles-core"
-version = "1.210.2"
+version = "1.214.1"
 description = "Store-free client library for Particles: define, validate, serialize, and extract provenance-tracked belief particles"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -149,7 +149,7 @@ Documentation = "https://docs.linkedparticles.org"
 Repository = "https://github.com/LinkedParticles/particles-core-py"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]

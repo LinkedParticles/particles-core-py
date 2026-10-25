@@ -331,6 +331,10 @@ class RelationCreatedBy(StrEnum):
     # Written on a CONTRADICTS edge; the probe verdict it records was already
     # paid for on the write path, so lint reports it without a second probe.
     OBSERVER_DIVERGENCE = "OBSERVER_DIVERGENCE"
+    # An MCP agent's `link_add`. Kept distinct from MANUAL_CLI, the
+    # operator's `links add`, so an agent may withdraw only the links an agent
+    # wrote and the event log credits the agent, not the operator CLI.
+    AGENT_ASSERTED = "AGENT_ASSERTED"
 
 
 class SuggestMode(StrEnum):

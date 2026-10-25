@@ -75,7 +75,7 @@ from particles.extraction.migration_preview import MigrationPreview, build_previ
 log = logging.getLogger(__name__)
 
 EXTRACTOR_ID = "mcp-memory-extractor"
-EXTRACTOR_VERSION = "0.1.1"
+EXTRACTOR_VERSION = "0.1.2"
 
 #: The per-incumbent source type. One string keys four existing
 #: levers: extractor applicability, the extractor trust weight, a
@@ -417,7 +417,23 @@ class McpMemoryExtractor:
         # The pipeline passes the corpus entry's depositor;
         # the fallback covers a direct call in a test or a tool.
         actor = str(kwargs.get("deposited_by") or "operator")
+        oversize = export_size_note(len(content))
+        if oversize is not None:
+            # Before the parser: an HTTP text deposit typed MCP_MEMORY_EXPORT
+            # reaches this extractor too (security review N23).
+            return ExtractionResult(quality_notes=[oversize])
         return map_graph(parse_memory_jsonl(content), deposited_by=actor)
+
+
+def export_size_note(size: int) -> str | None:
+    """The refusal note for an export over ``migration.max_bytes``, else ``None``."""
+    cap = get_config().migration.max_bytes
+    if size <= cap:
+        return None
+    return (
+        f"Export is {size} bytes, over the migration.max_bytes limit of {cap}; not parsed. "
+        "Raise the limit to import it."
+    )
 
 
 def map_graph(graph: ParsedGraph, *, deposited_by: str = "operator") -> ExtractionResult:
@@ -434,6 +450,7 @@ def map_graph(graph: ParsedGraph, *, deposited_by: str = "operator") -> Extracti
         )
 
     floor = _import_floor()
+    cap = get_config().migration.max_candidates
     contributors = [
         ContributorRef(id=_contributor_id(deposited_by), role="importer", at=datetime.now(UTC))
     ]
@@ -447,6 +464,8 @@ def map_graph(graph: ParsedGraph, *, deposited_by: str = "operator") -> Extracti
         )
         classes = {entity.name: entity.entity_type} if entity.entity_type else {}
         for index, observation in enumerate(entity.observations):
+            if len(candidates) >= cap:
+                break
             candidates.append(
                 CandidateParticle(
                     content=observation,
@@ -469,6 +488,8 @@ def map_graph(graph: ParsedGraph, *, deposited_by: str = "operator") -> Extracti
     entity_types = {_key(e.name): e.entity_type for e in graph.entities if e.entity_type}
 
     for relation in graph.relations:
+        if len(candidates) >= cap:
+            break
         endpoint_classes = {
             name: entity_types[_key(name)]
             for name in (relation.from_name, relation.to_name)
@@ -502,6 +523,15 @@ def map_graph(graph: ParsedGraph, *, deposited_by: str = "operator") -> Extracti
         )
 
     notes = [*graph.notes, *empty_entity_notes(empty_entity_report(graph))]
+    total = sum(len(e.observations) for e in graph.entities) + len(graph.relations)
+    if total > cap:
+        # Each candidate is reconciled with an embedding and the §6.6 ladder, so
+        # the export is not trusted to be small (security review N23).
+        notes.append(
+            f"The export maps to {total} records; the first {cap} (observations, then "
+            f"relations) were imported and {total - cap} were not, at the "
+            "migration.max_candidates limit. Raise it and import again for the rest."
+        )
     if graph.unmapped_fields:
         fields = ", ".join(f"{name} ({count})" for name, count in graph.unmapped_fields.items())
         notes.append(

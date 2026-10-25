@@ -26,9 +26,13 @@ a back-compat shim re-exporting this module.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
+import logging
 import os
 import re
+import stat
+import tempfile
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
@@ -48,6 +52,8 @@ from particles.core.schema import (
 )
 from particles.core.status import Status
 from particles.extraction.polarity import is_non_asserted
+
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Projected-region sentinels (hoisted here).
@@ -75,6 +81,62 @@ PROJECTED_BEGIN_RE_TMPL = (
     r"<!--\s*BEGIN PROJECTED:\s*{region}\s*\(manifest:\s*(?P<manifest>[^)]*?)\s*\)\s*-->"
 )
 PROJECTED_END_RE_TMPL = r"<!--\s*END PROJECTED:\s*{region}\s*-->"
+
+#: Matches any BEGIN or END sentinel, of any region: text a renderer is about
+#: to splice must carry none (security review D14).
+PROJECTED_SENTINEL_RE = re.compile(r"<!--\s*(?:BEGIN|END) PROJECTED:")
+
+
+def neutralize_comment_delimiters(text: str) -> str:
+    """``text`` with HTML comment delimiters escaped, so it cannot open or close one.
+
+    Belief text rendered into a projected region must not be able to write a
+    sentinel: a belief carrying ``<!-- END PROJECTED: memory-index -->`` would
+    close the region early, leave its own tail outside it, and the next harvest
+    would read that tail as the owner's own words (security review D14). The
+    escaped form reads the same in rendered Markdown.
+    """
+    return text.replace("<!--", "&lt;!--").replace("-->", "--&gt;")
+
+
+_LINE_BREAKS = re.compile(r"\s*[\r\n]+\s*")
+
+
+def neutralize_inline_markdown(text: str) -> str:
+    """Stored claim text made inert as one line of exported Markdown.
+
+    A claim is extracted from deposited documents, so it is untrusted. Placed
+    raw in an Obsidian note or a Logseq page it could carry HTML (a remote
+    ``<img>``, a comment that hides the rest of the line), an embed or remote
+    image (``![[…]]``, ``![](https://…)``), a link whose text names one place
+    and whose target is another, a Logseq macro (``{{…}}``), or a line break
+    that leaves the callout or block it sits in (security review D36).
+
+    Every one of those is backslash-escaped, which CommonMark, Obsidian and
+    Logseq render as the literal character, so the claim reads as written.
+    Backslashes are escaped first so the claim cannot cancel an escape. A
+    ``[[wikilink]]`` stays a link, since a link to a subject's note is how the
+    exported graph is navigated.
+    """
+    text = _LINE_BREAKS.sub(" ", text).strip()
+    text = text.replace("\\", "\\\\")
+    text = text.replace("<", "\\<")
+    text = re.sub(r"!(?=\[)", r"\\!", text)
+    text = text.replace("](", "]\\(")
+    return text.replace("{{", "\\{\\{")
+
+
+def neutralize_link_label(text: str) -> str:
+    """Stored text made safe as the visible label of a link the exporter writes.
+
+    A label sits inside ``[[target|label]]`` or ``[label](target)``, where a
+    backslash escape is not reliably honoured, so brackets become parentheses
+    (the label cannot close the link and open another) and ``<`` becomes an
+    entity (security review D36).
+    """
+    text = " ".join(text.split())
+    return text.replace("[", "(").replace("]", ")").replace("<", "&lt;")
+
 
 #: Matches *any* BEGIN sentinel, capturing the region name — the harvest-side
 #: strip must find every projected region without knowing their names.
@@ -137,14 +199,33 @@ def strip_projected_regions_for_deposit(text: str, snapshot_bodies: Mapping[str,
     kept — deposited as ordinarily-authored input for the §6.6 ladder — and
     only the sentinel comment lines are dropped. Structurally damaged pairs
     (BEGIN without END) are left untouched.
+
+    A region followed by a second END sentinel of its own name, before the next
+    BEGIN, is damaged the other way: something wrote an END inside the region,
+    and the text up to the last END was rendered, not authored. Nothing from
+    BEGIN through that last END is deposited (security review D14).
     """
     regions = find_projected_regions(text)
     if not regions:
         return text
     out: list[str] = []
     cursor = 0
-    for region in regions:
+    for i, region in enumerate(regions):
+        if region.start < cursor:
+            continue  # inside a damaged span already dropped
         out.append(text[cursor : region.start])
+        limit = regions[i + 1].start if i + 1 < len(regions) else len(text)
+        end_re = re.compile(PROJECTED_END_RE_TMPL.format(region=re.escape(region.region)))
+        extra = list(end_re.finditer(text, region.end, limit))
+        if extra:
+            log.warning(
+                "projected region %r carries %d extra END sentinel(s); "
+                "nothing from it is deposited",
+                region.region,
+                len(extra),
+            )
+            cursor = extra[-1].end()
+            continue
         snapshot = snapshot_bodies.get(region.region)
         pristine = snapshot is not None and region.body.strip("\n") == snapshot.strip("\n")
         if not pristine and region.body:
@@ -529,19 +610,34 @@ def atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None
     (replacement of the file). Same disk = same filesystem = the rename
     cannot cross a filesystem boundary and become a copy.
 
-    Hidden-prefix + PID disambiguates concurrent writes within the same
-    process tree and prevents the tempfile from being indexed by sync
-    daemons before the rename. The target directory is created if
-    missing.
+    The hidden tempfile keeps sync daemons from indexing it before the
+    rename. It is created by :func:`tempfile.mkstemp`, so its name is
+    unpredictable and it is opened ``O_CREAT | O_EXCL``: a symlink planted
+    at a guessable sibling name can neither redirect the write nor be
+    renamed onto the target (security review D35). The file takes the
+    target's permission bits when the target exists, else ``0o644``. The
+    target directory is created if missing.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
-        tmp.write_text(content, encoding=encoding)
+        existing = path.lstat()
+    except FileNotFoundError:
+        existing = None
+    mode = (
+        stat.S_IMODE(existing.st_mode)
+        if existing is not None and stat.S_ISREG(existing.st_mode)
+        else 0o644
+    )
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as fh:
+            fh.write(content)
+        os.chmod(tmp, mode)
         os.replace(tmp, path)
-    except Exception:
+    except BaseException:
         # Best-effort cleanup of the tempfile if anything between
-        # write_text and replace blew up.
+        # the write and the replace blew up.
         with contextlib.suppress(FileNotFoundError):
             tmp.unlink()
         raise
@@ -652,7 +748,15 @@ class MarkdownExportLedger:
     present.
 
     The lifecycle is :meth:`claim`, then :meth:`write` for every file, then
-    :meth:`finish`, which prunes and saves the manifest. :meth:`claim`
+    :meth:`finish`, which prunes and saves the manifest.
+
+    The manifest and the journal record the SHA-256 of every file written, and
+    the prune deletes only a file whose bytes still match the recorded hash.
+    A manifest entry with no hash (a version-1 manifest, an older journal line)
+    is pruned only when ``legacy_marker`` recognises the file. A manifest
+    planted in a shared or cloned vault therefore cannot make the user's own
+    notes prunable, and a note the user edited after an export is kept
+    (security review D34). :meth:`claim`
     refuses a target that holds files it does not own and has never been
     exported to, unless ``force``. :meth:`write` never overwrites a file it
     does not own unless ``force``; it skips it and reports ``False``.
@@ -667,6 +771,8 @@ class MarkdownExportLedger:
         recursive: bool,
         force: bool,
         owned: set[Path],
+        recorded: Mapping[Path, str | None] | None = None,
+        legacy_marker: Callable[[str], bool] | None = None,
     ) -> None:
         self.root = root
         self.scope = scope
@@ -674,7 +780,10 @@ class MarkdownExportLedger:
         self.recursive = recursive
         self.force = force
         self.owned = owned
+        self.recorded: dict[Path, str | None] = dict(recorded or {})
+        self.legacy_marker = legacy_marker
         self.written: set[Path] = set()
+        self.written_hashes: dict[Path, str] = {}
         self.skipped: list[Path] = []
 
     @classmethod
@@ -698,7 +807,12 @@ class MarkdownExportLedger:
         scope = scope if scope is not None else root
         manifest = _read_export_manifest(root, exporter)
         journal = _read_export_journal(root)
-        owned = {p for p in (manifest or set()) | journal if _ownable(scope, p, recursive)}
+        recorded = {
+            p: digest
+            for p, digest in {**(manifest or {}), **journal}.items()
+            if _ownable(scope, p, recursive)
+        }
+        owned = set(recorded)
         present = _markdown_files(scope, recursive)
         if manifest is None and legacy_marker is not None:
             for path in present - owned:
@@ -719,7 +833,16 @@ class MarkdownExportLedger:
                 f"export never deletes a file it did not write; with --force it "
                 f"overwrites one whose path a note it writes takes."
             )
-        return cls(root, scope, exporter=exporter, recursive=recursive, force=force, owned=owned)
+        return cls(
+            root,
+            scope,
+            exporter=exporter,
+            recursive=recursive,
+            force=force,
+            owned=owned,
+            recorded=recorded,
+            legacy_marker=legacy_marker,
+        )
 
     def write(self, path: Path, content: str) -> bool:
         """Write ``path`` atomically unless it is a file this exporter does not own.
@@ -737,20 +860,41 @@ class MarkdownExportLedger:
             self.skipped.append(resolved)
             return False
         atomic_write_text(path, content)
-        if resolved not in self.owned and resolved not in self.written:
-            _append_export_journal(self.root, resolved)
+        digest = _content_digest(content.encode("utf-8"))
+        if self.written_hashes.get(resolved) != digest:
+            _append_export_journal(self.root, resolved, digest)
         self.written.add(resolved)
+        self.written_hashes[resolved] = digest
         return True
+
+    def _still_as_written(self, path: Path) -> bool:
+        """Whether ``path`` holds what this exporter recorded writing there."""
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return False
+        digest = self.recorded.get(path)
+        if digest is not None:
+            return _content_digest(data) == digest
+        if self.legacy_marker is None:
+            return False
+        try:
+            return self.legacy_marker(data.decode("utf-8"))
+        except UnicodeDecodeError:
+            return False
 
     def finish(self) -> int:
         """Prune owned files this run did not write, save the manifest, clear
         the journal; return the number pruned."""
+        prunable = {p for p in self.owned - self.written if self._still_as_written(p)}
         pruned = prune_obsolete_markdown(
-            self.scope, self.written, owned=self.owned, recursive=self.recursive
+            self.scope, self.written, owned=prunable, recursive=self.recursive
         )
         root = self.root.resolve()
-        files = sorted(p.relative_to(root).as_posix() for p in self.written)
-        manifest = {"exporter": self.exporter, "version": 1, "files": files}
+        files = {
+            p.relative_to(root).as_posix(): self.written_hashes[p] for p in sorted(self.written)
+        }
+        manifest = {"exporter": self.exporter, "version": 2, "files": files}
         atomic_write_text(self.root / EXPORT_MANIFEST_NAME, json.dumps(manifest, indent=1) + "\n")
         with contextlib.suppress(FileNotFoundError):
             (self.root / EXPORT_JOURNAL_NAME).unlink()
@@ -771,9 +915,15 @@ def _ownable(scope: Path, path: Path, recursive: bool) -> bool:
     return recursive or path.parent == scope.resolve()
 
 
-def _read_export_manifest(root: Path, exporter: str) -> set[Path] | None:
-    """The resolved paths ``exporter``'s manifest at ``root`` lists, or ``None``
-    when there is none (or it belongs to another exporter, or is unreadable)."""
+def _content_digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _read_export_manifest(root: Path, exporter: str) -> dict[Path, str | None] | None:
+    """``resolved path -> recorded SHA-256`` for ``exporter``'s manifest at
+    ``root``, or ``None`` when there is none (or it belongs to another exporter,
+    or is unreadable). A version-1 manifest lists bare paths, recorded as
+    ``None``."""
     try:
         data = json.loads((root / EXPORT_MANIFEST_NAME).read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -781,23 +931,38 @@ def _read_export_manifest(root: Path, exporter: str) -> set[Path] | None:
     if not isinstance(data, dict) or data.get("exporter") != exporter:
         return None
     files = data.get("files")
-    if not isinstance(files, list):
-        return None
-    return {(root / f).resolve() for f in files if isinstance(f, str)}
+    if isinstance(files, list):
+        return {(root / f).resolve(): None for f in files if isinstance(f, str)}
+    if isinstance(files, dict):
+        return {
+            (root / f).resolve(): digest if isinstance(digest, str) else None
+            for f, digest in files.items()
+            if isinstance(f, str)
+        }
+    return None
 
 
-def _read_export_journal(root: Path) -> set[Path]:
+def _read_export_journal(root: Path) -> dict[Path, str | None]:
+    """``resolved path -> SHA-256`` for each file an interrupted run wrote; the
+    last line for a path wins. A line from before hashes were journalled
+    records ``None``."""
     try:
         lines = (root / EXPORT_JOURNAL_NAME).read_text(encoding="utf-8").splitlines()
     except OSError:
-        return set()
-    return {(root / line).resolve() for line in lines if line.strip()}
+        return {}
+    out: dict[Path, str | None] = {}
+    for line in lines:
+        if not line.strip():
+            continue
+        rel, _, digest = line.partition("\t")
+        out[(root / rel).resolve()] = digest or None
+    return out
 
 
-def _append_export_journal(root: Path, path: Path) -> None:
+def _append_export_journal(root: Path, path: Path, digest: str) -> None:
     rel = path.relative_to(root.resolve()).as_posix()
     with (root / EXPORT_JOURNAL_NAME).open("a", encoding="utf-8") as fh:
-        fh.write(rel + "\n")
+        fh.write(f"{rel}\t{digest}\n")
 
 
 _SEVERITY_CALLOUT: dict[str, str] = {
@@ -827,7 +992,7 @@ def render_particle(particle: Particle, effective_confidence: float | None = Non
 
     lines = [
         f"> [!{callout_type}] {title}",
-        f"> **Content:** {particle.content}",
+        f"> **Content:** {neutralize_inline_markdown(particle.content)}",
         f"> **Uncertainty:** {particle.uncertainty_nature}",
         f"> **Asserted by:** {particle.asserted_by}",
         f"> **Asserted at:** {particle.asserted_at.isoformat()}",
@@ -1059,9 +1224,11 @@ def format_memory_bullet(
     drill-down when the inconsistency basis fired (``contested_by``). With no
     bases supplied, a bare ``contested_by`` renders the pre-badge
     inconsistency-only flag unchanged. No timestamp, no volatile field:
-    byte-stable for a given input (the §2 idempotent-render belt).
+    byte-stable for a given input (the §2 idempotent-render belt). HTML comment
+    delimiters in ``content`` are escaped, so a belief cannot write a region
+    sentinel (:func:`neutralize_comment_delimiters`).
     """
-    flat = " ".join(content.split())
+    flat = neutralize_comment_delimiters(" ".join(content.split()))
     bases = list(contested_bases)
     versus = f" (vs. p-{contested_by})" if contested_by else ""
     if bases:

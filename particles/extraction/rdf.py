@@ -197,6 +197,42 @@ class RemoteRetrievalRefused(RuntimeError):
     """
 
 
+class EntityDeclarationRefused(RuntimeError):
+    """An RDF/XML document declares an XML entity (security review N39).
+
+    An internal entity is expanded into every literal that names it, so a few
+    nested declarations multiply the input many times over. Expat's own
+    amplification guard allows roughly a hundredfold growth past 8 MiB, which
+    the 16 MiB ``rdf.max_bytes`` cap does not bound. RDF/XML has no need of an
+    entity, so any declaration is refused, the way ``defusedxml`` does.
+    """
+
+
+def _forbid_entity_declarations(parser: Any) -> None:
+    """Refuse every ``<!ENTITY`` declaration on one expat-backed SAX reader.
+
+    ``xml.sax``'s expat reader exposes no declaration-handler property, and it
+    builds a fresh ``pyexpat`` parser in each ``reset()``, so the handler is
+    installed on that parser after every reset. A reader without the expat
+    ``_parser`` is refused outright rather than parsed unguarded.
+    """
+    original_reset = parser.reset
+
+    def _refuse(name: str, *_args: Any) -> None:
+        raise EntityDeclarationRefused(f"refused the XML entity declaration {name!r}")
+
+    def _guarded_reset() -> None:
+        original_reset()
+        inner = getattr(parser, "_parser", None)
+        if inner is None:
+            raise EntityDeclarationRefused(
+                "the SAX reader exposes no expat parser to guard against entity declarations"
+            )
+        inner.EntityDeclHandler = _refuse
+
+    parser.reset = _guarded_reset
+
+
 def _forbid_external_entities(parser: Any, refused: list[str]) -> None:
     """Turn off external entity and DTD resolution on one SAX parser.
 
@@ -285,6 +321,7 @@ def no_remote_retrieval() -> Iterator[list[str]]:
     def _hardened_create_parser(target: Any, store: Any) -> Any:
         parser = original_create_parser(target, store)
         _forbid_external_entities(parser, refused)
+        _forbid_entity_declarations(parser)
         return parser
 
     jsonld_context.source_to_json = _refuse_context_fetch  # type: ignore[attr-defined]

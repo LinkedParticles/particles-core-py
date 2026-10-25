@@ -45,9 +45,10 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import os
 import socket
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 from urllib.parse import urlparse
 
@@ -68,6 +69,19 @@ Resolver = Callable[[str], list[IPAddress]]
 # IPv4-mapped IPv6 form (``::ffff:100.64.0.0`` + the 10-bit prefix → /106).
 _CGNAT_V4 = ipaddress.IPv4Network("100.64.0.0/10")
 _CGNAT_V6_MAPPED = ipaddress.IPv6Network("::ffff:100.64.0.0/106")
+
+
+def is_network_uri(uri: str) -> bool:
+    """Whether ``uri`` names a network resource (``http`` / ``https``), not a local one.
+
+    The test a remote deposit's ``fetch_policy=LAZY`` must pass. A ``LAZY``
+    entry is re-read by the engine later, and only a network URI-R is re-read
+    through the guarded fetch path: a ``file://`` URI-R (or any other scheme)
+    names a path on the engine host, so a remote caller who could enrol one
+    could make the engine read its own files and store them in the corpus
+    (security review 2026-10-23, finding D2).
+    """
+    return urlparse(uri).scheme.lower() in ALLOWED_SCHEMES
 
 
 class UnsafeUrlError(ValueError):
@@ -213,6 +227,115 @@ def format_connect_pin(host: str, port: int, addrs: list[IPAddress]) -> str:
     """
     rendered = [f"[{ip}]" if isinstance(ip, ipaddress.IPv6Address) else str(ip) for ip in addrs]
     return f"{host}:{port}:{','.join(rendered)}"
+
+
+# ---------------------------------------------------------------------------
+# Credentials over cleartext (N12, SECURITY_REVIEW_20261024-1)
+# ---------------------------------------------------------------------------
+
+
+def host_is_loopback(host: str | None) -> bool:
+    """True iff ``host`` is loopback (``127.0.0.0/8`` / ``::1`` / ``localhost``).
+
+    Fail-closed like ``particles.api.auth._is_loopback_host``: a non-IP
+    hostname (other than the literal ``localhost``) is treated as non-loopback.
+    No DNS is resolved, so a custom name aliasing loopback counts as remote,
+    the safe direction for a credential check.
+    """
+    if not host:
+        return False
+    h = host.strip().lower()
+    if h == "localhost":
+        return True
+    h = h.removeprefix("[").removesuffix("]")
+    h = h.split("%", 1)[0]
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
+
+
+def is_cleartext_remote(url: str) -> bool:
+    """True iff a credential sent to ``url`` would cross the network unencrypted.
+
+    That is any scheme other than ``https`` to a host that is not loopback. The
+    documented tunnel deployments (an SSH or Tailscale forward to
+    ``http://127.0.0.1``) stay ``False``. The engine bearer, the
+    OpenAI-compatible provider key and the OTLP exporter headers are each
+    refused on a ``True`` here unless the operator opted in for that one
+    endpoint.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme.lower() == "https":
+        return False
+    return not host_is_loopback(parsed.hostname)
+
+
+# ---------------------------------------------------------------------------
+# Git subprocesses: no program a repository or the user's config names
+# (N13 / D22, SECURITY_REVIEW_20261024-1)
+# ---------------------------------------------------------------------------
+
+#: ``-c`` options every local-only git subprocess passes (class 3).
+#: A repository's own ``.git/config`` can name a program git runs by itself,
+#: and ``core.fsmonitor`` runs on any index refresh, ``ls-files`` and
+#: ``rev-parse`` included, so a planted config in a checkout the operator names
+#: would otherwise execute. ``diff`` callers also pass ``--no-ext-diff
+#: --no-textconv``. A caller that also stages or commits adds its own
+#: hardening on top (the memory projection's ``_HARDENING_CONFIG`` disables
+#: hooks and skips a repository whose config names a filter driver).
+GIT_LOCAL_ARGS: tuple[str, ...] = ("-c", "core.fsmonitor=false")
+
+#: Environment variables that point git at a repository other than the one its
+#: arguments name. A git hook exports several of them, so a subprocess run from
+#: inside one would otherwise reach the hook's repository.
+GIT_REDIRECT_VARS = frozenset(
+    {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_NAMESPACE",
+        "GIT_PREFIX",
+    }
+)
+
+
+def local_git_env(environ: Mapping[str, str]) -> dict[str, str]:
+    """``environ`` without the repository-redirect variables, for a local git query."""
+    return {k: v for k, v in environ.items() if k not in GIT_REDIRECT_VARS}
+
+
+def isolated_git_env(environ: Mapping[str, str], *, home: str) -> dict[str, str]:
+    """An environment for git over a repository fetched from elsewhere (N13).
+
+    Every ``GIT_*`` variable is dropped, so neither a hook's redirect variables
+    nor an inherited ``GIT_CONFIG_PARAMETERS`` / ``GIT_SSL_NO_VERIFY`` applies.
+    The system and global config are switched off (``GIT_CONFIG_NOSYSTEM``,
+    ``GIT_CONFIG_GLOBAL``), and ``HOME`` / ``XDG_CONFIG_HOME`` point at
+    ``home``, an empty directory, for a git older than ``GIT_CONFIG_GLOBAL``.
+    With no config defining a filter driver, a ``.gitattributes`` in the
+    fetched tree names nothing git can run: a stock ``git lfs install`` defines
+    ``filter.lfs.*`` globally, and git-lfs would otherwise fetch from whatever a
+    committed ``.lfsconfig`` names, unpinned and unchecked by
+    ``network.egress``. ``GIT_LFS_SKIP_SMUDGE`` covers a git-lfs that is
+    configured some other way. Only https is allowed as a transport.
+    """
+    env = {k: v for k, v in environ.items() if not k.startswith("GIT_")}
+    env.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_LFS_SKIP_SMUDGE": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_ALLOW_PROTOCOL": "https",
+            "HOME": home,
+            "XDG_CONFIG_HOME": home,
+        }
+    )
+    return env
 
 
 class ValidatingTransport(httpx.AsyncHTTPTransport):

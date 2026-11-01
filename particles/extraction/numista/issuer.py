@@ -63,7 +63,15 @@ class NumistaIssuerExtractor:
         content: bytes,
         **kwargs: object,
     ) -> ExtractionResult:
-        envelope: dict[str, object] = json.loads(content)
+        envelope: object
+        try:
+            envelope = json.loads(content)
+        except (ValueError, RecursionError) as exc:
+            # RecursionError: a blob nested past the decoder's depth (security
+            # review 2026-10-30, AB17).
+            return ExtractionResult(quality_notes=[f"JSON parse error: {type(exc).__name__}"])
+        if not isinstance(envelope, dict):
+            return ExtractionResult(quality_notes=["Top-level JSON value is not an object"])
         issuer_code = str(envelope.get("issuer_code", ""))
         issuer_name = str(envelope.get("issuer_name", ""))
         suffix = _issuer_suffix(issuer_code, issuer_name)

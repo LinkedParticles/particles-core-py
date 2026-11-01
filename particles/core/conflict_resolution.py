@@ -292,8 +292,8 @@ def resolve_conflict(
             rung 2 is **skipped entirely** and a confirmed contradiction falls
             through to ``INCONSISTENT`` (both claims stay ACTIVE, ranked
             per-viewer at query time) — a contributor's claim is never dropped
-            by another's trust. The caller passes
-            ``get_config().reconciliation.store_mode == "single"``.
+            by another's trust. The caller passes the target store's mode,
+            ``get_config().reconciliation_mode_for(store) == "single"``.
         update_order: Rung 2.5 input. ``+1`` when the pair is a
             same-lineage update and ``new`` is strictly newer, ``-1`` when
             ``existing`` is, ``None`` when rung 2.5 does not apply. The rung

@@ -39,6 +39,7 @@ from particles.extraction.general import (
     CandidateParticle,
     ExtractionResult,
     NormalizedDocument,
+    paragraph_spans,
 )
 from particles.extraction.incremental import ChunkUnit, extract_with_carry_forward
 from particles.http import get_capped
@@ -47,7 +48,11 @@ log = logging.getLogger(__name__)
 
 SOURCE_TYPE = "HACKERNEWS_THREAD"
 EXTRACTOR_ID = "hackernews-extractor"
-EXTRACTOR_VERSION = "0.1.0"
+EXTRACTOR_VERSION = "0.1.1"
+# 0.1.1: a story text past single_call_threshold_chars is split into parts of
+#        comment_chunk_chars, and every comment line is clipped to that
+#        budget, so no model call is larger than the configured budget plus a
+#        header (security review 2026-10-30, AB18).
 DEFAULT_TRUST_WEIGHT = 0.50  # UGC starting weight for HN
 
 HACKERNEWS_API_BASE = "https://hacker-news.firebaseio.com/v0"
@@ -89,8 +94,24 @@ def _parse_item_id(url: str) -> int | None:
 # ---------------------------------------------------------------------------
 
 
+def _is_item_id(value: object) -> bool:
+    """Whether ``value`` is an HN item id: a non-negative ``int``, never a ``bool``.
+
+    A ``kids`` entry comes from the API or the stored blob. One that is not an
+    integer went into the item URL as text, so a path-shaped one reached
+    another path on the API host (security review 2026-10-30, AB63).
+    """
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
 def _api_url(item_id: int) -> str:
-    """Return the Firebase API URL for a single HN item."""
+    """Return the Firebase API URL for a single HN item.
+
+    Raises:
+        ValueError: ``item_id`` is not an HN item id (:func:`_is_item_id`).
+    """
+    if not _is_item_id(item_id):
+        raise ValueError(f"not a Hacker News item id: {item_id!r}")
     return f"{HACKERNEWS_API_BASE}/item/{item_id}.json"
 
 
@@ -107,7 +128,9 @@ async def _fetch_item(client: Any, item_id: int) -> dict[str, Any] | None:
     resp.raise_for_status()
     try:
         data = resp.json()
-    except (ValueError, json.JSONDecodeError):
+    except (ValueError, json.JSONDecodeError, RecursionError):
+        # A body nested past the decoder's depth reads as no item
+        # (security review 2026-10-28-2, AA18).
         return None
     if not isinstance(data, dict):
         return None
@@ -130,31 +153,40 @@ async def _fetch_thread(client: Any, root_id: int, max_comments: int) -> dict[st
     ```
 
     Walks depth-first (so a reply sequence stays contiguous in iteration
-    order) up to ``max_comments`` total comments. Deeply-nested but
+    order) up to ``max_comments`` comment fetches. Deeply-nested but
     low-engagement threads will be truncated at the cap; the extractor
-    surfaces a ``HN_COMMENT_LIMIT_HIT`` quality note in that case.
+    surfaces a ``HN_COMMENT_LIMIT_HIT`` quality note in that case. The walk
+    keeps a stack rather than recursing, fetches each id once, and counts
+    every fetch against the cap, so ``kids`` that revisit an item cannot
+    refetch it without end (security review 2026-10-28-2, AA57).
     """
     story = await _fetch_item(client, root_id)
     if story is None:
         raise ValueError(f"Hacker News item {root_id} not found or returned non-dict JSON")
 
     comments: dict[str, dict[str, Any]] = {}
-
-    async def _walk(kids: list[int]) -> None:
-        for child_id in kids:
-            if len(comments) >= max_comments:
-                return
-            child = await _fetch_item(client, child_id)
-            if child is None:
-                continue
-            comments[str(child_id)] = child
-            sub_kids = child.get("kids")
-            if isinstance(sub_kids, list) and sub_kids:
-                await _walk(sub_kids)
+    seen = {str(root_id)}
+    fetches = 0
 
     root_kids = story.get("kids")
-    if isinstance(root_kids, list):
-        await _walk(root_kids)
+    stack: list[int] = (
+        [kid for kid in reversed(root_kids) if _is_item_id(kid)]
+        if isinstance(root_kids, list)
+        else []
+    )
+    while stack and fetches < max_comments:
+        child_id = stack.pop()
+        if str(child_id) in seen:
+            continue
+        seen.add(str(child_id))
+        fetches += 1
+        child = await _fetch_item(client, child_id)
+        if child is None:
+            continue
+        comments[str(child_id)] = child
+        sub_kids = child.get("kids")
+        if isinstance(sub_kids, list):
+            stack.extend(kid for kid in reversed(sub_kids) if _is_item_id(kid))
 
     return {"story": story, "comments": comments}
 
@@ -210,7 +242,9 @@ class HackerNewsExtractor:
         """
         try:
             data = json.loads(content)
-        except json.JSONDecodeError as exc:
+        except (ValueError, RecursionError) as exc:
+            # RecursionError: a blob nested past the decoder's depth
+            # (security review 2026-10-30, AB17).
             return (NormalizedDocument(quality_notes=[f"JSON parse error: {exc}"]), {})
 
         story = _get_story(data)
@@ -319,6 +353,34 @@ def _get_comments_map(data: Any) -> dict[str, dict[str, Any]]:
     return {str(k): v for k, v in comments.items() if isinstance(v, dict)}
 
 
+# Characters a header line of the story chunk may hold: past HN's own
+# 80-character title limit, and the URL line past any URL a browser keeps.
+_HEADER_LINE_CHARS = 400
+_URL_LINE_CHARS = 2100
+
+
+def _render_hn_story_head(story: dict[str, Any]) -> list[str]:
+    """The story's title, byline and URL lines, each clipped to its bound."""
+    title = story.get("title", "") or ""
+    author = story.get("by", "") or ""
+    score = story.get("score", 0) or 0
+    url = story.get("url") or ""
+    lines = [
+        _clip(f"HACKER NEWS THREAD: {title}", _HEADER_LINE_CHARS),
+        _clip(f"Posted by hn/{author} [score: {score}]", _HEADER_LINE_CHARS),
+    ]
+    if url:
+        lines.append(_clip(f"External URL: {url}", _URL_LINE_CHARS))
+    return lines
+
+
+def _clip(text: str, limit: int) -> str:
+    """``text`` cut to ``limit`` characters, marked when it was cut."""
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)] + "…"
+
+
 def _render_hn_story_body(story: dict[str, Any]) -> str:
     """The story chunk's text — title + optional self-post body. Excludes comments.
 
@@ -326,18 +388,8 @@ def _render_hn_story_body(story: dict[str, Any]) -> str:
     the prime carry-forward candidate when only comments change (mirrors
     the Reddit body-chunk strategy).
     """
-    title = story.get("title", "") or ""
-    author = story.get("by", "") or ""
-    score = story.get("score", 0) or 0
-    url = story.get("url") or ""
     body = (story.get("text") or "").strip()
-
-    lines = [
-        f"HACKER NEWS THREAD: {title}",
-        f"Posted by hn/{author} [score: {score}]",
-    ]
-    if url:
-        lines.append(f"External URL: {url}")
+    lines = _render_hn_story_head(story)
     if body:
         lines.append("")
         # HN's text fields contain HTML entities and limited tags; the LLM
@@ -362,10 +414,27 @@ def _walk_comments_dfs(
     Per-item ``score`` is not exposed by Firebase for comments (only for
     stories), so ``min_score`` only thresholds when an item happens to
     carry a score (rare in practice — defensive handling).
+
+    The map is the stored blob's bytes, so the walk keeps a stack rather than
+    recursing and visits each id once: ``kids`` that revisit a comment cannot
+    loop (security review 2026-10-28-2, AA57).
     """
     out: list[tuple[int, dict[str, Any]]] = []
+    seen: set[str] = set()
 
-    def _visit(node: dict[str, Any], depth: int) -> None:
+    def _children(node: dict[str, Any], depth: int) -> list[tuple[str, int]]:
+        kids = node.get("kids")
+        if not isinstance(kids, list):
+            return []
+        return [(str(kid_id), depth) for kid_id in reversed(kids) if _is_item_id(kid_id)]
+
+    stack = _children(story, 0)
+    while stack:
+        key, depth = stack.pop()
+        node = comments_map.get(key)
+        if node is None or key in seen:
+            continue
+        seen.add(key)
         text = (node.get("text") or "").strip()
         dead = bool(node.get("dead"))
         deleted = bool(node.get("deleted"))
@@ -373,19 +442,7 @@ def _walk_comments_dfs(
         score_ok = not isinstance(score, int) or score >= min_score
         if text and not dead and not deleted and score_ok:
             out.append((depth, node))
-        kids = node.get("kids")
-        if isinstance(kids, list):
-            for kid_id in kids:
-                child = comments_map.get(str(kid_id))
-                if child is not None:
-                    _visit(child, depth + 1)
-
-    root_kids = story.get("kids")
-    if isinstance(root_kids, list):
-        for kid_id in root_kids:
-            child = comments_map.get(str(kid_id))
-            if child is not None:
-                _visit(child, 0)
+        stack.extend(_children(node, depth + 1))
 
     return out
 
@@ -393,39 +450,68 @@ def _walk_comments_dfs(
 def _render_hn_comment_lines(
     comments: list[tuple[int, dict[str, Any]]],
     indent_per_level: int,
+    line_limit: int | None = None,
 ) -> list[str]:
-    """Render an ordered ``(depth, comment)`` list as indented prose lines."""
+    """Render an ordered ``(depth, comment)`` list as indented prose lines.
+
+    Each line is clipped to ``line_limit`` when one is given: a single
+    comment longer than the chunk budget was one model call of its own
+    (security review 2026-10-30, AB18).
+    """
     lines: list[str] = []
     for depth, c in comments:
         author = c.get("by") or "anon"
         text = (c.get("text") or "").replace("\n", " ").strip()
         indent = " " * (depth * indent_per_level)
-        lines.append(f"{indent}hn/{author}: {text}")
+        line = f"{indent}hn/{author}: {text}"
+        lines.append(line if line_limit is None else _clip(line, line_limit))
     return lines
 
 
-def _chunk_hn_comments_by_size(
-    comments: list[tuple[int, dict[str, Any]]],
-    indent_per_level: int,
-    chunk_chars: int,
-) -> list[list[tuple[int, dict[str, Any]]]]:
-    """Group HN comments into chunks whose rendered text fits the budget."""
-    chunks: list[list[tuple[int, dict[str, Any]]]] = []
-    current: list[tuple[int, dict[str, Any]]] = []
+def _chunk_lines_by_size(lines: list[str], chunk_chars: int) -> list[list[str]]:
+    """Greedy line grouping such that each group fits within ``chunk_chars``."""
+    chunks: list[list[str]] = []
+    current: list[str] = []
     current_size = 0
-    for depth, c in comments:
-        text = (c.get("text") or "").strip()
-        # Overhead per line: indent + "hn/{author}: " ≈ 20 chars + indent
-        rendered_size = len(text) + (depth * indent_per_level) + 20
-        if current and current_size + rendered_size > chunk_chars:
+    for line in lines:
+        size = len(line) + 1  # +1 for the newline separator
+        if current and current_size + size > chunk_chars:
             chunks.append(current)
             current = []
             current_size = 0
-        current.append((depth, c))
-        current_size += rendered_size
+        current.append(line)
+        current_size += size
     if current:
         chunks.append(current)
     return chunks
+
+
+def _build_hn_story_chunks(
+    story: dict[str, Any], single_call_threshold: int, chunk_chars: int
+) -> list[ChunkUnit]:
+    """The story chunk, or the story text split into parts when it passes the threshold.
+
+    A story text longer than ``single_call_threshold`` went to the model in
+    one call (security review 2026-10-30, AB18). It is split on paragraph
+    breaks into parts of at most ``chunk_chars`` (and never more than the
+    threshold), each under the story's title, byline and URL.
+    """
+    body_text = _render_hn_story_body(story)
+    if not body_text.strip():
+        return []
+    if len(body_text) <= single_call_threshold:
+        return [ChunkUnit(chunk_id="story", chunk_text=body_text)]
+    body = (story.get("text") or "").strip()
+    head = "\n".join(_render_hn_story_head(story))
+    spans = paragraph_spans(body, max(1, min(chunk_chars, single_call_threshold)))
+    total = len(spans)
+    return [
+        ChunkUnit(
+            chunk_id=f"story_{i}_of_{total}",
+            chunk_text=f"{head}\nSTORY TEXT (part {i}/{total}):\n\n{body[start:end]}",
+        )
+        for i, (start, end) in enumerate(spans, start=1)
+    ]
 
 
 def _build_hn_chunks(
@@ -438,15 +524,14 @@ def _build_hn_chunks(
 ) -> list[ChunkUnit]:
     """Produce ChunkUnits for an HN thread (body + 0-or-more comment chunks).
 
-    The body chunk is always its own unit. Comment chunks are sized
-    adaptively, mirroring the Reddit / gist strategy so the chunk-hash
-    carry-forward can reuse particles when only one chunk's
-    text changes.
+    The story is its own unit, split into parts past the threshold. Comment
+    chunks are sized adaptively, mirroring the Reddit / gist strategy so the
+    chunk-hash carry-forward can reuse particles when only one
+    chunk's text changes. Every comment line is clipped to the chunk budget,
+    so no chunk is larger than the budget plus its header (security review
+    2026-10-30, AB18).
     """
-    chunks: list[ChunkUnit] = []
-    body_text = _render_hn_story_body(story)
-    if body_text.strip():
-        chunks.append(ChunkUnit(chunk_id="story", chunk_text=body_text))
+    chunks = _build_hn_story_chunks(story, single_call_threshold, chunk_chars)
 
     flat_comments = _walk_comments_dfs(story, comments_map, min_score)
     if not flat_comments:
@@ -454,28 +539,21 @@ def _build_hn_chunks(
 
     title = (story.get("title") or "")[:120]
     header = f"# Context: comments on Hacker News thread — {title}"
-
-    rendered_size = sum(
-        len((c.get("text") or "").strip()) + (d * indent_per_level) + 20 for d, c in flat_comments
+    lines = _render_hn_comment_lines(
+        flat_comments, indent_per_level, max(1, min(chunk_chars, single_call_threshold))
     )
 
+    rendered_size = sum(len(line) + 1 for line in lines)
+
     if rendered_size <= single_call_threshold:
-        parts = [
-            header,
-            "COMMENTS:",
-            *_render_hn_comment_lines(flat_comments, indent_per_level),
-        ]
+        parts = [header, "COMMENTS:", *lines]
         chunks.append(ChunkUnit(chunk_id="comments", chunk_text="\n".join(parts)))
         return chunks
 
-    sub_chunks = _chunk_hn_comments_by_size(flat_comments, indent_per_level, chunk_chars)
+    sub_chunks = _chunk_lines_by_size(lines, chunk_chars)
     total = len(sub_chunks)
     for i, sub_chunk in enumerate(sub_chunks, start=1):
-        text_parts = [
-            header,
-            f"COMMENTS (chunk {i}/{total}):",
-            *_render_hn_comment_lines(sub_chunk, indent_per_level),
-        ]
+        text_parts = [header, f"COMMENTS (chunk {i}/{total}):", *sub_chunk]
         chunks.append(
             ChunkUnit(
                 chunk_id=f"comments_{i}_of_{total}",

@@ -62,7 +62,7 @@ TRANSFORM_LOGIT = "logit"
 TRANSFORM_LINEAR = "linear"
 
 #: Value of ``ExtractorCalibration.transform`` for an isotonic map (
-#: §4): a monotone, piecewise-linear map from stated confidence to observed
+#: §1): a monotone, piecewise-linear map from stated confidence to observed
 #: hit rate, stored as its breakpoints. The method for a target that is a
 #: base-rate map, which one temperature cannot express without distorting
 #: the ranking.

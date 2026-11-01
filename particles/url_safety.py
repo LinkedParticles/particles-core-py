@@ -46,7 +46,9 @@ from __future__ import annotations
 import ipaddress
 import logging
 import os
+import re
 import socket
+import stat
 import time
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -271,6 +273,83 @@ def is_cleartext_remote(url: str) -> bool:
     return not host_is_loopback(parsed.hostname)
 
 
+_USERINFO_RE = re.compile(r"^(\s*[A-Za-z][A-Za-z0-9+.-]*://)[^/?#]*@")
+_SCHEME_RE = re.compile(r"^(\s*[A-Za-z][A-Za-z0-9+.-]*://)([^/?#]*)")
+_AUTHORITY_RE = re.compile(r"^(?:[A-Za-z0-9._~%-]*|\[[0-9A-Fa-f:.]*\])(?::\d*)?$")
+
+
+def url_without_userinfo(url: str) -> str:
+    """``url`` with any ``user:password@`` removed, for printing or logging it.
+
+    An operator can write a credential into an endpoint's userinfo
+    (``http://user:token@gateway``), and a refusal, a warning or a diagnostic
+    that names the endpoint would echo it (security review 2026-10-25-2, R36).
+    Textual, so it never fails on a URL ``urllib`` cannot parse: everything
+    from the scheme's ``//`` to the authority's last ``@`` goes.
+
+    A password written unescaped can hold ``/``, ``?`` or ``#``, which end the
+    authority for a parser. When the text before the first of them is no host
+    and port (``user:pa`` of ``user:pa/ss@host``), it is taken as the start of
+    a userinfo, and everything up to the URL's last ``@`` goes; that can hide
+    more than the userinfo, never less (security review 2026-10-26-1, R36).
+
+    A password of digits up to its first ``/``, ``?`` or ``#`` reads as a
+    port (``user:4417`` of ``user:4417/rest@engine``): when the authority holds
+    a ``:`` and an ``@`` follows anywhere in the URL, everything up to the last
+    ``@`` goes, whatever the host after it looks like, unless the authority
+    names an IP literal. A URL written without a
+    scheme (``user:token@host``) loses everything up to the last ``@`` before
+    its first whitespace (2026-10-27-1, R36, W12; security review
+    2026-10-28-1, O31).
+    """
+    stripped = _USERINFO_RE.sub(r"\1", url, count=1)
+    if stripped != url:
+        return stripped
+    match = _SCHEME_RE.match(url)
+    if match is None:
+        return _schemeless_without_userinfo(url)
+    if _AUTHORITY_RE.match(match.group(2)):
+        return _port_shaped_password_removed(url, match)
+    at = url.rfind("@", match.end(1))
+    if at < 0:
+        return url
+    return match.group(1) + url[at + 1 :]
+
+
+def _port_shaped_password_removed(url: str, match: re.Match[str]) -> str:
+    """``url`` without a ``user:<digits>...@`` prefix whose password reads as a port.
+
+    An authority whose name is an IP literal (``127.0.0.1:8000``, ``[::1]:8000``)
+    is a host and port, since no user name is one, so an ``@`` later in its path
+    or query is kept. Any other name may be a user's, and the text up to the
+    last ``@`` goes.
+    """
+    authority = match.group(2)
+    if ":" not in authority or authority.startswith("["):
+        return url
+    try:
+        ipaddress.ip_address(authority.split(":", 1)[0])
+    except ValueError:
+        pass
+    else:
+        return url
+    at = url.rfind("@", match.end(2))
+    if at < 0:
+        return url
+    return match.group(1) + url[at + 1 :]
+
+
+def _schemeless_without_userinfo(url: str) -> str:
+    """``url``, written without ``scheme://``, without the userinfo it holds."""
+    lead = len(url) - len(url.lstrip())
+    space = re.search(r"\s", url[lead:])
+    end = lead + space.start() if space else len(url)
+    at = url.rfind("@", lead, end)
+    if at < 0:
+        return url
+    return url[:lead] + url[at + 1 :]
+
+
 # ---------------------------------------------------------------------------
 # Git subprocesses: no program a repository or the user's config names
 # (N13 / D22, SECURITY_REVIEW_20261024-1)
@@ -308,6 +387,172 @@ def local_git_env(environ: Mapping[str, str]) -> dict[str, str]:
     return {k: v for k, v in environ.items() if k not in GIT_REDIRECT_VARS}
 
 
+#: Variables that send a subprocess's connection through a proxy or swap the
+#: trust anchors it verifies with, compared case-insensitively. Through a
+#: proxy the proxy resolves the host, so the vetted-address pin (``--resolve``,
+#: ``http.curloptResolve``) and the ``network.egress`` check of the target no
+#: longer decide the peer, and the proxy itself is never checked (P43).
+PINNED_SUBPROCESS_DROPPED_VARS = frozenset(
+    {
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "ftp_proxy",
+        "no_proxy",
+        "curl_ca_bundle",
+        "ssl_cert_file",
+        "ssl_cert_dir",
+        # Writes the TLS session keys to a file, so anyone who can read it can
+        # decrypt the connection; and the program ssh runs to ask for a
+        # password (security review 2026-10-26-1, K10).
+        "sslkeylogfile",
+        "ssh_askpass",
+    }
+)
+
+
+def pinned_subprocess_env(environ: Mapping[str, str]) -> dict[str, str]:
+    """``environ`` without the proxy and CA variables, for a pinned curl or git fetch.
+
+    ``PATH`` keeps only the absolute entries no other user may write: the
+    subprocess's program, and any program it runs, is looked up there, so a
+    relative entry would find one in the working directory (security review
+    2026-10-26-1, K10), and a directory writable by its group or by others, or
+    owned by neither root nor this user, would find one another local user
+    planted (2026-10-27-1, G52). An entry that is another user's link, or that
+    sits under a directory others may write without the sticky bit, is dropped
+    too, since that user could repoint or rename it after the check. When no
+    entry is left, ``PATH`` falls back to the entries of ``os.defpath`` that
+    pass, and failing those to a path that holds no program: an empty ``PATH``
+    would make the lookup search the working directory (2026-10-28-1, G52).
+    """
+    env = {k: v for k, v in environ.items() if k.lower() not in PINNED_SUBPROCESS_DROPPED_VARS}
+    if "PATH" in env:
+        kept = [p for p in env["PATH"].split(os.pathsep) if _only_trusted_users_write(p)]
+        if not kept:
+            kept = [p for p in os.defpath.split(os.pathsep) if _only_trusted_users_write(p)]
+        env["PATH"] = os.pathsep.join(kept) if kept else _NO_PROGRAM_PATH
+    return env
+
+
+#: A ``PATH`` under which no program can be found (``/dev/null`` is no directory).
+_NO_PROGRAM_PATH = os.devnull
+
+#: Groups whose members can already act as root, so a directory they may
+#: write (Homebrew's ``/opt/homebrew/bin`` is ``admin``-writable) gives no
+#: other user more than they hold.
+_ADMINISTRATIVE_GROUPS = frozenset({"root", "wheel", "admin", "sudo"})
+
+
+def _only_trusted_users_write(directory: str) -> bool:
+    """Whether ``directory`` is an absolute path to a directory no other ordinary user may write.
+
+    Refused: a relative or missing entry, one others may write, one owned by
+    neither root nor this user, and one its group may write unless that group
+    is administrative. A link is judged as itself (its owner) and as its
+    target, and every directory above the entry, as written and as resolved,
+    is refused when another user may write it without the sticky bit. Every
+    link the entry passes through on the way to its target is judged the same
+    way, since another user who owns a middle link, or may rename entries in
+    its directory, can repoint it after the check (security review
+    2026-10-28-2). A middle link's directories are judged as resolved too: a
+    hop reached through a directory link lies in that link's target, and the
+    directories above the target are the ones that can rename it (2026-10-30-1).
+    """
+    if not os.path.isabs(directory):
+        return False
+    try:
+        hops = _link_hops(directory)
+        st = os.stat(directory)
+    except OSError:
+        return False
+    for path, link in hops:
+        resolved_hop = os.path.join(os.path.realpath(os.path.dirname(path)), os.path.basename(path))
+        if (
+            not _owned_by_trusted_user(link)
+            or _an_ancestor_is_open(path)
+            or _an_ancestor_is_open(resolved_hop)
+        ):
+            return False
+    if not stat.S_ISDIR(st.st_mode) or _others_may_write(st) or not _owned_by_trusted_user(st):
+        return False
+    written, resolved = os.path.abspath(directory), os.path.realpath(directory)
+    return not (_an_ancestor_is_open(written) or _an_ancestor_is_open(resolved))
+
+
+#: The longest link chain a ``PATH`` entry may sit behind.
+_MAX_LINK_HOPS = 40
+
+
+def _link_hops(path: str) -> list[tuple[str, os.stat_result]]:
+    """Each link ``path`` passes through, with its own ``lstat``, one ``readlink`` at a time.
+
+    Raises ``OSError`` when the chain is longer than :data:`_MAX_LINK_HOPS`.
+    """
+    hops: list[tuple[str, os.stat_result]] = []
+    current = os.path.abspath(path)
+    link = os.lstat(current)
+    while stat.S_ISLNK(link.st_mode):
+        if len(hops) >= _MAX_LINK_HOPS:
+            raise OSError(f"{path}: too many levels of symbolic links")
+        hops.append((current, link))
+        # Joined, not normalised: the system resolves a ``..`` in a link
+        # against the directory the link is in, wherever that leads.
+        current = os.path.join(os.path.dirname(current), os.readlink(current))
+        link = os.lstat(current)
+    return hops
+
+
+def _owned_by_trusted_user(st: os.stat_result) -> bool:
+    geteuid = getattr(os, "geteuid", None)
+    return geteuid is None or st.st_uid in (0, geteuid())
+
+
+def _others_may_write(st: os.stat_result) -> bool:
+    """Whether a user other than the owner, outside an administrative group, may write it."""
+    if st.st_mode & stat.S_IWOTH:
+        return True
+    return bool(st.st_mode & stat.S_IWGRP) and not _is_administrative_group(st.st_gid)
+
+
+def _an_ancestor_is_open(path: str) -> bool:
+    """Whether a directory above ``path`` lets another user rename its entries.
+
+    A directory owned by neither root nor this user is refused whatever its
+    mode bits, since its owner may change them (security review 2026-10-28-2).
+    """
+    parent = os.path.dirname(path)
+    while True:
+        try:
+            link = os.lstat(parent)
+            st = os.stat(parent)
+        except OSError:
+            return True
+        if stat.S_ISLNK(link.st_mode) and not _owned_by_trusted_user(link):
+            return True
+        if not _owned_by_trusted_user(st):
+            return True
+        if _others_may_write(st) and not st.st_mode & stat.S_ISVTX:
+            return True
+        up = os.path.dirname(parent)
+        if up == parent:
+            return False
+        parent = up
+
+
+def _is_administrative_group(gid: int) -> bool:
+    if gid == 0:
+        return True
+    try:
+        import grp
+    except ImportError:  # not POSIX: no group to look up
+        return False
+    try:
+        return grp.getgrgid(gid).gr_name in _ADMINISTRATIVE_GROUPS
+    except KeyError:
+        return False
+
+
 def isolated_git_env(environ: Mapping[str, str], *, home: str) -> dict[str, str]:
     """An environment for git over a repository fetched from elsewhere (N13).
 
@@ -321,9 +566,12 @@ def isolated_git_env(environ: Mapping[str, str], *, home: str) -> dict[str, str]
     ``filter.lfs.*`` globally, and git-lfs would otherwise fetch from whatever a
     committed ``.lfsconfig`` names, unpinned and unchecked by
     ``network.egress``. ``GIT_LFS_SKIP_SMUDGE`` covers a git-lfs that is
-    configured some other way. Only https is allowed as a transport.
+    configured some other way. Only https is allowed as a transport. The proxy
+    and CA variables are dropped too (:func:`pinned_subprocess_env`), so the
+    clone connects to the pinned address and verifies it with the system trust
+    store.
     """
-    env = {k: v for k, v in environ.items() if not k.startswith("GIT_")}
+    env = {k: v for k, v in pinned_subprocess_env(environ).items() if not k.startswith("GIT_")}
     env.update(
         {
             "GIT_CONFIG_NOSYSTEM": "1",

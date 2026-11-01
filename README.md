@@ -133,13 +133,16 @@ package**, because this is where untrusted bytes meet the model:
 
 Behind both: the model is never given tools, and no model output is ever
 executed. Nothing it emits becomes a shell command, a SQL fragment, or a fetch,
-so an injection can at worst distort *claims*, never trigger *actions*.
+so within this package an injection can at worst distort *claims*, never
+trigger *actions*. In the engine, a model's verdicts on those claims can retire
+other claims, as the engine's SECURITY.md describes.
 
 The whole package was audited adversarially before it was opened; the verdict,
 verbatim, was **GO-WITH-FIXES** with **33 findings (2 High, 7 Medium, 20 Low,
 4 Info)**. The ranked must-fix set merged the following day, and the last open
 finding closed in `v1.128.0`. Trust model, known limitations, and how to report
-a vulnerability privately:
+a vulnerability privately (this repository's private vulnerability reporting,
+or email):
 [SECURITY.md](https://github.com/LinkedParticles/particles-core-py/blob/main/SECURITY.md).
 
 ## Documentation

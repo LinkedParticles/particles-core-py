@@ -120,10 +120,17 @@ def _parse_graph(content: bytes) -> tuple[list[dict[str, object]], dict[str, str
 
     Handles both {"@context": ..., "@graph": [...]} and bare list formats.
     """
-    doc = json.loads(content)
+    try:
+        doc = json.loads(content)
+    except (ValueError, RecursionError):
+        # Read as unparseable; RecursionError is a blob nested past the
+        # decoder's depth (security review 2026-10-30, AB17).
+        return [], {}
     if isinstance(doc, dict):
         ctx = doc.get("@context", {})
-        prefix_map: dict[str, str] = {k: v for k, v in ctx.items() if isinstance(v, str)}
+        prefix_map: dict[str, str] = (
+            {k: v for k, v in ctx.items() if isinstance(v, str)} if isinstance(ctx, dict) else {}
+        )
         graph = doc.get("@graph", [])
         nodes = graph if isinstance(graph, list) else [graph]
     elif isinstance(doc, list):

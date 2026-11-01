@@ -61,11 +61,13 @@ from particles.llm.registry import (
     CompletionError,
     CompletionRefused,
     EmptyCompletionError,
+    PlaintextKeyRefused,
     VisionImage,
     budget_hint,
 )
 from particles.llm.usage import record_usage
-from particles.url_safety import is_cleartext_remote
+from particles.secrets import redact_known_secrets
+from particles.url_safety import is_cleartext_remote, url_without_userinfo
 
 log = logging.getLogger(__name__)
 
@@ -76,14 +78,34 @@ log = logging.getLogger(__name__)
 _BEARER_RE = re.compile(r"(?i)(authorization\s*:\s*)?bearer\s+\S+")
 
 
-def _scrub_response_body(text: str, *, limit: int = 500) -> str:
-    """Redact bearer tokens from a gateway response body, then truncate.
+#: Request headers that carry no credential; every other one the adapter sends
+#: is scrubbed from an error (security review 2026-10-26-1, Q13).
+_NON_CREDENTIAL_HEADERS = frozenset({"accept", "content-type", "user-agent"})
+
+
+def _sent_secrets(headers: dict[str, str]) -> list[str]:
+    """The credential values in the request headers, bare and as sent."""
+    values: list[str] = []
+    for name, value in headers.items():
+        if name.lower() not in _NON_CREDENTIAL_HEADERS:
+            values.append(value)
+            values.extend(value.split())
+    return values
+
+
+def _scrub_response_body(
+    text: str, *, limit: int = 500, headers: dict[str, str] | None = None
+) -> str:
+    """Redact credentials from a gateway response body, then truncate.
 
     Keeps the body useful for diagnosing a 4xx/5xx (status detail, error JSON)
-    while ensuring an echoed ``Authorization: Bearer …`` never reaches an
-    exception string. Redaction runs before truncation so a token straddling the
-    cut is still scrubbed.
+    while ensuring an echoed credential never reaches an exception string: a
+    ``Bearer …`` spelling of any token, and the literal value of every key the
+    request sent or the environment holds, in whatever spelling the gateway
+    echoes it (security review 2026-10-25, Q13). Redaction runs before
+    truncation so a token straddling the cut is still scrubbed.
     """
+    text = redact_known_secrets(text, _sent_secrets(headers or {}))
     return _BEARER_RE.sub("Bearer [REDACTED]", text)[:limit]
 
 
@@ -114,14 +136,6 @@ class OpenAICompatCompletionError(CompletionError):
         self.status_code = status_code
 
 
-class PlaintextKeyRefused(CompletionError):
-    """The adapter refused to send the entry's API key over non-loopback ``http://``.
-
-    Raised before any request (N12, SECURITY_REVIEW_20261024-1), the provider-key
-    counterpart of the engine client's ``PlaintextTokenRefused``.
-    """
-
-
 @cache
 def _warn_plaintext_key_once(name: str, base_url: str) -> None:
     """One warning per entry and URL when ``allow_plaintext_key`` lets a key through."""
@@ -130,7 +144,7 @@ def _warn_plaintext_key_once(name: str, base_url: str) -> None:
         "connection to %s (allow_plaintext_key is set). Anyone on the network "
         "path can read it.",
         name,
-        base_url,
+        url_without_userinfo(base_url),
     )
 
 
@@ -147,7 +161,8 @@ def _check_plaintext_key(name: str, base_url: str, *, allow: bool) -> None:
         _warn_plaintext_key_once(name, base_url)
         return
     raise PlaintextKeyRefused(
-        f"Refusing to send the llm.providers.{name} API key to {base_url} over "
+        f"Refusing to send the llm.providers.{name} API key to "
+        f"{url_without_userinfo(base_url)} over "
         "unencrypted http://. Use https://, or reach the endpoint through a "
         "loopback hop (an SSH or Tailscale forward to http://127.0.0.1). To send "
         f"it anyway on a network you trust end to end, set "
@@ -399,7 +414,11 @@ class OpenAICompatProvider:
 
         url = f"{cfg.base_url.rstrip('/')}/chat/completions"
 
-        with _tracer.start_as_current_span("llm.complete") as span:
+        # The exception's type alone, never its message (security review
+        # 2026-10-26-1, R7): a provider's error text can echo the request.
+        with _tracer.start_as_current_span(
+            "llm.complete", record_exception=False, set_status_on_exception=False
+        ) as span:
             span.set_attribute("llm.model", self.provider_model)
             span.set_attribute("llm.max_tokens", max_tokens)
             span.set_attribute("llm.structured_output", enforce)
@@ -445,6 +464,10 @@ class OpenAICompatProvider:
                         provider_model=self.provider_model,
                         max_tokens=max_tokens,
                     )
+            except Exception as exc:
+                span.set_attribute("error.type", type(exc).__name__)
+                span.set_status(trace.Status(trace.StatusCode.ERROR))
+                raise
             finally:
                 _llm_duration.record(time.perf_counter() - start, {"model": self.provider_model})
         return _unwrap_items_reply(text) if wrapped else text
@@ -478,12 +501,13 @@ async def _post_with_retry(
                 resp = await client.post(url, json=body, headers=headers)
             except httpx.RequestError as exc:
                 # Connection refused, DNS, timeout — transient, no status.
-                last_status, last_detail = None, f"{type(exc).__name__}: {exc}"
+                last_status = None
+                last_detail = _scrub_response_body(f"{type(exc).__name__}: {exc}", headers=headers)
                 log.warning(
                     "LLM endpoint request error (attempt %d/%d): %s",
                     attempt + 1,
                     max_retries + 1,
-                    exc,
+                    last_detail,
                 )
             else:
                 if resp.status_code == 200:
@@ -494,7 +518,7 @@ async def _post_with_retry(
                         temperature_sent="temperature" in body,
                     )
                 last_status = resp.status_code
-                last_detail = _scrub_response_body(resp.text)
+                last_detail = _scrub_response_body(resp.text, headers=headers)
                 if resp.status_code not in _RETRYABLE_STATUSES:
                     # Deterministic client error (auth, bad request) — fail fast.
                     raise OpenAICompatCompletionError(

@@ -82,7 +82,15 @@ class NumistaCoinExtractor:
         content: bytes,
         **kwargs: object,
     ) -> ExtractionResult:
-        data: dict[str, object] = json.loads(content)
+        data: object
+        try:
+            data = json.loads(content)
+        except (ValueError, RecursionError) as exc:
+            # RecursionError: a blob nested past the decoder's depth (security
+            # review 2026-10-30, AB17).
+            return ExtractionResult(quality_notes=[f"JSON parse error: {type(exc).__name__}"])
+        if not isinstance(data, dict):
+            return ExtractionResult(quality_notes=["Top-level JSON value is not an object"])
         candidates: list[CandidateParticle] = []
         notes: list[str] = []
 

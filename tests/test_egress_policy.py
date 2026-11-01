@@ -135,13 +135,16 @@ class TestChecks:
         # keyed on ``id()`` then serves the released config's policy (a CI
         # flake, 2026-10-22). The swaps bypass monkeypatch, which would hold
         # every replaced value alive; one monkeypatch call up front restores
-        # the original.
+        # the original. A young-generation collect is enough to free the
+        # released config (an id()-keyed cache fails by round 1); a full
+        # ``gc.collect()`` walks the whole heap of a long test session, and
+        # fifty of them cost 96 s on the CI runner.
         cfg = get_config()
         original = cfg.network
         _set_network(monkeypatch, original)
         for i in range(50):
             cfg.network = original
-            gc.collect()
+            gc.collect(0)
             posture = "none" if i % 2 else "open"
             cfg.network = NetworkConfig(egress=posture)
             assert egress.current_policy().posture == posture
@@ -219,3 +222,213 @@ class TestBackstop:
         b.close()
         egress.disarm_backstop()
         assert socket.getaddrinfo("127.0.0.1", 80)
+
+    def test_a_datagram_reaches_only_an_admitted_address(self, backstop: None) -> None:
+        """P10: an unconnected ``sendto`` is held to the same rule as a connect."""
+        socket.getaddrinfo("models.test", 8000)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            try:
+                sock.sendto(b"x", ("127.0.0.1", 8000))
+            except egress.EgressRefused:
+                pytest.fail("the backstop refused a datagram to an admitted address")
+            except OSError:
+                pass
+            with pytest.raises(egress.EgressRefused):
+                sock.sendto(b"x", ("127.0.0.1", 8001))
+
+    def test_a_reverse_lookup_needs_an_admitted_address(self, backstop: None) -> None:
+        """P10: ``gethostbyaddr`` of an address the posture never admitted is refused."""
+        with pytest.raises(egress.EgressRefused):
+            socket.gethostbyaddr("127.0.0.2")
+        with pytest.raises(egress.EgressRefused):
+            socket.gethostbyname("www.wikidata.org")
+
+
+@pytest.fixture
+def armed_none(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Arm the backstop under ``none``, which refuses loopback too."""
+    _set_network(monkeypatch, NetworkConfig(egress="none"))
+    egress.ensure_backstop()
+    try:
+        yield
+    finally:
+        egress.disarm_backstop()
+
+
+class TestBackstopUnderNone:
+    """P10 (SECURITY_REVIEW_20261024-2): every lookup and datagram, not only TCP.
+
+    Every probe targets loopback or the hosts file; under ``none`` the hook
+    refuses before anything is resolved or sent.
+    """
+
+    @pytest.mark.parametrize(
+        "lookup",
+        [
+            lambda: socket.getaddrinfo("localhost", 80),
+            lambda: socket.gethostbyname("localhost"),
+            lambda: socket.gethostbyname_ex("localhost"),
+            lambda: socket.gethostbyaddr("127.0.0.1"),
+            lambda: socket.getnameinfo(("127.0.0.1", 80), 0),
+        ],
+        ids=["getaddrinfo", "gethostbyname", "gethostbyname_ex", "gethostbyaddr", "getnameinfo"],
+    )
+    def test_every_name_lookup_is_refused(self, armed_none: None, lookup: Any) -> None:
+        with pytest.raises(egress.EgressRefused):
+            lookup()
+
+    def test_unconnected_datagrams_are_refused(self, armed_none: None) -> None:
+        with (
+            socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as rx,
+            socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as tx,
+        ):
+            rx.bind(("127.0.0.1", 0))
+            target = rx.getsockname()
+            with pytest.raises(egress.EgressRefused):
+                tx.sendto(b"x", target)
+            with pytest.raises(egress.EgressRefused):
+                tx.sendto(b"x", 0, target)
+            with pytest.raises(egress.EgressRefused):
+                tx.sendmsg([b"x"], [], 0, target)
+            with pytest.raises(egress.EgressRefused):
+                tx.connect(target)
+
+
+#: A name the resolver rejects locally: a DNS label over 63 octets cannot be
+#: put on the wire, so a resolution attempt fails without sending a query.
+_UNSENDABLE_NAME = "a" * 70 + ".example"
+
+
+class TestConnectByName:
+    """Q44 (SECURITY_REVIEW_20261025-1): a named destination is judged before it resolves.
+
+    CPython resolves a ``connect`` / ``sendto`` host inside the C call, before
+    the audit event and with no lookup event, so the refusal must come first.
+    The unsendable name makes the order visible: a resolver error instead of
+    ``EgressRefused`` means the name was looked up before the check.
+    """
+
+    def test_connect_by_name_is_refused_before_the_name_is_resolved(self, armed_none: None) -> None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            with pytest.raises(egress.EgressRefused):
+                sock.connect((_UNSENDABLE_NAME, 80))
+            with pytest.raises(egress.EgressRefused):
+                sock.connect_ex((_UNSENDABLE_NAME, 80))
+
+    def test_a_datagram_to_a_name_is_refused_before_the_name_is_resolved(
+        self, armed_none: None
+    ) -> None:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            with pytest.raises(egress.EgressRefused):
+                sock.sendto(b"x", (_UNSENDABLE_NAME, 9))
+            with pytest.raises(egress.EgressRefused):
+                sock.sendto(b"x", 0, (_UNSENDABLE_NAME, 9))
+            if hasattr(sock, "sendmsg"):
+                with pytest.raises(egress.EgressRefused):
+                    sock.sendmsg([b"x"], [], 0, (_UNSENDABLE_NAME, 9))
+
+    def test_an_unlisted_name_is_refused_under_allowlist(self, backstop: None) -> None:
+        with (
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock,
+            pytest.raises(egress.EgressRefused),
+        ):
+            sock.connect((_UNSENDABLE_NAME, 8000))
+
+    def test_a_listed_name_reaches_the_resolver(self, backstop: None) -> None:
+        """The guard admits what the posture admits; only the OS decides the rest."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.5)
+            try:
+                sock.connect(("models.test", 8000))
+            except egress.EgressRefused:
+                pytest.fail("the guard refused a connect to a listed name")
+            except OSError:
+                pass  # models.test does not resolve outside the stub
+
+    def test_the_guard_is_inert_when_disarmed(self) -> None:
+        egress.disarm_backstop()
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock, pytest.raises(OSError):
+            sock.connect((_UNSENDABLE_NAME, 80))
+
+
+class TestRequireCoveredLoop:
+    """B49: a refusing posture refuses to run on a loop the backstop cannot see."""
+
+    @staticmethod
+    def _run(loop_factory: Any) -> BaseException | None:
+        async def probe() -> BaseException | None:
+            try:
+                egress.require_covered_loop()
+            except egress.UncoveredEventLoop as exc:
+                return exc
+            return None
+
+        loop = loop_factory()
+        try:
+            result: BaseException | None = loop.run_until_complete(probe())
+        finally:
+            loop.close()
+        return result
+
+    def test_uvloop_is_refused_under_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        uvloop = pytest.importorskip("uvloop")
+        _set_network(monkeypatch, NetworkConfig(egress="none"))
+        refused = self._run(uvloop.new_event_loop)
+        assert isinstance(refused, egress.UncoveredEventLoop)
+        assert "uvloop" in str(refused) and "--loop asyncio" in str(refused)
+
+    def test_the_stdlib_loop_and_open_pass(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import asyncio
+
+        uvloop = pytest.importorskip("uvloop")
+        _set_network(monkeypatch, NetworkConfig(egress="none"))
+        assert self._run(asyncio.new_event_loop) is None
+        egress.require_covered_loop()  # no running loop: nothing to judge
+        _set_network(monkeypatch, NetworkConfig(egress="open"))
+        assert self._run(uvloop.new_event_loop) is None
+
+    def test_a_loop_that_is_no_selector_loop_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Q15: a stdlib loop that is no selector loop, as Windows' proactor loop is.
+
+        The proactor loop connects through ``ConnectEx`` on the raw descriptor,
+        never ``socket.socket.connect``, so the hook would not see it. It cannot
+        run on this host, so a stand-in ``BaseEventLoop`` subclass is judged.
+        """
+        import asyncio
+
+        class _NotSelector(asyncio.BaseEventLoop):
+            pass
+
+        _set_network(monkeypatch, NetworkConfig(egress="none"))
+        stand_in = _NotSelector()
+        monkeypatch.setattr(egress.asyncio, "get_running_loop", lambda: stand_in)
+        with pytest.raises(egress.UncoveredEventLoop, match="SelectorEventLoop"):
+            egress.require_covered_loop()
+        selector = asyncio.SelectorEventLoop()
+        try:
+            monkeypatch.setattr(egress.asyncio, "get_running_loop", lambda: selector)
+            egress.require_covered_loop()
+        finally:
+            selector.close()
+
+    def test_arming_on_windows_selects_the_selector_policy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Q15: every entry point arms the backstop before its loop starts."""
+        import asyncio
+        import sys
+
+        if sys.platform != "win32":
+            pytest.skip("the selector policy is set on Windows only")
+        _set_network(monkeypatch, NetworkConfig(egress="none"))
+        egress.ensure_backstop()
+        try:
+            loop = asyncio.new_event_loop()
+            try:
+                assert isinstance(loop, asyncio.SelectorEventLoop)
+            finally:
+                loop.close()
+        finally:
+            egress.disarm_backstop()

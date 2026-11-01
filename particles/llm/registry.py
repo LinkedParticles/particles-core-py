@@ -76,6 +76,17 @@ class CompletionError(RuntimeError):
     """
 
 
+class PlaintextKeyRefused(CompletionError, ValueError):
+    """A provider key was refused over non-loopback ``http://``, before any request.
+
+    The provider-key counterpart of the engine client's ``PlaintextTokenRefused``:
+    raised by the OpenAI-compatible adapter for an entry's key
+    (N12, SECURITY_REVIEW_20261024-1) and by the shared Anthropic client for
+    ``ANTHROPIC_API_KEY`` (security review 2026-10-25, Q14). A ``ValueError``
+    too, so a caller that fails fast on a missing key reports this the same way.
+    """
+
+
 class PurposeRefused(CompletionError, EgressRefused):
     """The purpose's endpoint is refused by ``network.egress``.
 
@@ -437,7 +448,9 @@ def get_provider(purpose: LLMPurpose) -> CompletionProvider:
     A scoped :func:`override_providers` entry for ``purpose`` wins over config.
     Inside a :func:`~particles.llm.replay.replay_scope` the config-resolved
     provider is wrapped in the replay cache; an override is not,
-    since a scripted provider costs nothing to call again.
+    since a scripted provider costs nothing to call again. Inside a
+    :func:`~particles.llm.call_meter.metered_calls` scope either one is charged
+    to the scope's meter, once per completion.
 
     ``provider: "anthropic"`` selects the native-SDK adapter directly; any
     other name is an ``llm.providers`` entry whose ``adapter`` field picks
@@ -446,16 +459,20 @@ def get_provider(purpose: LLMPurpose) -> CompletionProvider:
     is constructed per call; adapters are cheap handles over cached clients,
     so this is not a hot-path cost.
     """
+    # Deferred import: cycle break, since call_meter imports this module's
+    # CompletionError and CompletionProvider.
+    from particles.llm.call_meter import metered_provider
+
     overrides = _OVERRIDES.get()
     if overrides is not None and purpose in overrides:
-        return overrides[purpose]
+        return metered_provider(overrides[purpose])
 
     policy = current_policy()
     if policy.refusing:
         host, port, _ = purpose_endpoint(purpose)
         if not policy.allows(host, port):
             raise PurposeRefused(purpose, host, port, policy.posture)
-    return maybe_wrap(purpose, _resolve_from_config(purpose))
+    return metered_provider(maybe_wrap(purpose, _resolve_from_config(purpose)))
 
 
 def _resolve_from_config(purpose: LLMPurpose) -> CompletionProvider:

@@ -18,6 +18,7 @@ from this layer into the state-holding engine.
 | `conformance/` | Schema + SHACL validation against the normative artifacts |
 | `interchange.codec`, `interchange.jsonl` | The pure, store-free serialization codec |
 | `render.markdown` | The store-free Markdown renderer |
+| `render.escape` | The escaping layer every exporter writes stored text through |
 
 ## The one rule to know
 

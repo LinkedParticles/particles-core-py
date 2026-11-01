@@ -38,6 +38,7 @@ from anthropic import Omit, omit
 from opentelemetry import metrics, trace
 
 from particles.llm.batch_budget import current_batch_wait_budget
+from particles.llm.errors import redact_provider_error
 from particles.llm.registry import (
     CompletionRefused,
     CompletionRequest,
@@ -123,6 +124,17 @@ def _is_unsupported_temperature_result(result: object) -> bool:
     if getattr(error, "type", None) != "invalid_request_error":
         return False
     return "temperature" in str(getattr(error, "message", "")).lower()
+
+
+def _redact(exc: BaseException) -> BaseException:
+    """Scrub an SDK exception of every credential before it is logged or raised.
+
+    The SDK raises its own exceptions, which carry the API's error text and can
+    echo the key it was sent (security review 2026-10-25, the Q13 residual).
+    """
+    from particles.llm.client import sent_credentials
+
+    return redact_provider_error(exc, sent_credentials())
 
 
 @dataclass(frozen=True)
@@ -222,6 +234,7 @@ class AnthropicProvider:
             try:
                 resp = _create(temp_arg)
             except Exception as exc:
+                _redact(exc)
                 if isinstance(temp_arg, Omit) or not _is_unsupported_temperature(exc):
                     raise
                 # this model has deprecated `temperature`. Retry ONCE
@@ -301,7 +314,11 @@ class AnthropicProvider:
                 )
             return str(text_block.text).strip()
 
-        with _tracer.start_as_current_span("llm.complete") as span:
+        # The exception's type alone, never its message (security review
+        # 2026-10-26-1, R7).
+        with _tracer.start_as_current_span(
+            "llm.complete", record_exception=False, set_status_on_exception=False
+        ) as span:
             span.set_attribute("llm.model", self.model)
             span.set_attribute("llm.max_tokens", max_tokens)
             span.set_attribute("llm.streamed", streamed)
@@ -319,6 +336,12 @@ class AnthropicProvider:
                             self.model,
                         )
                 return result
+            except Exception as exc:
+                # Before any caller logs it.
+                _redact(exc)
+                span.set_attribute("error.type", type(exc).__name__)
+                span.set_status(trace.Status(trace.StatusCode.ERROR))
+                raise
             finally:
                 _llm_duration.record(time.perf_counter() - start, {"model": self.model})
 
@@ -389,15 +412,20 @@ class AnthropicProvider:
                 results.extend([None] * len(chunk))
                 failures.extend([RequestFailure.UNAVAILABLE] * len(chunk))
                 continue
-            chunk_results, chunk_failures = await self._run_batch(
-                chunk,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                poll_interval=cfg.poll_interval_seconds,
-                max_wait=cfg.max_wait_seconds,
-                cancel_grace=cfg.cancel_grace_seconds,
-                rerun_max_output_tokens=cfg.cancel_rerun_max_output_tokens,
-            )
+            try:
+                chunk_results, chunk_failures = await self._run_batch(
+                    chunk,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    poll_interval=cfg.poll_interval_seconds,
+                    max_wait=cfg.max_wait_seconds,
+                    cancel_grace=cfg.cancel_grace_seconds,
+                    rerun_max_output_tokens=cfg.cancel_rerun_max_output_tokens,
+                )
+            except Exception as exc:
+                # Submit, poll and collect all raise the SDK's own errors.
+                _redact(exc)
+                raise
             results.extend(chunk_results)
             failures.extend(chunk_failures)
         if failures_out is not None:
@@ -480,7 +508,9 @@ class AnthropicProvider:
             )
             return str(batch.id)
 
-        with _tracer.start_as_current_span("llm.complete_many") as span:
+        with _tracer.start_as_current_span(
+            "llm.complete_many", record_exception=False, set_status_on_exception=False
+        ) as span:
             span.set_attribute("llm.model", self.model)
             span.set_attribute("llm.batch.requests", len(requests))
             started = time.perf_counter()
@@ -544,6 +574,10 @@ class AnthropicProvider:
                     temperature_ids,
                     not isinstance(batch_temp, Omit),
                 )
+            except Exception as exc:
+                span.set_attribute("error.type", type(exc).__name__)
+                span.set_status(trace.Status(trace.StatusCode.ERROR))
+                raise
             finally:
                 _llm_duration.record(time.perf_counter() - started, {"model": self.model})
 
@@ -763,7 +797,7 @@ class AnthropicProvider:
         try:
             get_client().messages.batches.cancel(batch_id)
         except Exception as exc:  # noqa: BLE001 — cancellation is courtesy, not contract
-            log.info("Could not cancel message batch %s: %s", batch_id, exc)
+            log.info("Could not cancel message batch %s: %s", batch_id, _redact(exc))
 
     @staticmethod
     def _collect(

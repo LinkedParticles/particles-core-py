@@ -23,7 +23,10 @@ not consolidated here — it overrides operational config fields, not secrets.
 
 from __future__ import annotations
 
+import bisect
 import os
+import re
+from collections.abc import Iterable
 
 _PARTICLES_API_KEY_DEFAULT = "dev-key"
 
@@ -119,8 +122,18 @@ def get_particles_api_key() -> str:
     skip authentication entirely (local development). Production deployments
     set this to a real secret; the startup warning in
     ``warn_if_dev_auth_in_use`` shouts if it is left unset.
+
+    An empty or whitespace-only value is no key, so it reads as the sentinel
+    too: the engine is keyless, serves reads only, and the loopback startup
+    gate applies. Before this an empty key counted as a key, so the gate let a
+    non-loopback bind serve its reads to the network (security review
+    2026-10-25, the empty-key residual). Every reader of the key
+    goes through this function, so they all agree.
     """
-    return os.environ.get("PARTICLES_API_KEY", _PARTICLES_API_KEY_DEFAULT)
+    value = os.environ.get("PARTICLES_API_KEY")
+    if value is None or not value.strip():
+        return _PARTICLES_API_KEY_DEFAULT
+    return value
 
 
 def get_metrics_github_token() -> str:
@@ -178,7 +191,8 @@ def get_engine_token_optional() -> str | None:
     ``None``. A non-loopback engine will reject the unauthenticated request
     (401), which is the intended, legible failure.
     """
-    return os.environ.get("PARTICLES_ENGINE_TOKEN") or None
+    token = os.environ.get("PARTICLES_ENGINE_TOKEN")
+    return token if token and token.strip() else None
 
 
 def get_llm_api_key_optional(provider_name: str) -> str | None:
@@ -242,3 +256,200 @@ def get_particles_config_path() -> str | None:
     env var directly to avoid an import cycle during bootstrap.
     """
     return os.environ.get("PARTICLES_CONFIG") or None
+
+
+# The variables :func:`redact_known_secrets` treats as secret values. A secret added
+# above joins this tuple (or, for a per-name family, the prefix scan below).
+_SECRET_VARIABLES = (
+    "ANTHROPIC_API_KEY",
+    "GITHUB_API_KEY",
+    "NUMISTA_API_KEY",
+    "NOTION_API_KEY",
+    "PARTICLES_API_KEY",
+    "PARTICLES_METRICS_GITHUB_TOKEN",
+    "PARTICLES_METRICS_GOATCOUNTER_TOKEN",
+    "PARTICLES_ENGINE_TOKEN",
+    "PARTICLES_LOCAL_LLM_API_KEY",
+    # Read by the Anthropic SDK itself, never by a getter here; listed so an
+    # error or log line that echoes them is scrubbed (security review
+    # 2026-10-25-2, R9).
+    "ANTHROPIC_AUTH_TOKEN",
+)
+_LLM_API_KEY_PREFIX = "PARTICLES_LLM_API_KEY_"
+_OTLP_HEADER_VARIABLES = (
+    "PARTICLES_OTEL_EXPORTER_HEADERS",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+    "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+    "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+)
+
+#: A value shorter than this is never treated as a secret to redact: replacing
+#: every occurrence of a short string would garble ordinary text, and no real
+#: credential is that short (the ``dev-key`` sentinel is seven characters).
+_MIN_REDACTED_LENGTH = 8
+
+REDACTED = "[REDACTED]"
+
+
+def _header_secret_values(raw: str) -> list[str]:
+    """The values in a ``name=value,…`` header list, and each word of each value.
+
+    A value such as ``Bearer abc123`` yields both the whole value and
+    ``abc123``, so an echo of the bare token is caught too.
+    """
+    values: list[str] = []
+    for item in raw.split(","):
+        _name, sep, value = item.partition("=")
+        if not sep:
+            # A malformed item (``name: value``) may still hold the secret.
+            value = item.partition(":")[2]
+        value = value.strip()
+        values.append(value)
+        values.extend(value.split())
+    return values
+
+
+def _custom_header_secret_values(raw: str) -> list[str]:
+    """The values in ``ANTHROPIC_CUSTOM_HEADERS`` (``name: value`` lines), and each word.
+
+    Parsed the way the Anthropic SDK parses it: one header per line, split at
+    the first colon.
+    """
+    values: list[str] = []
+    for line in raw.split("\n"):
+        _name, sep, value = line.partition(":")
+        if sep:
+            value = value.strip()
+            values.append(value)
+            values.extend(value.split())
+    return values
+
+
+def known_secret_values() -> list[str]:
+    """Every configured secret value, longest first, for :func:`redact_known_secrets`.
+
+    Read from the environment at call time, so a key set or rotated after
+    import is still covered. The ``dev-key`` sentinel is not a secret and is
+    never listed.
+    """
+    values: list[str | None] = [os.environ.get(name) for name in _SECRET_VARIABLES]
+    values.extend(v for k, v in os.environ.items() if k.startswith(_LLM_API_KEY_PREFIX))
+    # The Particles OTLP header secret, and the OpenTelemetry SDK's own header
+    # variables in the same ``name=value,…`` form, which it sends on its own
+    # (security review 2026-10-26-1, Q13).
+    for name in _OTLP_HEADER_VARIABLES:
+        headers = os.environ.get(name)
+        if headers:
+            values.extend(_header_secret_values(headers))
+    custom = os.environ.get("ANTHROPIC_CUSTOM_HEADERS")
+    if custom:
+        values.extend(_custom_header_secret_values(custom))
+    kept = {
+        v
+        for v in values
+        if v and len(v) >= _MIN_REDACTED_LENGTH and v != _PARTICLES_API_KEY_DEFAULT
+    }
+    return sorted(kept, key=len, reverse=True)
+
+
+def redact_known_secrets(text: str, extra: Iterable[str | None] = ()) -> str:
+    """Replace every known secret value in ``text`` with ``[REDACTED]``.
+
+    Applied to text that came from outside the process (a provider's error
+    body, an exception message built from one) before it is raised, logged or
+    stored, because an endpoint can echo the credential it was sent in any
+    spelling (security review 2026-10-25, Q13). ``extra`` names values the
+    caller sent that the environment may not hold, such as a header it built.
+    """
+    secrets = set(known_secret_values())
+    secrets.update(v for v in extra if v and len(v) >= _MIN_REDACTED_LENGTH)
+    for value in sorted(secrets, key=len, reverse=True):
+        text = text.replace(value, REDACTED)
+    # A per-client engine key is masked by its shape too, whether or not this
+    # process holds it (security review 2026-10-26-1, W1).
+    return mask_engine_keys(text, REDACTED)
+
+
+#: The shape of a per-client engine key, ``ptk_<role>_<id>_<secret>``,
+#: anywhere in a text. ``particles.api._keys`` parses the same shape; a test
+#: ties the two. No boundary is required before the key: it may follow any
+#: escape whose last character is a letter or digit (a percent escape, a shell
+#: backslash escape, quoted-printable ``=3D``, a JSON unicode escape), and the
+#: fixed ``ptk_<role>_<12 hex>_`` prefix is distinctive on its own (security
+#: review 2026-10-27-1, W31; security review 2026-10-28-1, O25).
+ENGINE_KEY_SHAPE = re.compile(r"ptk_(?:read|agent|op)_[0-9a-f]{12}_[A-Za-z0-9_-]{43,}")
+
+#: What can sit inside a per-client key without changing what a reader copies
+#: out of it: a Unicode default-ignorable code point (a zero-width space, a
+#: soft hyphen, a joiner, a variation selector, a bidi control), and an escape
+#: of the ``_`` separator (percent, JSON or C hex, HTML character reference).
+#: Each ignorable is dropped and each escape read as ``_`` before the key shape
+#: is matched (security review 2026-10-30-1, E33).
+_KEY_NOISE = re.compile(
+    "[­͏؜ᅟᅠ឴឵᠋-᠏​-‏"
+    "‪-‮⁠-⁯ㅤ︀-️﻿ﾠ￰-￸"
+    "\U0001bca0-\U0001bca3\U0001d173-\U0001d17a\U000e0000-\U000e0fff]"
+    r"|%5[fF]|\\u005[fF]|\\x5[fF]|&#(?:95|x5[fF]);"
+)
+
+
+def _engine_key_spans(text: str) -> list[tuple[int, int]]:
+    """The spans of ``text`` that read as a per-client key once noise is removed.
+
+    The key shape is matched against a shadow of ``text`` with every
+    :data:`_KEY_NOISE` match dropped (an ignorable) or read as ``_`` (an
+    escape), and each match is mapped back to the span of ``text`` it came
+    from, noise inside it included.
+    """
+    shadow: list[str] = []
+    # (shadow offset, original offset, original end of an escape or -1)
+    marks: list[tuple[int, int, int]] = []
+    length = 0
+    pos = 0
+    for noise in _KEY_NOISE.finditer(text):
+        if noise.start() > pos:
+            marks.append((length, pos, -1))
+            shadow.append(text[pos : noise.start()])
+            length += noise.start() - pos
+        if len(noise.group()) > 1:
+            marks.append((length, noise.start(), noise.end()))
+            shadow.append("_")
+            length += 1
+        pos = noise.end()
+    if not marks and pos == 0:
+        return [m.span() for m in ENGINE_KEY_SHAPE.finditer(text)]
+    if pos < len(text):
+        marks.append((length, pos, -1))
+        shadow.append(text[pos:])
+    starts = [mark[0] for mark in marks]
+
+    def _origin(index: int) -> tuple[int, int]:
+        at, origin, escape_end = marks[bisect.bisect_right(starts, index) - 1]
+        if escape_end >= 0:
+            return origin, escape_end
+        return origin + index - at, origin + index - at + 1
+
+    return [
+        (_origin(m.start())[0], _origin(m.end() - 1)[1])
+        for m in ENGINE_KEY_SHAPE.finditer("".join(shadow))
+    ]
+
+
+def mask_engine_keys(text: str, replacement: str) -> str:
+    """Replace every per-client engine key in ``text`` with ``replacement``.
+
+    A key is found whole or split by an invisible character or an escaped
+    separator (:data:`_KEY_NOISE`), and the whole span it occupies is replaced.
+    """
+    spans = _engine_key_spans(text)
+    if not spans:
+        return text
+    parts: list[str] = []
+    pos = 0
+    for start, end in spans:
+        parts.append(text[pos:start])
+        parts.append(replacement)
+        pos = end
+    parts.append(text[pos:])
+    return "".join(parts)

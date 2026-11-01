@@ -69,6 +69,17 @@ class StorageConfig(BaseModel):
     # to `database_url` above. Static config; dynamic per-tenant provisioning is
     # handled by a separate layer above this one.
     stores: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("database_url")
+    @classmethod
+    def _expand_home_in_database_url(cls, value: str) -> str:
+        return expand_sqlite_home(value)
+
+    @field_validator("stores")
+    @classmethod
+    def _expand_home_in_stores(cls, value: dict[str, str]) -> dict[str, str]:
+        return {handle: expand_sqlite_home(url) for handle, url in value.items()}
+
     # Cross-process single-writer discipline.
     write_lock: WriteLockConfig = Field(default_factory=WriteLockConfig)
     # Hard upper bound on the ``limit`` query param of the read/list endpoints
@@ -162,6 +173,130 @@ class NetworkConfig(BaseModel):
         return self
 
 
+#: Second-level labels under which a two-letter country-code TLD registers
+#: names for the public (``co.uk``, ``com.au``, ``ne.jp``).
+_CC_SECOND_LEVEL_LABELS = frozenset(
+    {"ac", "co", "com", "edu", "gen", "go", "gob", "gov", "govt", "ltd", "mil"}
+    | {"ne", "net", "nom", "or", "org", "plc", "sch"}
+)
+
+#: Shared-hosting and tunnel suffixes whose subdomains belong to different
+#: parties, plus the wildcard-DNS services that resolve a name to any address.
+#: Not the full public-suffix list, which would need a dependency: the common
+#: cases an engine is put behind, and the hosting, site-builder and app
+#: platforms whose tenants' pages could rebind a name under them (security
+#: review 2026-10-30-1). A suffix missing here still validates; a complete list
+#: is an open decision.
+_SHARED_HOST_SUFFIXES = frozenset(
+    {
+        "amazonaws.com",
+        "amplifyapp.com",
+        "appspot.com",
+        "awsapprunner.com",
+        "azurecontainer.io",
+        "azureedge.net",
+        "azurestaticapps.net",
+        "azurewebsites.net",
+        "bitbucket.io",
+        "blogspot.com",
+        "bubbleapps.io",
+        "cloudapp.net",
+        "cloudflareaccess.com",
+        "cloudfront.net",
+        "cloudfunctions.net",
+        "codeberg.page",
+        "csb.app",
+        "deno.dev",
+        "duckdns.org",
+        "elasticbeanstalk.com",
+        "firebaseapp.com",
+        "fly.dev",
+        "framer.app",
+        "framer.website",
+        "github.dev",
+        "github.io",
+        "gitlab.io",
+        "gitpod.io",
+        "glitch.me",
+        "googleusercontent.com",
+        "herokuapp.com",
+        "hf.space",
+        "koyeb.app",
+        "lhr.life",
+        "loca.lt",
+        "lovable.app",
+        "myshopify.com",
+        "neocities.org",
+        "netlify.app",
+        "ngrok-free.app",
+        "ngrok.app",
+        "ngrok.dev",
+        "ngrok.io",
+        "nip.io",
+        "ondigitalocean.app",
+        "onrender.com",
+        "pages.dev",
+        "pythonanywhere.com",
+        "r2.dev",
+        "railway.app",
+        "readthedocs.io",
+        "repl.co",
+        "replit.app",
+        "replit.dev",
+        "run.app",
+        "serveo.net",
+        "sslip.io",
+        "stackblitz.io",
+        "streamlit.app",
+        "supabase.co",
+        "surge.sh",
+        "traefik.me",
+        "trycloudflare.com",
+        "ts.net",
+        "val.run",
+        "vercel.app",
+        "web.app",
+        "webcontainer.io",
+        "webflow.io",
+        "wixsite.com",
+        "wordpress.com",
+        "workers.dev",
+    }
+)
+
+
+def _is_shared_suffix(name: str) -> bool:
+    """Whether ``name`` is a suffix other parties register names under.
+
+    A wildcard over one admits every page beneath it, which under the dev-key
+    skip is the DNS-rebinding read and write path the ``Host`` bound exists to
+    refuse (security review 2026-10-24-2, P40). A single label (``com``,
+    ``io``), a country-code second level (``co.uk``) and a listed shared-hosting
+    suffix (``ts.net``) all count. An IP literal never does.
+    """
+    labels = name.split(".")
+    if len(labels) < 2:
+        return True
+    if len(labels) == 2 and len(labels[1]) == 2 and labels[0] in _CC_SECOND_LEVEL_LABELS:
+        return True
+    return name in _SHARED_HOST_SUFFIXES
+
+
+#: The loopback ranges no trusted proxy may overlap: IPv4 loopback, IPv6
+#: loopback, and IPv4 loopback in IPv4-mapped IPv6 form (security review
+#: 2026-10-25, Q42).
+_LOOPBACK_V4 = ipaddress.IPv4Network("127.0.0.0/8")
+_LOOPBACK_V6 = (ipaddress.IPv6Network("::1/128"), ipaddress.IPv6Network("::ffff:127.0.0.0/104"))
+#: The broadest range a trusted-proxy entry may name, per address family.
+_MIN_TRUSTED_PROXY_PREFIX = {4: 8, 6: 32}
+
+
+def _overlaps_loopback(network: ipaddress.IPv4Network | ipaddress.IPv6Network) -> bool:
+    if isinstance(network, ipaddress.IPv4Network):
+        return network.overlaps(_LOOPBACK_V4)
+    return any(network.overlaps(loopback) for loopback in _LOOPBACK_V6)
+
+
 class ApiConfig(BaseModel):
     """FastAPI app tunables (defense-in-depth limits for the HTTP surface).
 
@@ -200,10 +335,15 @@ class ApiConfig(BaseModel):
 
     ``rate_limit_per_minute`` is an in-app token-bucket cap on the
     LLM/embedding-driving endpoints (``/query``, ``/extract``, ``/reindex``, the
-    semantic ``/lint`` path), keyed on the real client host (security review F6).
+    semantic ``/lint`` path) and on every deposit route, which queues model
+    extraction, keyed on the request's key principal when it has one and on the
+    real client host otherwise (security review F6).
     Each of those endpoints drives a paid Anthropic completion and/or an
     embedding per request, so an unauthenticated or compromised caller could
-    otherwise burn tokens unbounded. ``0`` (or any value ``≤ 0``) disables the
+    otherwise burn tokens unbounded. For a request without the bearer the cap
+    also counts model calls: the request's token pays for its first call and
+    each further call spends one more (security review 2026-10-25-2, R2).
+    ``0`` (or any value ``≤ 0``) disables the
     in-app limiter — appropriate for the default loopback-bound single-operator
     engine, and for deployments where a reverse proxy already rate-limits. The
     limiter is a *second* line of defense, not a substitute for the
@@ -235,7 +375,9 @@ class ApiConfig(BaseModel):
     ``allowed_hosts`` lists the ``Host`` header names (no port) the engine
     answers on, beside the loopback names (``localhost``, ``127.0.0.0/8``,
     ``::1``), which are always allowed so a local health probe keeps working.
-    A ``*.`` prefix matches any subdomain (``*.tailnet.example``). The check
+    A ``*.`` prefix matches any subdomain (``*.tailnet.example``); a wildcard
+    over a suffix other parties register under (``*.com``, ``*.co.uk``,
+    ``*.ts.net``) is rejected, since it would admit their pages too. The check
     covers every path, ``/health`` and ``/app`` included, and is what refuses a
     DNS-rebinding page: such a page reaches the engine's address under its own
     hostname (security review 2026-10-24, N1). Under the dev-key skip only the
@@ -243,8 +385,28 @@ class ApiConfig(BaseModel):
     With a real ``PARTICLES_API_KEY`` and an empty list (the default) no
     ``Host`` is refused; set it on a non-loopback deployment whose reads are
     open, and include the name your health probe sends.
+
+    ``keys_file`` is where the engine keeps its per-client keys: one
+    record per key naming its principal, role and optional project, with only a
+    SHA-256 digest of the secret, never the secret. ``particles engine keys``
+    writes it on the engine's host; no HTTP route does. The engine re-reads it
+    when it changes, so a revocation takes effect on the next request. A file
+    that is group- or world-writable, owned by another user, or unparseable is
+    refused, and every per-client key then answers 503 while
+    ``PARTICLES_API_KEY`` keeps working. An absent file means no per-client
+    keys. The container pins it on the data volume
+    (``deploy/config.container.yaml``).
+
+    ``keys_dir_group`` names the one group whose setgid, group-writable
+    directory may hold the key file: a Kubernetes ``fsGroup`` volume, which the
+    Helm chart sets it to. Unset (the default), a group-writable key directory
+    is refused, since nothing the engine can read tells a volume only its own
+    pods write from a host directory a host group shares (security review
+    2026-10-30-1, AB53). A group another account holds is refused even when
+    named.
     """
 
+    keys_dir_group: int | None = None
     max_request_body_bytes: int = 25 * 1024 * 1024  # 25 MiB
     bind_host: str = "127.0.0.1"
     trusted_proxies: list[str] = Field(default_factory=list)
@@ -252,6 +414,7 @@ class ApiConfig(BaseModel):
     require_auth_for_reads: bool = False
     allowed_origins: list[str] = Field(default_factory=list)
     allowed_hosts: list[str] = Field(default_factory=list)
+    keys_file: str = "~/.particles/engine-keys.json"
 
     @field_validator("allowed_hosts")
     @classmethod
@@ -273,6 +436,13 @@ class ApiConfig(BaseModel):
                     f"api.allowed_hosts entry {entry!r} is not a host name; give a "
                     "bare name with no scheme or port, e.g. engine.example.org or "
                     "*.tailnet.example"
+                )
+            if host.startswith("*.") and _is_shared_suffix(bare.rstrip(".")):
+                raise ValueError(
+                    f"api.allowed_hosts entry {entry!r} is a wildcard over a suffix "
+                    "that other parties register names under, so it would admit "
+                    "their pages too; name a domain you control, e.g. "
+                    "*.engine.example.org or *.tail1234.ts.net"
                 )
             normalized.append(host)
         return normalized
@@ -305,11 +475,12 @@ class ApiConfig(BaseModel):
     @field_validator("trusted_proxies")
     @classmethod
     def _validate_trusted_proxies(cls, value: list[str]) -> list[str]:
-        """Reject overly-broad or loopback proxy ranges (security review F19).
+        """Reject overly-broad or loopback proxy ranges (security review F19, Q42).
 
         Each entry must parse as an IP or CIDR. A reverse proxy is never
-        legitimately the everything-range (``0.0.0.0/0`` / ``::/0``) or a
-        loopback range (``127.0.0.0/8`` / ``::1/128``): trusting either
+        legitimately broader than ``/8`` (IPv4) or ``/32`` (IPv6), and never a
+        range that contains loopback (``127.0.0.0/8``, ``::1/128`` or the
+        IPv4-mapped ``::ffff:127.0.0.0/104``): trusting either
         re-enables the ``X-Forwarded-For`` spoof the per-request loopback gate
         (``particles/api/auth.py``) defends against — an attacker whose hop is
         "trusted" can forge the real-client address. An empty list (the
@@ -331,11 +502,20 @@ class ApiConfig(BaseModel):
                     f"trusting it re-enables X-Forwarded-For spoofing. List the "
                     f"specific proxy IPs / CIDRs instead."
                 )
-            if network.is_loopback:
+            if network.is_loopback or _overlaps_loopback(network):
                 raise ValueError(
-                    f"api.trusted_proxies entry {entry!r} is a loopback range; "
-                    f"a reverse proxy is never loopback, and trusting it re-enables "
-                    f"X-Forwarded-For spoofing. List the specific proxy IPs / CIDRs."
+                    f"api.trusted_proxies entry {entry!r} is or contains a loopback "
+                    f"range; a reverse proxy is never loopback, and trusting it "
+                    f"re-enables X-Forwarded-For spoofing. List the specific proxy "
+                    f"IPs / CIDRs."
+                )
+            min_prefix = _MIN_TRUSTED_PROXY_PREFIX[network.version]
+            if int(network.prefixlen) < min_prefix:
+                raise ValueError(
+                    f"api.trusted_proxies entry {entry!r} is broader than "
+                    f"/{min_prefix}; a reverse proxy is never that much of the "
+                    f"address space, and trusting it re-enables X-Forwarded-For "
+                    f"spoofing. List the specific proxy IPs / CIDRs."
                 )
         return value
 
@@ -829,6 +1009,12 @@ class LLMConfig(BaseModel):
     # no permission, or out-of-credits — before the semantic seam probes the API
     # again (circuit breaker). 0 disables the breaker.
     unavailable_backoff_seconds: int = 60
+    # The Anthropic key is refused over a non-loopback http:// ANTHROPIC_BASE_URL,
+    # before any request (security review 2026-10-25, Q14; the rule
+    # ``llm.providers.<name>.allow_plaintext_key`` sets for an OpenAI-compatible
+    # entry). True sends it anyway, with a warning, for a gateway on a network
+    # you trust end to end.
+    anthropic_allow_plaintext_key: bool = False
     # List prices every cost estimate turns tokens into dollars with (the
     # audit and the benchmark harnesses alike), keyed by resolved model id
     # (``claude-sonnet-5``) or, to pin one provider's route,
@@ -1954,7 +2140,9 @@ class UtilityConfig(BaseModel):
     pass that produces the evidence.
 
     ``explicit_weight`` is what one operator gesture
-    (``particles memory useful <id>``) is worth relative to one mined event. It
+    (``particles memory useful <id>``, or ``POST /memory/useful`` with an
+    operator key; an agent key's press earns nothing) is worth relative to one
+    mined event. It
     lives here rather than on :class:`UtilityRuleConfig` because it parameterises
     *evidence production* in the local store, not the portable policy for
     *interpreting* another store's utility evidence — so it is deliberately not
@@ -1962,7 +2150,7 @@ class UtilityConfig(BaseModel):
 
     It must be well above 1.0 or the explicit channel cannot function: the miner
     emits one event per (belief, session) and accumulates tens unattended, while
-    a gesture fires once and is capped at one credit per belief per principal per
+    a gesture fires once and is capped at one credit per belief per interface per
     day. At ``1.0`` a deliberate press buys ``λ·ln 2`` of rank-lift against the
     ``λ·ln(1+R)`` a well-used belief earns for free — roughly a fifth of head
     entry on the dogfood store — so the verb would exist and change nothing.
@@ -2438,8 +2626,9 @@ class HackerNewsConfig(BaseModel):
 
 class MastodonConfig(BaseModel):
     # Total cap on context items (ancestors + descendants) the importer
-    # keeps per thread. Ancestors are retained first (the reply chain UP
-    # is typically short); remaining budget goes to descendants. Deep,
+    # keeps per thread, and the extractor reads. Ancestors are retained
+    # first; past the cap the thread's root and the nearest ancestors are
+    # kept. Remaining budget goes to descendants. Deep,
     # high-engagement threads are truncated and the extractor surfaces a
     # MASTODON_REPLY_LIMIT_HIT quality note. Mirrors
     # ``hackernews.max_comments`` in intent.
@@ -2650,6 +2839,71 @@ class ExporterCommonConfig(BaseModel):
     synthesis_min_particles: int = 3
 
 
+def is_broad_root(path: Path) -> bool:
+    """Whether ``path`` is too broad to be a root a read is contained to.
+
+    The filesystem root, the home directory and every ancestor of the home
+    directory are broad: each holds ``~/.claude`` and every project the user
+    owns. Both sides are compared with ``realpath``, so macOS ``/private``
+    aliases and a symlinked home agree, and then by ``stat`` identity, so a
+    name ``realpath`` keeps apart from the home directory (its
+    ``/System/Volumes/Data`` firmlink, or another letter case on a
+    case-insensitive volume) is still broad (2026-10-25, Q50). A directory
+    that holds the home directory under another name is broad too: the mount
+    point of the volume home lives on, and any directory under which home's
+    trailing components name the home directory itself (macOS
+    ``/System/Volumes/Data``, a bind-mount parent on Linux; 2026-10-25-2,
+    R16). Rule-source roots use it (security review K9, P49), and so does
+    ``graph.manifest_root`` (2026-10-25, Q43).
+
+    The trailing-component rule follows no link: each component is
+    ``lstat``-ed and a symlink on the way ends that match. A link anyone can
+    plant, named after home's last component (or its first) and pointing at
+    home, would otherwise make the directory holding it broad, and the
+    operator-only predicate and the work-tree rule skip a broad directory
+    (2026-10-30-1, AB1).
+    """
+    resolved = Path(os.path.realpath(path))
+    home = Path(os.path.realpath(Path.home()))
+    if resolved == Path(resolved.anchor) or home.is_relative_to(resolved):
+        return True
+    try:
+        st = os.stat(resolved)
+    except OSError:
+        return False
+    for ancestor in (home, *home.parents):
+        try:
+            if os.path.samestat(st, os.stat(ancestor)):
+                return True
+        except OSError:
+            continue
+    try:
+        home_st = os.stat(home)
+    except OSError:
+        return False
+    if st.st_dev == home_st.st_dev and os.path.ismount(resolved):
+        return True
+    parts = home.parts[1:]
+    return any(
+        _reaches_without_links(resolved, parts[start:], home_st) for start in range(len(parts))
+    )
+
+
+def _reaches_without_links(base: Path, names: tuple[str, ...], target: os.stat_result) -> bool:
+    """Whether ``base`` joined with ``names`` is ``target``, with no symlink on the way."""
+    current = base
+    st: os.stat_result | None = None
+    for name in names:
+        current = current / name
+        try:
+            st = os.lstat(current)
+        except OSError:
+            return False
+        if stat.S_ISLNK(st.st_mode):
+            return False
+    return st is not None and os.path.samestat(st, target)
+
+
 class GraphConfig(BaseModel):
     """Scoped epistemic graph view.
 
@@ -2671,6 +2925,31 @@ class GraphConfig(BaseModel):
     # Retrieval-set size for query scope (`export graph --query`), bounded by
     # the query pipeline's own top_k ceiling.
     query_top_k: int = Field(default=25, ge=1, le=200)
+    # The directory `GET /graph?scope=projection` reads manifests from. The
+    # `manifest` parameter is then a relative name under it: an absolute name, a
+    # `..` component, a symlink, a non-regular file or one outside the directory
+    # is refused with one fixed error (security review 2026-10-24-2, P1). Unset
+    # (the default), the HTTP route and the stdio MCP tool refuse the projection
+    # scope, since their caller would otherwise name any file on the engine host
+    # (security review 2026-10-25, Q11). Only `export graph` reads the path it is
+    # given. A broad directory (the filesystem root, the home directory or one of
+    # its ancestors) is refused, since under it every host file is a candidate
+    # (security review 2026-10-25, Q43).
+    manifest_root: str | None = None
+    # Largest manifest the HTTP projection scope reads, in bytes.
+    manifest_max_bytes: int = Field(default=1024 * 1024, ge=1)
+
+    @field_validator("manifest_root")
+    @classmethod
+    def _validate_manifest_root(cls, value: str | None) -> str | None:
+        """Refuse a broad manifest root (security review 2026-10-25, Q43)."""
+        if value is not None and is_broad_root(Path(value).expanduser()):
+            raise ValueError(
+                f"graph.manifest_root {value!r} is too broad: the filesystem root, the "
+                "home directory and their ancestors hold every file on the host. "
+                "Point it at the directory that holds your projection manifests."
+            )
+        return value
 
 
 class ObsidianConfig(BaseModel):
@@ -2717,6 +2996,10 @@ class InboxConfig(BaseModel):
     # (one mtime check + a file read if changed) so the default leans
     # toward fresh.
     poll_interval_seconds: int = 30
+    # Largest inbox file a pass reads, in bytes. A larger file is refused
+    # rather than read, so a file far beyond any list of shared URLs cannot
+    # stall the engine (security review 2026-10-28-2, AA7).
+    max_bytes: int = Field(default=1_048_576, ge=1)
 
 
 class WikiConfig(BaseModel):
@@ -3075,6 +3358,10 @@ class McpWriteConfig(BaseModel):
     # the same knobs so the gate and the lint cannot drift. 0 disables a check.
     max_assertion_chars: int = Field(default=320, ge=0)
     max_assertion_sentences: int = Field(default=3, ge=0)
+    # Most subject names one belief write may name. Each unknown name can cost a
+    # live authority lookup, so the bound caps the lookups one request makes
+    # (security review 2026-10-30-2, AC3). 0 disables it.
+    max_subject_names: int = Field(default=16, ge=0)
 
 
 class McpRecallConfig(BaseModel):
@@ -3137,13 +3424,19 @@ class McpMemoryCompatConfig(BaseModel):
 class McpConfig(BaseModel):
     """MCP server surfaces.
 
-    ``rate_limit_per_minute`` caps, per server process, the tool calls that can
-    drive a paid model call: a ``query`` with a question (the NL response), a
+    ``rate_limit_per_minute`` caps, per store, the tool calls that can drive a
+    paid model call: a ``query`` with a question (the NL response), a
     ``particle_assert`` / ``particle_supersede`` (the §6.6 contradiction
-    probe), and every write of the memory-server façade. One token bucket per
-    process, refilling over a minute, so an agent looping on a tool (a prompt
-    injection, a runaway plan) spends at most this many such calls a minute
-    (security review D30). ``0`` disables it. Other reads are not counted.
+    probe), a ``graph_view``, and every write of the memory-server façade. One
+    token bucket per store, refilling over a minute, so an agent looping on a
+    tool (a prompt injection, a runaway plan) spends at most this many such
+    calls a minute (security review D30). A file-backed store keeps the bucket
+    beside its file (``<db>.mcp-rate``), so every server process on the store
+    shares it (U11); a store with no file, and a server routed to a remote
+    engine, keep it per process. A façade write is charged one token
+    per §6.6 assertion it lists, so one call cannot fan out past the cap, and a
+    call listing more than the cap is refused (P26). ``0`` disables it. Other
+    reads are not counted.
     """
 
     rate_limit_per_minute: int = Field(default=60, ge=0)
@@ -3171,6 +3464,18 @@ class ClaudeCodeHarvestConfig(BaseModel):
     # How many recent transcripts the level-triggered catch-up sweep re-checks
     # after handling the current session. 0 disables the sweep.
     catchup_limit: int = Field(default=5, ge=0)
+    # Whether a completed walk of a memory directory records an ABSENT record
+    # for each previously harvested memory file it no longer finds, so the
+    # deleted file's claims retire at the next extraction pass.
+    # Local store only. The first absence ever under a directory, and a mass
+    # absence, are refused and reported rather than recorded; `particles
+    # memory absences --record` confirms them.
+    record_absence: bool = True
+    # Above this fraction of a directory's previously harvested memory files
+    # (and at least five, a fixed floor), the walk records no absence and
+    # reports it. A directory of fewer than five files is held
+    # back only by the first-absence rule.
+    max_absent_fraction: float = Field(default=0.25, ge=0.0, le=1.0)
 
 
 class ClaudeCodeConfig(BaseModel):
@@ -3194,8 +3499,11 @@ class ClaudeCodeConfig(BaseModel):
     # Byte-level guard on the injected digest, truncating on a line boundary
     # with a disclosed footer. Complements
     # ``mcp.recall.digest_max_beliefs`` (a belief line has no fixed width).
-    # 0 = no byte cap.
-    digest_max_bytes: int = Field(default=24_000, ge=0)
+    # Claude Code passes the model only a 2,000-character preview of any
+    # hook context over 10,000 characters, so the hook clamps this budget to
+    # 9,500 (``_claude_code.DIGEST_BUDGET_CEILING``); a UTF-8 byte count is
+    # never below the character count. 0 = the ceiling.
+    digest_max_bytes: int = Field(default=9_000, ge=0)
     # Internal deadline for a hook run, far under Claude Code's own 600 s hook
     # timeout. On expiry the hook logs and exits 0 with no output — a memory
     # outage must cost an empty digest, never a hung session start.
@@ -3389,8 +3697,9 @@ class CurationConfig(BaseModel):
     # Projection manifests: paths to ``operations.projection`` doc
     # manifests whose selected particles get ``projection_blocking`` leverage —
     # a belief that feeds a generated doc is worth tending first. Empty leaves
-    # the projection-blocking signal inert (the default). Paths are
-    # resolved relative to the process working directory.
+    # the projection-blocking signal inert (the default). A
+    # relative path is resolved against the loaded config file's directory,
+    # never the working directory (security review U15).
     projection_manifests: list[str] = Field(default_factory=list)
     # serve the queue from a persisted card collection instead of
     # running every finder per request. `false` restores the pre-0238
@@ -4673,6 +4982,8 @@ _ENV_OVERRIDES: list[tuple[str, str, str]] = [
     ("PARTICLES_API_BIND_HOST", "api", "bind_host"),
     ("PARTICLES_API_RATE_LIMIT_PER_MINUTE", "api", "rate_limit_per_minute"),
     ("PARTICLES_API_REQUIRE_AUTH_FOR_READS", "api", "require_auth_for_reads"),
+    ("PARTICLES_API_KEYS_FILE", "api", "keys_file"),
+    ("PARTICLES_API_KEYS_DIR_GROUP", "api", "keys_dir_group"),
     ("PARTICLES_MAX_PAGE_SIZE", "storage", "max_page_size"),
     # Stamped by the image, not set by an operator (deploy/Dockerfile).
     ("PARTICLES_BUILD_DATE", "build", "date"),
@@ -4742,13 +5053,90 @@ ENDPOINT_ENV_VARS: tuple[str, ...] = (
     "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
     "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
     "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+    # Where the embedding encoder downloads from (huggingface_hub).
+    "HF_ENDPOINT",
+)
+
+#: Environment variables that hold, or name the file of, a credential the SDKs
+#: send on their own, beside the ones Particles reads: the Anthropic SDK's
+#: bearer and custom headers, the OTLP exporter's headers (the Particles secret
+#: and the SDK's own, per signal), its client certificate and key (overall and
+#: per signal), and the Hugging Face Hub token the encoder download sends.
+#: Reported by name only, never by value (security review 2026-10-26-1, E6;
+#: 2026-10-27-1, G50).
+CREDENTIAL_ENV_VARS: tuple[str, ...] = (
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "PARTICLES_OTEL_EXPORTER_HEADERS",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+    "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+    "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+    "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_CLIENT_KEY",
+    "OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY",
+    "OTEL_EXPORTER_OTLP_METRICS_CLIENT_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_METRICS_CLIENT_KEY",
+    "OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_LOGS_CLIENT_KEY",
+    "HF_TOKEN",
+    "HUGGING_FACE_HUB_TOKEN",
+)
+
+#: Environment variables that make a TLS client write each session's secrets
+#: to a file. Python's default TLS context honours ``SSLKEYLOGFILE``; the
+#: clients :mod:`particles.http` builds and the ``curl`` / ``git`` subprocesses
+#: ignore it, but a library that builds its own context does not (security
+#: review 2026-10-27-1, G15).
+KEY_LOG_ENV_VARS: tuple[str, ...] = ("SSLKEYLOGFILE",)
+
+#: Environment variables that name a proxy. The native Anthropic client, the
+#: OTLP exporter sessions and the Hugging Face encoder download read them (and,
+#: with none set, the operating system's proxy settings), so with a CA override
+#: below a proxy sees the provider key in the clear (security review
+#: 2026-10-24-2, P16). The clients :mod:`particles.http` builds take no proxy
+#: from the environment, and the pinned ``curl`` / ``git`` subprocesses drop
+#: these variables (2026-10-30-1).
+PROXY_ENV_VARS: tuple[str, ...] = (
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+)
+
+#: Environment variables that replace the certificate authorities a TLS
+#: connection trusts, for httpx, OpenSSL, ``requests`` and ``curl``.
+CA_ENV_VARS: tuple[str, ...] = (
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+)
+
+#: Environment variables that replace the certificate authorities the OTLP
+#: exporter trusts, overall and per signal (security review 2026-10-26-1, E6).
+OTLP_CA_ENV_VARS: tuple[str, ...] = (
+    "OTEL_EXPORTER_OTLP_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_METRICS_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE",
 )
 
 
 def _endpoint_origin(value: str) -> str:
-    """``scheme://host[:port]`` of an endpoint value, without any userinfo or path."""
+    """``scheme://host[:port]`` of an endpoint value, without any userinfo or path.
+
+    A value with an ``@`` after its authority may hold a password a parser
+    reads as a host and port (``user:4417/rest@engine``), so it is shown as
+    unparseable rather than echoed (security review 2026-10-28-1, E22).
+    """
     try:
         parts = urlsplit(value)
+        if "@" in parts.path + parts.query + parts.fragment:
+            return "(unparseable)"
         host = parts.hostname or ""
         port = f":{parts.port}" if parts.port is not None else ""
     except ValueError:
@@ -4756,18 +5144,65 @@ def _endpoint_origin(value: str) -> str:
     return f"{parts.scheme}://{host}{port}" if parts.scheme and host else "(unparseable)"
 
 
+#: Overrides whose empty value means "no override": the config file decides.
+#: ``init claude-code`` pins ``PARTICLES_ENGINE_BASE_URL=''`` in each hook
+#: command, so a hook takes its engine from the config file it pins and never
+#: from one its harness's environment supplies (security review 2026-10-25-2,
+#: R41).
+_EMPTY_MEANS_UNSET: frozenset[str] = frozenset({"PARTICLES_ENGINE_BASE_URL"})
+
+
+def environment_engine_url() -> str | None:
+    """The engine ``PARTICLES_ENGINE_BASE_URL`` names, when it overrides the config file.
+
+    ``None`` when the variable is unset or empty, in which case
+    ``engine.base_url`` is the config file's. A lifecycle hook trusts only an
+    engine its pinned config names (security review 2026-10-25-2, R41).
+    """
+    return os.environ.get("PARTICLES_ENGINE_BASE_URL") or None
+
+
+def _system_proxy_notes() -> list[str]:
+    """The proxies the operating system's settings name, when no variable names one.
+
+    With no proxy variable set, :func:`urllib.request.getproxies` reads the
+    macOS system configuration or the Windows registry, and the Anthropic SDK
+    and ``requests`` route through what it returns (security review
+    2026-10-30-1, L28).
+    """
+    import urllib.request
+
+    try:
+        if urllib.request.getproxies_environment():
+            return []
+        system = urllib.request.getproxies()
+    except Exception:  # noqa: BLE001 — a diagnostic never fails on an OS read
+        return []
+    return [
+        f"⚠ the system proxy settings route {scheme} connections of the Anthropic, "
+        f"OTLP and Hugging Face clients through {_endpoint_origin(url)}"
+        for scheme, url in sorted(system.items())
+        if scheme in ("http", "https", "all") and url
+    ]
+
+
 def environment_notes() -> list[str]:
     """What this process's environment changes about its config, for the diagnostics.
 
     ``config validate`` and ``hook doctor`` print these: a relative
     ``PARTICLES_CONFIG`` (read against the working directory), every set
-    override from :data:`_ENV_OVERRIDES`, and each endpoint variable that
+    override from :data:`_ENV_OVERRIDES`, each endpoint variable that
     sends a secret or the prompts somewhere other than the pinned file says
-    (security review N15, N16). An entry starting with ``⚠`` deserves a look.
+    (security review N15, N16), each proxy or CA variable, which reroutes
+    or re-roots every connection (P16), and each variable whose value an SDK
+    sends as a credential, named without its value (E6), and a TLS key log
+    variable (G15). An entry starting with ``⚠``
+    deserves a look. Only this process's environment is read, not the env
+    pins of an installed hook or MCP registration.
     """
     notes: list[str] = []
-    explicit = os.environ.get("PARTICLES_CONFIG")
-    if explicit and not Path(explicit).is_absolute():
+    explicit = relative_config_pin()
+    if explicit:
         notes.append(
             f"⚠ PARTICLES_CONFIG is relative ({explicit}) and is read against the working "
             "directory; set an absolute path"
@@ -4779,6 +5214,29 @@ def environment_notes() -> list[str]:
         value = os.environ.get(name)
         if value:
             notes.append(f"⚠ {name} sends to {_endpoint_origin(value)}, overriding the config file")
+    for name in PROXY_ENV_VARS:
+        value = os.environ.get(name)
+        if value:
+            notes.append(
+                f"⚠ {name} routes the Anthropic, OTLP and Hugging Face connections "
+                f"through {_endpoint_origin(value)}"
+            )
+    notes.extend(_system_proxy_notes())
+    for name in CA_ENV_VARS:
+        if os.environ.get(name):
+            notes.append(f"⚠ {name} replaces the certificate authorities TLS connections trust")
+    for name in OTLP_CA_ENV_VARS:
+        if os.environ.get(name):
+            notes.append(f"⚠ {name} replaces the certificate authorities the OTLP exporter trusts")
+    for name in CREDENTIAL_ENV_VARS:
+        if os.environ.get(name):
+            notes.append(f"⚠ {name} is set, and an SDK sends the credential it holds")
+    for name in KEY_LOG_ENV_VARS:
+        if os.environ.get(name):
+            notes.append(
+                f"⚠ {name} is set, and a TLS client that honours it writes session keys "
+                "to the file it names"
+            )
     return notes
 
 
@@ -4820,6 +5278,51 @@ def _find_config_file() -> Path | None:
         return p if p.exists() else None
     user = user_config_path()
     return user if user.exists() else None
+
+
+class LoadedConfigFile(NamedTuple):
+    """The config file :func:`get_config` loaded: its path as found and the file it was then.
+
+    ``device`` and ``inode`` are the ``fstat`` of the descriptor the settings
+    were read from, so a later check can tell whether the name still holds that
+    file. ``ctime_ns``, ``mode`` and ``uid`` are that file's
+    state when it was read, and ``dir_mode`` and ``dir_uid`` the directory
+    holding it then (``None`` when it could not be read): settings read while
+    others could write the file or its directory stay in force after it is
+    closed, so the gate judges the state they were read in as well as the
+    state now (security review 2026-10-30-1, AB13).
+    """
+
+    path: Path
+    device: int
+    inode: int
+    ctime_ns: int = 0
+    mode: int = 0
+    uid: int = -1
+    dir_mode: int | None = None
+    dir_uid: int | None = None
+
+
+def loaded_config_file() -> LoadedConfigFile | None:
+    """The config file the process's settings came from, or ``None`` on compiled defaults.
+
+    Recorded when :func:`get_config` loads, never looked up again: the settings
+    stay in force after the file is removed or replaced, so the file to judge is
+    the one they came from.
+    """
+    get_config()
+    return _loaded_file
+
+
+def config_file_path() -> Path | None:
+    """The ``config.yaml`` this process loaded, or ``None`` on compiled defaults.
+
+    The path :func:`get_config` read, in the loader's order, as
+    recorded at that load (:func:`loaded_config_file`). The local refresh
+    judges it, since it chooses the roots the refresh reads.
+    """
+    loaded = loaded_config_file()
+    return None if loaded is None else loaded.path
 
 
 #: Largest nearby file :func:`nearby_unused_config` will parse to see whether it
@@ -4885,19 +5388,24 @@ def nearby_unused_config(loaded: Path | None = None) -> Path | None:
     bounds walk used. Returns the nearest ``config.yaml`` when it
     names a Particles section and is not the file the loader read (``loaded``);
     another tool's ``config.yaml`` returns ``None``. Never applies anything.
+
+    The checks are ``os.path`` ones, which answer ``False`` for a path they
+    cannot stat on every supported Python; ``Path.is_file`` raises on 3.11 to
+    3.13 for a symlink into a directory the user cannot search, which a
+    cloned repository can commit (security review 2026-10-24-2, P45).
     """
-    loaded_real = loaded.resolve() if loaded is not None else None
+    loaded_real = os.path.realpath(loaded) if loaded is not None else None
     try:
         start = Path.cwd()
     except OSError:  # the working directory was removed
         return None
     for directory in (start, *start.parents):
         candidate = directory / "config.yaml"
-        if candidate.is_file():
-            if loaded_real is not None and candidate.resolve() == loaded_real:
+        if os.path.isfile(candidate):
+            if loaded_real is not None and os.path.realpath(candidate) == loaded_real:
                 return None
             return candidate if _names_a_particles_section(candidate) else None
-        if (directory / ".git").exists():
+        if os.path.lexists(directory / ".git"):
             return None
     return None
 
@@ -4926,7 +5434,12 @@ def describe_config_resolution() -> ConfigResolution:
         missing = None if path is not None else Path(explicit)
         return ConfigResolution(path, origin, missing, None)
     origin = "user file" if path is not None else "none"
-    return ConfigResolution(path, origin, None, nearby_unused_config(path))
+    try:
+        nearby = nearby_unused_config(path)
+    except Exception:  # noqa: BLE001 - a diagnostic must report, not crash (N14, P45)
+        log.debug("nearby config check failed", exc_info=True)
+        nearby = None
+    return ConfigResolution(path, origin, None, nearby)
 
 
 _warned_resolution: set[str] = set()
@@ -4990,6 +5503,46 @@ def _report_resolution(config_path: Path | None, cfg: ParticlesConfig) -> None:
         )
 
 
+def relative_config_pin() -> str | None:
+    """``PARTICLES_CONFIG`` when it names a relative path, else ``None``.
+
+    The loader reads such a pin against the working directory, so a cloned
+    repository with a file at that path configures the process. The CLI warns;
+    the processes a harness starts in an arbitrary directory (the stdio MCP
+    servers and the lifecycle hooks) refuse it (security review N15, P14). A
+    ``~`` counts as relative: nothing expands it, since the shell does not
+    inside quotes.
+    """
+    explicit = os.environ.get("PARTICLES_CONFIG")
+    return explicit if explicit and not Path(explicit).is_absolute() else None
+
+
+def environment_database_url() -> str | None:
+    """The store ``DATABASE_URL`` names, when it overrides the config file's ``default`` store.
+
+    ``None`` when the variable is unset or empty. ``init claude-code`` reports
+    such a value rather than pinning it silently (security review 2026-10-27-1,
+    N3).
+    """
+    return os.environ.get("DATABASE_URL") or None
+
+
+def expand_sqlite_home(url: str) -> str:
+    """``url`` with a leading ``~`` in a file-backed SQLite path expanded.
+
+    SQLite does no ``~`` expansion, so ``sqlite+aiosqlite:///~/s.db`` opens
+    ``./~/s.db`` in the working directory, while every check that expanded the
+    path judged it absolute (security review 2026-10-24-2, P13).
+    :class:`StorageConfig` expands each DSN once, so the driver, the stdio store
+    rule and the diagnostics all judge the file that is opened. A ``~user``
+    that names no user stays unexpanded, and so stays relative.
+    """
+    path = sqlite_file_path(url)
+    if path is None or not path.startswith("~"):
+        return url
+    return f"{url.split(':///', 1)[0]}:///{os.path.expanduser(path)}"
+
+
 def sqlite_file_path(url: str) -> str | None:
     """Return a file-based SQLite URL's on-disk path, or ``None`` for memory/non-SQLite.
 
@@ -5012,8 +5565,8 @@ def describe_default_store() -> str:
 
     A file-backed SQLite store reads as its absolute path, marked when the
     configured path is relative and so names a different file in each working
-    directory. Any other DSN reads as its scheme only, so no credential in it
-    is printed.
+    directory, a store the local refresh does not run for. Any
+    other DSN reads as its scheme only, so no credential in it is printed.
     """
     url = get_config().storage.database_url
     db_file = sqlite_file_path(url)
@@ -5026,7 +5579,10 @@ def describe_default_store() -> str:
         here = Path.cwd() / path
     except OSError:
         here = path
-    return f"{os.path.normpath(here)} (relative to the working directory)"
+    return (
+        f"{os.path.normpath(here)} (relative to the working directory; "
+        "the local refresh does not run for it)"
+    )
 
 
 def resolve_store_adjacent_path(value: str) -> Path:
@@ -5047,7 +5603,8 @@ def resolve_store_adjacent_path(value: str) -> Path:
     2. A relative value anchors to the **store's own directory** — the parent of
        the default store's SQLite file — whenever that path is absolute.
     3. Otherwise the **loaded config file's directory** (Postgres and other
-       non-file DSNs have no store directory).
+       non-file DSNs have no store directory): the file the settings came
+       from, never a fresh lookup (security review 2026-10-30-1, AB12).
     4. Otherwise the working directory, as before.
 
     Step 2 deliberately does nothing when the DSN is itself relative: the store
@@ -5064,19 +5621,63 @@ def resolve_store_adjacent_path(value: str) -> Path:
         if anchor.is_absolute():
             return anchor.parent / path
 
-    config_file = _find_config_file()
+    config_file = config_file_path()
     if config_file is not None:
         return config_file.parent.resolve() / path
 
     return path
 
 
+def resolve_config_relative_path(value: str) -> Path:
+    """Resolve a path a config file names, anchoring a relative one to that file.
+
+    An absolute value is returned unchanged (``~`` expanded). A relative value
+    anchors to the loaded config file's directory, never to the working
+    directory, so running a command inside a cloned repository cannot swap in
+    that repository's file (security review U15). With no config file loaded
+    the value is returned as given. The file is the one the settings were
+    loaded from (:func:`config_file_path`), never a fresh lookup, so a value
+    keeps its anchor after that file is removed or ``PARTICLES_CONFIG``
+    changes (security review 2026-10-30-1, AB12).
+    """
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    config_file = config_file_path()
+    if config_file is not None:
+        return config_file.parent.resolve() / path
+    return path
+
+
 def _load_config() -> ParticlesConfig:
+    return _load_config_recorded()[0]
+
+
+def _load_config_recorded() -> tuple[ParticlesConfig, LoadedConfigFile | None]:
+    """Load the configuration, and say which file it was read from."""
     raw: dict[str, Any] = {}
 
     config_path = _find_config_file()
+    record: LoadedConfigFile | None = None
     if config_path is not None:
         with open(config_path) as f:
+            st = os.fstat(f.fileno())
+            try:
+                held = os.stat(Path(os.path.abspath(config_path)).parent)
+                dir_mode: int | None = held.st_mode
+                dir_uid: int | None = held.st_uid
+            except OSError:
+                dir_mode = dir_uid = None
+            record = LoadedConfigFile(
+                config_path,
+                st.st_dev,
+                st.st_ino,
+                st.st_ctime_ns,
+                st.st_mode,
+                st.st_uid,
+                dir_mode,
+                dir_uid,
+            )
             loaded = yaml.safe_load(f)
         if isinstance(loaded, dict):
             raw = loaded
@@ -5085,6 +5686,8 @@ def _load_config() -> ParticlesConfig:
 
     for env_var, section, field in _ENV_OVERRIDES:
         value = os.environ.get(env_var)
+        if value == "" and env_var in _EMPTY_MEANS_UNSET:
+            continue
         if value is not None:
             if section not in raw:
                 raw[section] = {}
@@ -5098,7 +5701,7 @@ def _load_config() -> ParticlesConfig:
 
     cfg = ParticlesConfig.model_validate(raw)
     _report_resolution(config_path, cfg)
-    return cfg
+    return cfg, record
 
 
 def validate_config() -> tuple[Path | None, ParticlesConfig]:
@@ -5342,14 +5945,15 @@ def _migrate_audit_output_keys(raw: dict[str, Any]) -> None:
 
 
 _config: ParticlesConfig | None = None
+_loaded_file: LoadedConfigFile | None = None
 _reset_hooks: list[Callable[[], None]] = []
 
 
 def get_config() -> ParticlesConfig:
     """Return the process-level config singleton."""
-    global _config
+    global _config, _loaded_file
     if _config is None:
-        _config = _load_config()
+        _config, _loaded_file = _load_config_recorded()
     return _config
 
 
@@ -5373,7 +5977,8 @@ def reset_config() -> None:
     discarded and a subsequent ``get_engine()`` rebuilds against the new
     ``storage.database_url``.
     """
-    global _config
+    global _config, _loaded_file
     _config = None
+    _loaded_file = None
     for hook in _reset_hooks:
         hook()

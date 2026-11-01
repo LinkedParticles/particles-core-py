@@ -363,7 +363,10 @@ def strip_remote_contexts(content: bytes) -> tuple[bytes, list[str]]:
     """
     try:
         doc = json.loads(content)
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+        # A document nested past the decoder's depth goes on to the parser,
+        # whose refusal becomes a quality note (security review 2026-10-30,
+        # AB17).
         return content, []
 
     dropped: list[str] = []

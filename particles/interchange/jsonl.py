@@ -24,9 +24,25 @@ _MAX_BUNDLE_BYTES = 256 * 1024 * 1024  # 256 MiB per member
 _MAX_UNITS = 500_000  # per member
 
 
+#: Characters ``str.splitlines`` (and many JSON Lines readers) take as a line
+#: break that ``json.dumps(ensure_ascii=False)`` writes raw inside a string.
+_RAW_LINE_BREAKS = str.maketrans({"\u2028": "\\u2028", "\u2029": "\\u2029", "\x85": "\\u0085"})
+
+
+def json_line(unit: Any) -> str:
+    """``unit`` as one line of JSON Lines, with no character a reader splits on.
+
+    A claim holding U+2028, U+2029 or U+0085 is written with those characters
+    as JSON escapes, so the unit stays on its own line and the bundle reads
+    back (security review 2026-10-30-1, AB35). They can only occur inside a
+    string, where the escape is the same value.
+    """
+    return json.dumps(unit, ensure_ascii=False).translate(_RAW_LINE_BREAKS)
+
+
 def write_jsonl(units: Iterable[dict[str, Any]]) -> str:
     """Serialize units to newline-delimited JSON (one unit per line)."""
-    return "".join(json.dumps(unit, ensure_ascii=False) + "\n" for unit in units)
+    return "".join(json_line(unit) + "\n" for unit in units)
 
 
 def read_jsonl(text: str) -> list[dict[str, Any]]:
@@ -47,7 +63,9 @@ def read_jsonl(text: str) -> list[dict[str, Any]]:
         )
 
     units: list[dict[str, Any]] = []
-    for line in text.splitlines():
+    # Only a line feed ends a unit: a bundle an older writer wrote with a raw
+    # U+2028 or U+0085 inside a string still reads back (AB35).
+    for line in text.split("\n"):
         if not line.strip():
             continue
         if len(units) >= _MAX_UNITS:

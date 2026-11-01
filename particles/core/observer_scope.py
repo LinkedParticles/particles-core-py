@@ -25,6 +25,7 @@ SDK conventions, which is why this sits beside, not inside, the normative
 
 from __future__ import annotations
 
+import unicodedata
 from collections.abc import Collection, Iterable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -47,14 +48,241 @@ def project_tag(key: str) -> str:
     return f"{PROJECT_TAG_PREFIX}{key}"
 
 
+#: Letters and symbols that render as nothing: the Hangul fillers, the braille
+#: blank and the musical null notehead (security review 2026-10-27-1, G74;
+#: 2026-10-28-1, G65).
+_BLANK_GLYPHS = frozenset("\u115f\u1160\u3164\uffa0\u2800\U0001d159")
+
+#: The categories of a character a reader can see: letters, numbers,
+#: punctuation and symbols.
+_VISIBLE_CATEGORIES = frozenset("LNPS")
+
+#: Unicode's default-ignorable code points (DerivedCoreProperties.txt): a
+#: renderer draws none of them, so a key holding one reads as the key without
+#: it. The variation selectors and the Khmer inherent vowels are among them
+#: (security review 2026-10-28-1, G65).
+_DEFAULT_IGNORABLE = (
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+)
+
+#: Scripts that one name legitimately mixes: Japanese writes kanji beside both
+#: kana, and Korean may write hanja beside hangul. The other entries name one
+#: script under two spellings of its Unicode names (the Arabic-Indic digits are
+#: Arabic's; the ideographic number zero is Han's).
+_ONE_SCRIPT = {
+    "HIRAGANA": "CJK",
+    "KATAKANA": "CJK",
+    "KATAKANA-HIRAGANA": "CJK",
+    "HANGUL": "CJK",
+    "BOPOMOFO": "CJK",
+    "IDEOGRAPHIC": "CJK",
+    "CJK": "CJK",
+    "ARABIC-INDIC": "ARABIC",
+    "EXTENDED ARABIC-INDIC": "ARABIC",
+}
+
+#: The words a character's Unicode name uses after its script's name
+#: (``OLD ITALIC LETTER A``, ``DEVANAGARI DIGIT ZERO``), so the script is every
+#: word before the first of them.
+_AFTER_SCRIPT = frozenset(
+    {
+        "LETTER",
+        "DIGIT",
+        "NUMBER",
+        "NUMERAL",
+        "SYLLABLE",
+        "SYLLABICS",
+        "CHARACTER",
+        "LIGATURE",
+        "VOWEL",
+        "CONSONANT",
+        "INDEPENDENT",
+        "SIGN",
+        "CAPITAL",
+        "SMALL",
+        "FRACTION",
+        "LOGOGRAM",
+        "HIEROGLYPH",
+    }
+)
+
+
+#: Categories that never belong in a key a reader can check: controls,
+#: private-use and unassigned code points, and the line and paragraph
+#: separators. Each renders as nothing, as a box, or as a break, so a key
+#: holding one reads as the key without it (security review 2026-10-30-1,
+#: AB32). A space separator other than U+0020 is refused beside them.
+_HIDDEN_CATEGORIES = frozenset({"Cc", "Co", "Cn", "Zl", "Zp"})
+
+#: Letters of the Latin script that Unicode's confusables data maps to an
+#: ASCII letter or mark: a key spelt with one reads as the ASCII key within one
+#: script, which the mixed-script rule cannot see (security review
+#: 2026-10-30-1, AB32). A hand-kept list of the common ones, not the whole
+#: table.
+_LATIN_CONFUSABLES = frozenset(
+    "\u0131\u0237\u0251\u0261\u0269\u026a\u028f\u01c0\u01c3\u02bc"
+    "\u1d04\u1d0f\u1d1c\u1d20\u1d21\u1d22\ua731"
+)
+
+#: Non-ASCII punctuation marks and symbols that read as an ASCII one: the
+#: quotation marks, primes, slashes, the minus sign, the ratio and the
+#: Armenian and Hebrew stops. Every dash (category Pd) is refused beside them.
+#: Refused in any key, not only beside ASCII characters, so a Unicode hyphen
+#: in a key of another script is refused too (security review 2026-10-30-1,
+#: AB32).
+_ASCII_LOOKALIKE_MARKS = frozenset(
+    "\u02b9\u02ba\u02c2\u02c3\u02c4\u02c6\u02c8\u02cb\u02d0\u02d7\u02dc"
+    "\u0589\u05c3\u2018\u2019\u201a\u201b\u201c\u201d\u201e\u201f"
+    "\u2032\u2033\u2035\u2039\u203a\u2044\u2212\u2215\u2216\u2217"
+    "\u2223\u2236\u223c\u29f8\u29f9"
+)
+
+
+def _default_ignorable(ch: str) -> bool:
+    cp = ord(ch)
+    return any(lo <= cp <= hi for lo, hi in _DEFAULT_IGNORABLE)
+
+
+def _script(ch: str) -> str | None:
+    """A letter's or number's script, read from its Unicode name (``LATIN``, ``OLD ITALIC``).
+
+    The script is the words of the name before the word that says what the
+    character is (``LETTER``, ``DIGIT``, ``SIGN``), so ``OLD ITALIC`` and ``OLD
+    PERSIAN`` are two scripts. Numbers count as letters do: a Devanagari digit
+    is Devanagari's (security review 2026-10-28-2, AA24). The ASCII digits are
+    every script's, and have none.
+    """
+    if unicodedata.category(ch)[0] not in "LN" or ("0" <= ch <= "9"):
+        return None
+    words = unicodedata.name(ch, "").split(" ")
+    if not words[0]:
+        return None
+    taken: list[str] = []
+    for word in words:
+        if word in _AFTER_SCRIPT or word.startswith("IDEOGRAPH"):
+            break
+        taken.append(word)
+    script = " ".join(taken) if taken and len(taken) < len(words) else words[0]
+    if script.startswith("CJK"):
+        script = "CJK"
+    return _ONE_SCRIPT.get(script, script)
+
+
+def names_a_project(key: str | None) -> bool:
+    """Whether ``key`` has a visible character, so it can name a project.
+
+    A key of only whitespace, separators or format characters (zero-width
+    space, joiner and non-joiner, word joiner, byte-order mark, Mongolian vowel
+    separator) names no project anyone can see or type: ``str.strip`` keeps the
+    format characters, so a key made of them passed every blank check (security
+    review 2026-10-26-1, E9). Neither does one of only combining marks,
+    controls, private-use or unassigned code points, or the letters and symbols
+    that render blank (security review 2026-10-27-1, G65, G74), so a key needs
+    one letter, number, punctuation mark or symbol that is not a blank glyph.
+    """
+    if not key:
+        return False
+    return any(
+        unicodedata.category(ch)[0] in _VISIBLE_CATEGORIES and ch not in _BLANK_GLYPHS for ch in key
+    )
+
+
+def hides_a_character(key: str) -> bool:
+    """Whether ``key`` holds a character that makes it read as another project.
+
+    A format character (zero-width space, joiner and non-joiner, word joiner,
+    soft hyphen, byte-order mark) or a variation selector leaves a key looking
+    exactly like another, so ``acme`` with one of them inside is a second
+    project no reader can tell from the first (security review 2026-10-28-1,
+    O46). So do the other default-ignorable code points and a blank glyph
+    beside visible characters, a compatibility form that Unicode NFKC
+    normalisation changes (a fullwidth letter; a decomposed accent is NFC's
+    and :func:`canonical_project_key` composes it), and letters from more than
+    one script, such as a Cyrillic letter among Latin ones (security review
+    2026-10-28-1, G65). Digits count by their script, and a key that holds an
+    ASCII character may hold no other punctuation or symbol, since a Unicode
+    hyphen or minus sign reads as the ASCII one (security review 2026-10-28-2,
+    AA24). No key may hold a control, private-use, unassigned or separator
+    character, a dash or another mark that reads as an ASCII one, or a Latin
+    letter that reads as an ASCII letter (security review 2026-10-30-1, AB32).
+    """
+    return lookalike_reason(key) is not None
+
+
+def lookalike_reason(key: str) -> str | None:
+    """Why :func:`hides_a_character` refuses ``key``, worded for a refusal, or None.
+
+    So a refusal names the rule that fired rather than always an invisible
+    character (security review 2026-10-28-2, AA26).
+    """
+    composed = unicodedata.normalize("NFC", key)
+    if unicodedata.normalize("NFKC", composed) != composed:
+        return "holds a compatibility form (a fullwidth or styled character) that reads as another"
+    if any(ch.isascii() for ch in key) and any(
+        not ch.isascii() and unicodedata.category(ch)[0] in "PS" for ch in key
+    ):
+        return "holds a non-ASCII punctuation mark or symbol beside ASCII characters"
+    for ch in key:
+        category = unicodedata.category(ch)
+        if category in _HIDDEN_CATEGORIES or (category == "Zs" and ch != " "):
+            return "holds a control, private-use, unassigned or separator character"
+        if not ch.isascii() and (category == "Pd" or ch in _ASCII_LOOKALIKE_MARKS):
+            return "holds a punctuation mark or symbol that reads as an ASCII one"
+        if ch in _LATIN_CONFUSABLES:
+            return "holds a letter that reads as an ASCII letter"
+    scripts: set[str] = set()
+    for ch in key:
+        if (
+            unicodedata.category(ch) == "Cf"
+            or "\U000e0100" <= ch <= "\U000e01ef"
+            or _default_ignorable(ch)
+            or ch in _BLANK_GLYPHS
+        ):
+            return "holds an invisible character"
+        script = _script(ch)
+        if script is not None:
+            scripts.add(script)
+    if len(scripts) > 1:
+        return f"mixes the {' and '.join(sorted(scripts))} scripts"
+    return None
+
+
+def canonical_project_key(key: str) -> str:
+    """``key`` as a binding stores and compares it: stripped and in Unicode NFC.
+
+    The composed and decomposed spellings of one name (``café`` typed, and as a
+    macOS path returns it) are one project (security review 2026-10-28-1, O46).
+    """
+    return unicodedata.normalize("NFC", key.strip())
+
+
 def project_keys(tags: Iterable[str] | None) -> frozenset[str]:
-    """The project keys among an entry's tags (empty keys are ignored)."""
+    """The project keys among an entry's tags, canonical (keys that name no project are ignored)."""
     if not tags:
         return frozenset()
+    # Canonical on read, so a tag stored in another normalisation form (an
+    # operator's deposit, an entry from before keys were canonicalised) is the
+    # project its NFC spelling names (security review 2026-10-28-2, AA25).
     return frozenset(
-        tag[len(PROJECT_TAG_PREFIX) :]
+        canonical_project_key(tag[len(PROJECT_TAG_PREFIX) :])
         for tag in tags
-        if tag.startswith(PROJECT_TAG_PREFIX) and len(tag) > len(PROJECT_TAG_PREFIX)
+        if tag.startswith(PROJECT_TAG_PREFIX) and names_a_project(tag[len(PROJECT_TAG_PREFIX) :])
     )
 
 
@@ -77,13 +305,20 @@ def classify_entry(tags: Iterable[str] | None, harness_tags: Collection[str]) ->
 
     ``harness_tags`` are the tags a harness adapter puts on everything it
     harvests (``observer_scope.harness_tags``). :data:`UNATTRIBUTED_MARKER`
-    counts as one whatever that list says. Keyed wins over both other classes:
-    an entry with a key is attributed, whoever deposited it.
+    counts as one whatever that list says, and so does a ``project:`` tag
+    whose key names no project. Keyed wins over both other classes: an entry
+    with a key is attributed, whoever deposited it.
     """
     tag_list = list(tags or ())
     if project_keys(tag_list):
         return EntryScope.KEYED
     if UNATTRIBUTED_MARKER in tag_list or any(tag in harness_tags for tag in tag_list):
+        return EntryScope.UNATTRIBUTED
+    # A project tag whose key names no project (one an earlier release
+    # accepted, before the rule tightened) still says the entry was written
+    # for one project, so it fails closed rather than reading as global
+    # (security review 2026-10-28-1, E21).
+    if any(tag.startswith(PROJECT_TAG_PREFIX) for tag in tag_list):
         return EntryScope.UNATTRIBUTED
     return EntryScope.GLOBAL
 
@@ -210,7 +445,8 @@ def visible(scope: BeliefScope, observer_project: str | None, *, widened: bool =
     """
     if observer_project is None:
         return True
-    return widened or scope.everywhere or observer_project in scope.keys
+    # Keys compare canonical on both sides (security review 2026-10-28-2, AA25).
+    return widened or scope.everywhere or canonical_project_key(observer_project) in scope.keys
 
 
 def share_an_observer(a: BeliefScope, b: BeliefScope) -> bool:

@@ -35,6 +35,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
 from particles.config import get_config
+from particles.core import bounded_yaml
 from particles.core.schema import (
     SCHEMA_VERSION,
     ApplicabilityClause,
@@ -3072,7 +3073,7 @@ def _strip_obsidian_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     try:
         import yaml
 
-        parsed = yaml.safe_load(yaml_block) if yaml_block.strip() else {}
+        parsed = bounded_yaml.load(yaml_block) if yaml_block.strip() else {}
         meta: dict[str, Any] = parsed if isinstance(parsed, dict) else {}
     except yaml.YAMLError:
         # Malformed frontmatter — still strip it from the body so the LLM

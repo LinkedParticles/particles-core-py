@@ -32,10 +32,13 @@ than letting it fail the snapshot.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import random
-from collections.abc import Awaitable, Callable
-from typing import TypeVar
+from collections.abc import Awaitable, Callable, Iterable
+from typing import Any, TypeVar
+
+from particles.secrets import redact_known_secrets
 
 log = logging.getLogger(__name__)
 
@@ -53,8 +56,79 @@ class AccountLevelLLMError(RuntimeError):
     """
 
     def __init__(self, cause: BaseException) -> None:
-        super().__init__(str(cause))
+        # The cause's text is a provider's error body, which can echo the key
+        # it was sent (security review 2026-10-25, Q13).
+        super().__init__(redact_known_secrets(str(cause)))
         self.cause = cause
+
+
+def _redacted(value: object, extra: list[str | None]) -> object:
+    """``value`` with every known secret replaced, through nested containers."""
+    if isinstance(value, str):
+        return redact_known_secrets(value, extra)
+    if isinstance(value, dict):
+        return {k: _redacted(v, extra) for k, v in value.items()}
+    if isinstance(value, list | tuple):
+        return type(value)(_redacted(v, extra) for v in value)
+    return value
+
+
+def _redact_response_body(response: Any, extra: list[str | None]) -> None:
+    """Replace every known secret in a read ``httpx`` response's body, in place.
+
+    Only a body already read is touched (the SDK reads an error's body before
+    it raises); an unread stream holds nothing the error text echoed. The
+    decoded text is cached on first read, so the cache is dropped with it.
+    """
+    if not isinstance(getattr(response, "_content", None), bytes):
+        return
+    try:
+        text = response.text
+    except (UnicodeDecodeError, LookupError, AttributeError):
+        return
+    redacted = redact_known_secrets(text, extra)
+    if redacted == text:
+        return
+    with contextlib.suppress(AttributeError, TypeError):
+        response._content = redacted.encode(response.encoding or "utf-8")
+        response.__dict__.pop("_text", None)
+
+
+def redact_provider_error(exc: BaseException, extra: Iterable[str | None] = ()) -> BaseException:
+    """Scrub known secrets from a provider SDK exception in place, and return it.
+
+    An SDK's own exception carries the provider's error text in its ``args``,
+    its ``message`` and its parsed ``body``, and every later log line, event
+    detail or quality note copies one of those. The OpenAI-compatible adapter
+    builds its exceptions from a scrubbed body (security review 2026-10-25,
+    Q13); the native Anthropic SDK raises its own, so the adapter passes each
+    through here before it leaves (the Q13 residual). The exception keeps its
+    type, ``status_code`` and headers, so the breaker and the rate-limit wait
+    still classify it. Chained causes are scrubbed too, since a traceback
+    prints them, and so is the body of a ``response`` the exception holds, so
+    no attribute of the raised error keeps the echo (security review
+    2026-10-25-2, R37). ``extra`` names credentials the caller sent that the
+    environment may not hold.
+    """
+    sent = list(extra)
+    seen: set[int] = set()
+    pending = [exc]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        with contextlib.suppress(AttributeError, TypeError):
+            current.args = tuple(_redacted(a, sent) for a in current.args)
+        for attr in ("message", "body"):
+            if attr in getattr(current, "__dict__", {}):
+                with contextlib.suppress(AttributeError, TypeError):
+                    setattr(current, attr, _redacted(getattr(current, attr), sent))
+        response = getattr(current, "__dict__", {}).get("response")
+        if response is not None:
+            _redact_response_body(response, sent)
+        pending.extend(c for c in (current.__cause__, current.__context__) if c is not None)
+    return exc
 
 
 def is_account_level_failure(exc: BaseException) -> bool:

@@ -72,7 +72,7 @@ log = logging.getLogger(__name__)
 
 SOURCE_TYPE = "MASTODON_THREAD"
 EXTRACTOR_ID = "mastodon-extractor"
-EXTRACTOR_VERSION = "0.2.0"
+EXTRACTOR_VERSION = "0.2.1"
 # 0.2.0: capture ``mastodon:reblogOfStatusId``,
 # ``mastodon:reblogOfAccountAcct``, ``mastodon:reblogOfStatusUri``
 # when ``status.reblog`` is non-null so a future ``BOOSTS``-relation
@@ -169,11 +169,30 @@ async def _fetch_json(client: Any, url: str) -> dict[str, Any] | None:
     resp.raise_for_status()
     try:
         data = resp.json()
-    except (ValueError, json.JSONDecodeError):
+    except (ValueError, json.JSONDecodeError, RecursionError):
+        # A body nested past the decoder's depth is the instance's choice
+        # too, and reads as no JSON (security review 2026-10-28-2, AA18).
         return None
     if not isinstance(data, dict):
         return None
     return data
+
+
+def _cap_context(
+    ancestors: list[dict[str, Any]], descendants: list[dict[str, Any]], max_replies: int
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Hold ancestors plus descendants to ``max_replies`` items in total.
+
+    The instance chooses how many ancestors it returns, so they count against
+    the cap too (security review 2026-10-28-2, AA17). Past the cap the root
+    is kept, so ``thread:hasRootId`` still names it, with the nearest
+    ancestors after it; the older middle of the chain is dropped. Descendants
+    take whatever budget the ancestors leave.
+    """
+    cap = max(0, max_replies)
+    if len(ancestors) > cap:
+        ancestors = [ancestors[0], *ancestors[len(ancestors) - cap + 1 :]] if cap else []
+    return ancestors, descendants[: cap - len(ancestors)]
 
 
 async def _fetch_thread(
@@ -195,8 +214,8 @@ async def _fetch_thread(
     ```
 
     ``ancestors`` + ``descendants`` are capped at ``max_replies`` total
-    (ancestors are walked entirely first because the reply chain UP is
-    typically short; remaining budget goes to descendants). When the cap
+    (:func:`_cap_context`: ancestors first, the root and the nearest ones
+    kept past the cap; remaining budget goes to descendants). When the cap
     fires, the extractor surfaces a ``MASTODON_REPLY_LIMIT_HIT`` quality
     note so operators know the captured slice is truncated.
     """
@@ -215,12 +234,11 @@ async def _fetch_thread(
         if isinstance(desc, list):
             descendants_raw = desc
 
-    # Keep all ancestors (reply chains UP are short) and trim descendants
-    # to fit the remaining budget.
-    ancestors = [a for a in ancestors_raw if isinstance(a, dict)]
-    descendants_all = [d for d in descendants_raw if isinstance(d, dict)]
-    remaining = max(0, max_replies - len(ancestors))
-    descendants = descendants_all[:remaining]
+    ancestors, descendants = _cap_context(
+        [a for a in ancestors_raw if isinstance(a, dict)],
+        [d for d in descendants_raw if isinstance(d, dict)],
+        max_replies,
+    )
 
     return {
         "status": status,
@@ -279,7 +297,9 @@ class MastodonExtractor:
         """
         try:
             data = json.loads(content)
-        except json.JSONDecodeError as exc:
+        except (ValueError, RecursionError) as exc:
+            # RecursionError: a blob nested past the decoder's depth
+            # (security review 2026-10-30, AB17).
             return (NormalizedDocument(quality_notes=[f"JSON parse error: {exc}"]), {}, "", "")
 
         if not isinstance(data, dict):
@@ -320,6 +340,9 @@ class MastodonExtractor:
         )
 
         cfg = get_config()
+        # A blob stored before the fetch held ancestors to the cap is held to
+        # it here (security review 2026-10-28-2, AA17).
+        ancestors, descendants = _cap_context(ancestors, descendants, cfg.mastodon.max_replies)
         chunks = _build_mastodon_chunks(
             status=status,
             ancestors=ancestors,
@@ -559,6 +582,11 @@ def _build_descendant_lines(
     ``in_reply_to_id`` pointing into the same list or to the focal
     status. We rebuild the tree by parent id, then walk it depth-first
     from the focal status's direct replies down.
+
+    The list is the instance's bytes, so the walk keeps a stack rather than
+    recursing, and renders each id once: a reply naming itself, or a cycle
+    of replies, cannot recurse without end (security review 2026-10-28-2,
+    AA15).
     """
     by_parent: dict[str, list[dict[str, Any]]] = {}
     for d in descendants:
@@ -571,16 +599,23 @@ def _build_descendant_lines(
         return []
 
     lines: list[str] = []
+    seen = {status_id_raw}
 
-    def _walk(parent_id: str, depth: int) -> None:
+    def _children(parent_id: str, depth: int) -> list[tuple[dict[str, Any], int]]:
         children = _filter_replies_by_favs(by_parent.get(parent_id, []), min_favourites)
-        for c in children:
-            lines.append(_render_reply_line(c, depth, indent_per_level))
-            cid = c.get("id")
-            if isinstance(cid, str):
-                _walk(cid, depth + 1)
+        return [(c, depth) for c in reversed(children)]
 
-    _walk(status_id_raw, depth=0)
+    stack = _children(status_id_raw, 0)
+    while stack:
+        c, depth = stack.pop()
+        cid = c.get("id")
+        if isinstance(cid, str):
+            if cid in seen:
+                continue
+            seen.add(cid)
+        lines.append(_render_reply_line(c, depth, indent_per_level))
+        if isinstance(cid, str):
+            stack.extend(_children(cid, depth + 1))
     return lines
 
 
@@ -602,25 +637,40 @@ def _build_mastodon_chunks(
     budget (parallel to the HN / gist / reddit strategy so the
     chunk-hash carry-forward reuses particles when only one
     chunk's text changes).
+
+    A status chunk past ``single_call_threshold`` keeps the nearest ancestors
+    that fit ``chunk_chars`` beside the headline, and the older ones go to
+    their own context chunks of ``chunk_chars`` each. Every rendered line is
+    clipped to ``chunk_chars``, so no chunk is larger than the budget plus
+    its header, however much text the instance returns (security review
+    2026-10-28-2, AA19).
     """
     chunks: list[ChunkUnit] = []
 
-    headline = _render_status_headline(status, instance)
-    ancestor_lines = _build_ancestor_lines(ancestors, indent_per_level)
+    headline = _clip(_render_status_headline(status, instance), chunk_chars)
+    ancestor_lines = [
+        _clip(line, chunk_chars) for line in _build_ancestor_lines(ancestors, indent_per_level)
+    ]
 
-    status_chunk_parts = []
-    if ancestor_lines:
-        status_chunk_parts.append("CONTEXT (ancestors, oldest first):")
-        status_chunk_parts.extend(ancestor_lines)
-        status_chunk_parts.append("")
-    status_chunk_parts.append(headline)
-    status_chunk_text = "\n".join(status_chunk_parts).strip()
+    status_chunk_text = _status_chunk_text(ancestor_lines, headline)
+    if len(status_chunk_text) > single_call_threshold:
+        kept = _nearest_lines_within(ancestor_lines, chunk_chars - len(headline))
+        older = ancestor_lines[: len(ancestor_lines) - len(kept)]
+        sub_chunks = _chunk_lines_by_size(older, chunk_chars)
+        total = len(sub_chunks)
+        for i, sub in enumerate(sub_chunks, start=1):
+            parts = [f"CONTEXT (older ancestors, oldest first, chunk {i}/{total}):", *sub]
+            chunks.append(
+                ChunkUnit(chunk_id=f"ancestors_{i}_of_{total}", chunk_text="\n".join(parts))
+            )
+        status_chunk_text = _status_chunk_text(kept, headline)
     if status_chunk_text:
         chunks.append(ChunkUnit(chunk_id="status", chunk_text=status_chunk_text))
 
-    descendant_lines = _build_descendant_lines(
-        status, descendants, indent_per_level, min_favourites
-    )
+    descendant_lines = [
+        _clip(line, chunk_chars)
+        for line in _build_descendant_lines(status, descendants, indent_per_level, min_favourites)
+    ]
     if not descendant_lines:
         return chunks
 
@@ -629,7 +679,7 @@ def _build_mastodon_chunks(
     header_subject = spoiler or _status_content_text(status)[:80] or "(no subject)"
     header = f"# Context: replies on Mastodon thread — {header_subject[:120]}"
 
-    rendered_size = sum(len(line) for line in descendant_lines)
+    rendered_size = sum(len(line) + 1 for line in descendant_lines)
 
     if rendered_size <= single_call_threshold:
         parts = [header, "REPLIES:", *descendant_lines]
@@ -647,6 +697,34 @@ def _build_mastodon_chunks(
             )
         )
     return chunks
+
+
+def _status_chunk_text(ancestor_lines: list[str], headline: str) -> str:
+    """The status chunk: the ancestors given, oldest first, then the headline."""
+    parts = []
+    if ancestor_lines:
+        parts.append("CONTEXT (ancestors, oldest first):")
+        parts.extend(ancestor_lines)
+        parts.append("")
+    parts.append(headline)
+    return "\n".join(parts).strip()
+
+
+def _nearest_lines_within(lines: list[str], budget: int) -> list[str]:
+    """The longest tail of ``lines`` whose text, one line each, fits ``budget``."""
+    size = 0
+    start = len(lines)
+    while start > 0 and size + len(lines[start - 1]) + 1 <= budget:
+        start -= 1
+        size += len(lines[start]) + 1
+    return lines[start:]
+
+
+def _clip(text: str, limit: int) -> str:
+    """``text`` cut to ``limit`` characters, marked when it was cut."""
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)] + "…"
 
 
 def _chunk_lines_by_size(lines: list[str], chunk_chars: int) -> list[list[str]]:

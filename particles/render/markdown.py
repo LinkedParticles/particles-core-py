@@ -52,6 +52,15 @@ from particles.core.schema import (
 )
 from particles.core.status import Status
 from particles.extraction.polarity import is_non_asserted
+from particles.render.escape import (
+    identifier,
+    md_code_span,
+    md_link_label,
+    md_text,
+    prose_text,
+    synthesized_prose,
+    without_format_chars,
+)
 
 log = logging.getLogger(__name__)
 
@@ -99,43 +108,11 @@ def neutralize_comment_delimiters(text: str) -> str:
     return text.replace("<!--", "&lt;!--").replace("-->", "--&gt;")
 
 
-_LINE_BREAKS = re.compile(r"\s*[\r\n]+\s*")
-
-
-def neutralize_inline_markdown(text: str) -> str:
-    """Stored claim text made inert as one line of exported Markdown.
-
-    A claim is extracted from deposited documents, so it is untrusted. Placed
-    raw in an Obsidian note or a Logseq page it could carry HTML (a remote
-    ``<img>``, a comment that hides the rest of the line), an embed or remote
-    image (``![[…]]``, ``![](https://…)``), a link whose text names one place
-    and whose target is another, a Logseq macro (``{{…}}``), or a line break
-    that leaves the callout or block it sits in (security review D36).
-
-    Every one of those is backslash-escaped, which CommonMark, Obsidian and
-    Logseq render as the literal character, so the claim reads as written.
-    Backslashes are escaped first so the claim cannot cancel an escape. A
-    ``[[wikilink]]`` stays a link, since a link to a subject's note is how the
-    exported graph is navigated.
-    """
-    text = _LINE_BREAKS.sub(" ", text).strip()
-    text = text.replace("\\", "\\\\")
-    text = text.replace("<", "\\<")
-    text = re.sub(r"!(?=\[)", r"\\!", text)
-    text = text.replace("](", "]\\(")
-    return text.replace("{{", "\\{\\{")
-
-
-def neutralize_link_label(text: str) -> str:
-    """Stored text made safe as the visible label of a link the exporter writes.
-
-    A label sits inside ``[[target|label]]`` or ``[label](target)``, where a
-    backslash escape is not reliably honoured, so brackets become parentheses
-    (the label cannot close the link and open another) and ``<`` becomes an
-    entity (security review D36).
-    """
-    text = " ".join(text.split())
-    return text.replace("[", "(").replace("]", ")").replace("<", "&lt;")
+# The neutralizers live in the one escaping module (security review 2026-10-28-1,
+# O1, O2); these names stay for the callers and tests that import them here.
+neutralize_inline_markdown = md_text
+neutralize_synthesized_prose = synthesized_prose
+neutralize_link_label = md_link_label
 
 
 #: Matches *any* BEGIN sentinel, capturing the region name — the harvest-side
@@ -310,13 +287,39 @@ def sanitize_filename(name: str) -> str:
     dots are stripped (no hidden ``.foo`` / bare ``.`` / ``..`` files), and
     a Windows reserved device-name stem (``CON``, ``NUL``, ``COM1`` …) is
     prefixed with a dash so the export file stays writable on every OS.
+
+    Invisible format characters are dropped, so a bidirectional override
+    cannot make a name display with another word order or extension, and a
+    name longer than :data:`_FILENAME_MAX_BYTES` UTF-8 bytes is cut on a
+    character boundary and given a short hash of the whole name, so it still
+    fits a file name (255 bytes on APFS, ext4 and NTFS) with its extension and
+    two long names that share a prefix stay distinct (security review
+    2026-10-28-2, AA29, AA34).
     """
-    cleaned = _INVALID_FS_CHARS.sub("-", name)
+    cleaned = _INVALID_FS_CHARS.sub("-", without_format_chars(name))
     cleaned = _WHITESPACE_RUN.sub(" ", cleaned).strip()
     cleaned = cleaned.replace("..", "-").lstrip(".")
     if cleaned.split(".", 1)[0].upper() in _RESERVED_NAMES:
         cleaned = f"-{cleaned}"
+    if len(cleaned.encode("utf-8")) > _FILENAME_MAX_BYTES:
+        digest = hashlib.sha256(name.encode("utf-8", "surrogatepass")).hexdigest()[:8]
+        head = truncate_utf8(cleaned, _FILENAME_MAX_BYTES - len(digest) - 1).rstrip("-. ")
+        cleaned = f"{head}-{digest}"
     return cleaned or "unnamed"
+
+
+#: The longest file-name stem :func:`sanitize_filename` writes, in UTF-8
+#: bytes: room under the common 255-byte limit for an extension, a
+#: disambiguation suffix and the hidden temporary name an atomic write uses.
+_FILENAME_MAX_BYTES = 200
+
+
+def truncate_utf8(text: str, max_bytes: int) -> str:
+    """The longest prefix of ``text`` whose UTF-8 encoding fits ``max_bytes``."""
+    encoded = text.encode("utf-8", "surrogatepass")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode("utf-8", "ignore")
 
 
 def _sanitize_shard_tail(remainder: str) -> str:
@@ -554,6 +557,10 @@ def build_subject_naming(subjects: Iterable[Subject]) -> SubjectNaming:
 # collision append the narrative's short id. The id suffix is the only qualifier
 # tier and always disambiguates.
 _NARRATIVE_SLUG_MAXLEN = 80
+#: The same cap in UTF-8 bytes, so a label of multi-byte characters still
+#: leaves room for the ``Narratives___`` prefix, an id suffix and the
+#: extension within a file name (security review 2026-10-28-2, AA29).
+_NARRATIVE_SLUG_MAXBYTES = 120
 
 
 def build_narrative_naming(narratives: Iterable[Particle]) -> dict[str, str]:
@@ -567,6 +574,7 @@ def build_narrative_naming(narratives: Iterable[Particle]) -> dict[str, str]:
     base: dict[str, str] = {}
     for n in narratives:
         slug = subject_slug((n.content or "narrative").strip())[:_NARRATIVE_SLUG_MAXLEN]
+        slug = truncate_utf8(slug, _NARRATIVE_SLUG_MAXBYTES)
         base[n.id] = slug.rstrip("-. ") or "narrative"
     counts: dict[str, int] = defaultdict(int)
     for slug in base.values():
@@ -859,7 +867,15 @@ class MarkdownExportLedger:
         ):
             self.skipped.append(resolved)
             return False
-        atomic_write_text(path, content)
+        try:
+            atomic_write_text(path, content)
+        except OSError as exc:
+            # One note the filesystem refuses (a name it cannot hold) costs
+            # only that note, never the rest of the export (security review
+            # 2026-10-28-2, AA29).
+            log.warning("could not write %s: %s", path.name, exc.strerror or type(exc).__name__)
+            self.skipped.append(resolved)
+            return False
         digest = _content_digest(content.encode("utf-8"))
         if self.written_hashes.get(resolved) != digest:
             _append_export_journal(self.root, resolved, digest)
@@ -992,19 +1008,22 @@ def render_particle(particle: Particle, effective_confidence: float | None = Non
 
     lines = [
         f"> [!{callout_type}] {title}",
-        f"> **Content:** {neutralize_inline_markdown(particle.content)}",
-        f"> **Uncertainty:** {particle.uncertainty_nature}",
-        f"> **Asserted by:** {particle.asserted_by}",
+        f"> **Content:** {md_text(particle.content)}",
+        f"> **Uncertainty:** {md_text(str(particle.uncertainty_nature))}",
+        f"> **Asserted by:** {md_text(particle.asserted_by)}",
         f"> **Asserted at:** {particle.asserted_at.isoformat()}",
-        f"> **ID:** `{particle.id}`",
+        f"> **ID:** {md_code_span(particle.id)}",
     ]
 
+    # The asserter, the provenance ids and the status reason are stored text,
+    # each written as one inert line (security review 2026-10-28-1, O1).
     if particle.provenance:
         pref = particle.provenance[0]
-        lines.append(f"> **Source:** {pref.corpus_entry_id} / {pref.snapshot_id or '—'}")
+        source = f"{pref.corpus_entry_id} / {pref.snapshot_id or '—'}"
+        lines.append(f"> **Source:** {md_text(source)}")
 
     if particle.status_reason:
-        lines.append(f"> **Status reason:** {particle.status_reason}")
+        lines.append(f"> **Status reason:** {md_text(str(particle.status_reason))}")
 
     return "\n".join(lines)
 
@@ -1024,8 +1043,8 @@ def render_stance_callout(positions: list[StancePosition]) -> str:
 
     def _row(p: StancePosition) -> str:
         mag = f", magnitude {p.magnitude:.2f}" if p.magnitude is not None else ""
-        short = p.stance_particle_id.split("-")[0]
-        return f"> - {p.holder} (conf {p.effective_confidence:.2f}{mag}) `{short}`"
+        short = identifier(p.stance_particle_id.split("-")[0])
+        return f"> - {md_text(p.holder)} (conf {p.effective_confidence:.2f}{mag}) `{short}`"
 
     lines = ["> [!agreement] Positions on this claim (query-time; not factual confidence)"]
     endorses = [p for p in positions if p.kind == RelationType.ENDORSES]
@@ -1081,8 +1100,9 @@ def render_contested_callout(
             lines.append("> **Stance — disputed by:**")
             for p in disputes:
                 mag = f", magnitude {p.magnitude:.2f}" if p.magnitude is not None else ""
-                short = p.stance_particle_id.split("-")[0]
-                lines.append(f"> - {p.holder} (conf {p.effective_confidence:.2f}{mag}) `{short}`")
+                short = identifier(p.stance_particle_id.split("-")[0])
+                holder = md_text(p.holder)
+                lines.append(f"> - {holder} (conf {p.effective_confidence:.2f}{mag}) `{short}`")
         else:
             lines.append("> **Stance:** at least one holder disputes this claim.")
         if badge.caveat:
@@ -1091,7 +1111,9 @@ def render_contested_callout(
         if reading is not None:
             ordered = sorted(reading.renderings, key=lambda r: (-r.effective_confidence, r.policy))
             lines.append(f"> **Divergence across trust policies (spread {reading.spread:.2f}):**")
-            lines.extend(f"> - **{r.policy}:** {r.effective_confidence:.2f}" for r in ordered)
+            lines.extend(
+                f"> - **{md_text(r.policy)}:** {r.effective_confidence:.2f}" for r in ordered
+            )
         else:
             lines.append(
                 "> **Divergence:** effective confidence spreads across the viewer's "
@@ -1099,7 +1121,7 @@ def render_contested_callout(
             )
     if "inconsistency" in badge.bases and badge.inconsistency_id:
         lines.append(
-            f"> **Inconsistency:** open INCONSISTENCY `{badge.inconsistency_id}` "
+            f"> **Inconsistency:** open INCONSISTENCY {md_code_span(badge.inconsistency_id)} "
             "references this claim."
         )
     lines.append("> _The claim's own confidence is unchanged — disclosure, never a discount._")
@@ -1226,16 +1248,19 @@ def format_memory_bullet(
     inconsistency-only flag unchanged. No timestamp, no volatile field:
     byte-stable for a given input (the §2 idempotent-render belt). HTML comment
     delimiters in ``content`` are escaped, so a belief cannot write a region
-    sentinel (:func:`neutralize_comment_delimiters`).
+    sentinel (:func:`neutralize_comment_delimiters`), and the content is one
+    line whose warning sign is escaped, so stored text cannot forge the
+    contested badge, and whose invisible format characters are dropped
+    (:func:`_inert_bullet`; security review 2026-10-28-2, AA22).
     """
-    flat = neutralize_comment_delimiters(" ".join(content.split()))
-    bases = list(contested_bases)
-    versus = f" (vs. p-{contested_by})" if contested_by else ""
+    flat = neutralize_comment_delimiters(_inert_bullet(content))
+    bases = [b for b in contested_bases if b in _BADGE_BASES]
+    versus = f" (vs. p-{identifier(contested_by)})" if contested_by else ""
     if bases:
-        return f"- ⚠ contested ({', '.join(bases)}) — {flat}{versus} `p-{short_id}`"
+        return f"- ⚠ contested ({', '.join(bases)}) — {flat}{versus} `p-{identifier(short_id)}`"
     if contested_by:
-        return f"- ⚠ contested — {flat}{versus} `p-{short_id}`"
-    return f"- {flat} `p-{short_id}`"
+        return f"- ⚠ contested — {flat}{versus} `p-{identifier(short_id)}`"
+    return f"- {flat} `p-{identifier(short_id)}`"
 
 
 #: One memory-index bullet as :func:`format_memory_bullet` writes it: the
@@ -1256,8 +1281,15 @@ def parse_memory_bullet(line: str) -> tuple[str, list[str]] | None:
     if match is None:
         return None
     raw = match.group("bases")
-    bases = [b.strip() for b in raw.split(",") if b.strip()] if raw else []
+    # Only the badge's own labels are bases: a hand-edited or older bullet
+    # cannot put another word into the exposure record (AA22).
+    bases = [b.strip() for b in raw.split(",") if b.strip() in _BADGE_BASES] if raw else []
     return match.group("id"), bases
+
+
+#: The contested badge's basis labels, the only words a bullet's
+#: bases may hold.
+_BADGE_BASES = frozenset({"stance", "divergence", "inconsistency"})
 
 
 @dataclass(frozen=True)
@@ -1384,22 +1416,29 @@ def render_digest_located(
         "",
     ]
     for e in entries:
-        subjects = f" _({', '.join(e.subjects)})_" if e.subjects else ""
+        # A belief is one line: its stored text and subject names are
+        # flattened, so they cannot add lines that read as the digest's own
+        # bullets or headings (security review 2026-10-26-1, W33, W43).
+        names = ", ".join(_inert_subject_name(name) for name in e.subjects)
+        subjects = f" _({names})_" if e.subjects else ""
         # the composed badge names its fired bases; the INCONSISTENCY
         # id stays as the inconsistency basis's drill-down. A bases-less entry
-        # renders the pre-badge inconsistency-only flag unchanged.
+        # renders the pre-badge inconsistency-only flag unchanged. The badge
+        # leads the claim, as on a memory bullet, so a cut never separates it
+        # from the claim it flags.
         if e.contested_bases:
-            contested = f" · contested ({', '.join(e.contested_bases)})"
+            contested = f"⚠ contested ({', '.join(e.contested_bases)})"
             if e.contested:
                 contested += f" by `{e.contested}`"
+            contested += " — "
         elif e.contested:
-            contested = f" · contested by `{e.contested}`"
+            contested = f"⚠ contested by `{e.contested}` — "
         else:
             contested = ""
         entry_rows.append(len(lines))
         lines.append(
-            f"- **{e.effective_confidence:.2f}** {e.content}{subjects} · "
-            f"{e.asserted_at.date().isoformat()}{contested}"
+            f"- **{e.effective_confidence:.2f}** {contested}{_inert_line(e.content)}{subjects} · "
+            f"{e.asserted_at.date().isoformat()}"
         )
     if shown < total_active:
         lines += [
@@ -1421,19 +1460,83 @@ def render_digest_located(
     return "\n".join(lines) + "\n", [starts[row] for row in entry_rows]
 
 
+def _one_line(text: str) -> str:
+    """``text`` with every run of whitespace, line breaks included, made one
+    space, and no invisible format character."""
+    return " ".join(without_format_chars(text).split())
+
+
+#: The characters a digest line's own markup is made of: emphasis, code spans,
+#: the escape itself, the contested badge's warning sign and the middle dot
+#: that opens the line's date tail.
+_DIGEST_MARKUP = re.compile(r"([\\*_`⚠·])")
+
+
+def _inert_line(text: str) -> str:
+    """``text`` on one line, with the markup a digest line is built from escaped.
+
+    A belief's stored text follows the line's real confidence figure and
+    badge, so unescaped it could carry a second bold figure or a badge of its
+    own that reads as the digest's (security review 2026-10-27-1, W33, W43),
+    or a `` · <date>`` tail that reads as the line's own date. Bidirectional
+    and invisible format characters are dropped, so the line displays in the
+    order it is stored (2026-10-28-2, O28).
+    """
+    return _DIGEST_MARKUP.sub(r"\\\1", _one_line(text))
+
+
+def _inert_subject_name(name: str) -> str:
+    """A subject name as one entry of a digest line's subject list.
+
+    The list is joined with ``, ``, so a comma inside one name is escaped and
+    one subject never reads as two (security review 2026-10-30-1, AB64).
+    """
+    return _inert_line(name).replace(",", "\\,")
+
+
+def inert_listing_text(text: str) -> str:
+    """A belief's stored text as the content of one projected listing bullet.
+
+    The listing a ``particles project`` section writes without synthesis
+    follows each belief with the engine's own short-id handle and confidence
+    figure. The text is one line in the article entity form
+    (:func:`~particles.render.escape.prose_text`), so it carries no HTML,
+    image, embed or invisible character, with the digest line's markup
+    characters escaped, so it cannot imitate a second handle or figure, and
+    with its comment delimiters escaped, so it cannot write a region sentinel
+    (security review N26; 2026-10-30-1, AB22, AB36).
+    """
+    return neutralize_comment_delimiters(_DIGEST_MARKUP.sub(r"\\\1", prose_text(text)))
+
+
+def _inert_bullet(text: str) -> str:
+    """``text`` on one line, with no format character and its warning sign escaped.
+
+    A memory bullet's content follows the badge position, so a leading
+    warning sign would read as the contested badge, to an agent and to
+    :func:`parse_memory_bullet`. Emphasis and code spans are kept: the region
+    is read as an agent's standing memory, its rules quote commands, and the
+    bullet's own short-id handle is always the last one on the line (AA22).
+    """
+    return _one_line(text).replace("⚠", "\\⚠")
+
+
 def render_lint_finding(finding: LintFinding) -> str:
     """Render a single lint finding as a Markdown callout block."""
     callout_type = _SEVERITY_CALLOUT.get(finding.severity, "note")
     ref = finding.particle_id or finding.corpus_entry_id or "—"
     title = f"Lint [{finding.finding_type}] — {finding.severity}"
 
+    # A finding's detail and action carry stored text (a subject's name and
+    # description, a model's explanation), so each is one inert line inside the
+    # callout (security review 2026-10-28-1, O37).
     lines = [
         f"> [!{callout_type}] {title}",
-        f"> **Detail:** {finding.detail}",
-        f"> **Reference:** `{ref}`",
+        f"> **Detail:** {md_text(finding.detail)}",
+        f"> **Reference:** {md_code_span(ref)}",
     ]
     if finding.recommended_action:
-        lines.append(f"> **Action:** {finding.recommended_action}")
+        lines.append(f"> **Action:** {md_text(finding.recommended_action)}")
 
     return "\n".join(lines)
 

@@ -56,7 +56,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           # The floor interpreter — pyproject says requires-python = ">=3.11",
           # so testing there is what makes that claim true.
@@ -84,7 +84,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.11"
           enable-cache: false
@@ -94,9 +94,9 @@ jobs:
       # published, so a different version can fail on a no-op diff. Needs no
       # project install.
       - name: ruff check
-        run: uvx --from 'ruff==0.17.1' ruff check .
+        run: uvx --from 'ruff==0.17.3' ruff check .
       - name: ruff format --check
-        run: uvx --from 'ruff==0.17.1' ruff format --check .
+        run: uvx --from 'ruff==0.17.3' ruff format --check .
 
   reuse:
     name: REUSE licensing
@@ -105,7 +105,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.11"
           enable-cache: false

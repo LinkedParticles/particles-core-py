@@ -219,8 +219,9 @@ class MemoryRelation:
 class ParsedGraph:
     """The result of reading a ``memory.jsonl``.
 
-    ``notes`` carries every line the parser declined, with its number and why.
-    Nothing is silently dropped: a malformed line is a fact about the user's
+    ``notes`` carries each line the parser declined, with its number and why,
+    up to ``_MAX_LINE_NOTES``, then a count of the rest. Nothing is silently
+    dropped: a malformed line is a fact about the user's
     export they are entitled to see, and the verbatim bytes remain in the
     corpus for a later mapper (§3/§4e).
     """
@@ -249,14 +250,31 @@ def _count_unmapped(graph: ParsedGraph, kind: str, record: dict[str, Any]) -> No
         graph.unmapped_fields[label] = graph.unmapped_fields.get(label, 0) + 1
 
 
+#: How many declined lines the parser notes one by one before it only counts
+#: the rest (security review 2026-10-26-1, W25).
+_MAX_LINE_NOTES = 100
+
+
 def parse_memory_jsonl(content: bytes) -> ParsedGraph:
     """Parse a reference-server ``memory.jsonl`` blob.
 
     Tolerant by design — a single bad line must not cost the user their whole
     migration — but never silent: each skip lands in ``ParsedGraph.notes`` and
-    surfaces as an extraction quality note.
+    surfaces as an extraction quality note. The first ``_MAX_LINE_NOTES``
+    skips are noted line by line and the rest as one count, so an export of
+    many bad lines cannot multiply into as many notes (security review
+    2026-10-26-1, W25).
     """
     graph = ParsedGraph()
+    suppressed = 0
+
+    def note(text: str) -> None:
+        nonlocal suppressed
+        if len(graph.notes) < _MAX_LINE_NOTES:
+            graph.notes.append(text)
+        else:
+            suppressed += 1
+
     try:
         text = content.decode("utf-8")
     except UnicodeDecodeError:
@@ -269,27 +287,43 @@ def parse_memory_jsonl(content: bytes) -> ParsedGraph:
         try:
             record = json.loads(line)
         except json.JSONDecodeError as exc:
-            graph.notes.append(f"Line {number}: not valid JSON ({exc.msg}); skipped.")
+            note(f"Line {number}: not valid JSON ({exc.msg}); skipped.")
+            continue
+        except RecursionError:
+            # Nesting deeper than the decoder's stack is malformed input too, so
+            # it costs this line only (security review 2026-10-27-1, G19).
+            note(f"Line {number}: JSON nested too deeply to read; skipped.")
             continue
         if not isinstance(record, dict):
-            graph.notes.append(f"Line {number}: expected a JSON object; skipped.")
+            note(f"Line {number}: expected a JSON object; skipped.")
             continue
 
         kind = record.get("type")
         if kind == "entity":
             name = record.get("name")
             if not isinstance(name, str) or not name.strip():
-                graph.notes.append(f"Line {number}: entity has no usable name; skipped.")
+                note(f"Line {number}: entity has no usable name; skipped.")
                 continue
-            raw_observations = record.get("observations") or []
+            raw_observations = record.get("observations")
+            if raw_observations is None:
+                raw_observations = []
+            if not isinstance(raw_observations, list):
+                # A string would iterate as characters, each kept as an
+                # observation; any other value cannot be read (G19).
+                note(
+                    f"Line {number}: entity {name!r} has observations that are not a list; skipped."
+                )
+                continue
             observations = [o for o in raw_observations if isinstance(o, str) and o.strip()]
             dropped = len(raw_observations) - len(observations)
             if dropped:
-                graph.notes.append(
+                note(
                     f"Line {number}: dropped {dropped} non-string / empty observation(s) "
                     f"from entity {name!r}."
                 )
             entity_type = record.get("entityType")
+            if entity_type is not None and not isinstance(entity_type, str):
+                note(f"Line {number}: entity {name!r} has an entityType that is not text; ignored.")
             _count_unmapped(graph, "entity", record)
             graph.entities.append(
                 MemoryEntity(
@@ -302,9 +336,7 @@ def parse_memory_jsonl(content: bytes) -> ParsedGraph:
         elif kind == "relation":
             src, dst, rel = record.get("from"), record.get("to"), record.get("relationType")
             if not all(isinstance(v, str) and v.strip() for v in (src, dst, rel)):
-                graph.notes.append(
-                    f"Line {number}: relation is missing an endpoint or type; skipped."
-                )
+                note(f"Line {number}: relation is missing an endpoint or type; skipped.")
                 continue
             _count_unmapped(graph, "relation", record)
             graph.relations.append(
@@ -313,8 +345,13 @@ def parse_memory_jsonl(content: bytes) -> ParsedGraph:
                 )
             )
         else:
-            graph.notes.append(f"Line {number}: unknown record type {kind!r}; skipped.")
+            note(f"Line {number}: unknown record type {kind!r}; skipped.")
 
+    if suppressed:
+        graph.notes.append(
+            f"{suppressed} more line(s) were skipped or trimmed past the first "
+            f"{_MAX_LINE_NOTES} noted; the export holds them verbatim."
+        )
     return graph
 
 

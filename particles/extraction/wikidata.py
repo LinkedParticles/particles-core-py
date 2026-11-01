@@ -455,7 +455,14 @@ class WikidataExtractor:
         **kwargs: object,
     ) -> ExtractionResult:
         session: AsyncSession | None = kwargs.get("session")  # type: ignore[assignment]
-        entity = json.loads(content)
+        try:
+            entity = json.loads(content)
+        except (ValueError, RecursionError) as exc:
+            # RecursionError: a blob nested past the decoder's depth (security
+            # review 2026-10-30, AB17).
+            return ExtractionResult(quality_notes=[f"JSON parse error: {type(exc).__name__}"])
+        if not isinstance(entity, dict):
+            return ExtractionResult(quality_notes=["Top-level JSON value is not an object"])
         entity_id: str = entity.get("id", "")
         label: str = entity.get("labels", {}).get("en", entity_id)
         statements: dict[str, list[dict[str, object]]] = entity.get("statements", {})

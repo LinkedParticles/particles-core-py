@@ -121,3 +121,42 @@ class TestRetryOnRateLimit:
                 call, retries=0, backoff_seconds=0, max_wait_seconds=0, label="t"
             )
         assert len(calls) == 1
+
+
+def test_account_level_error_redacts_a_key_its_cause_echoed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Q13 (SECURITY_REVIEW_20261025-1): the wrapped cause's text loses the key."""
+    from particles.llm.errors import AccountLevelLLMError
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-echoed-0000000000")
+    err = AccountLevelLLMError(RuntimeError("401: bad key sk-ant-echoed-0000000000"))
+    assert "sk-ant-echoed-0000000000" not in str(err)
+    assert "[REDACTED]" in str(err)
+
+
+def test_redact_provider_error_scrubs_args_message_body_and_causes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Q13 residual: an SDK exception is scrubbed in place and keeps its type."""
+    from particles.llm.errors import redact_provider_error
+
+    secret = "sk-ant-echoed-1111111111"
+    sent = "client-only-credential-22"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", secret)
+
+    class _SdkError(Exception):
+        def __init__(self, message: str, body: object) -> None:
+            super().__init__(message)
+            self.message = message
+            self.body = body
+            self.status_code = 401
+
+    cause = OSError(f"connect failed for {sent}")
+    err = _SdkError(f"bad key {secret}", {"error": {"message": [f"echo {secret}", sent]}})
+    err.__cause__ = cause
+    assert redact_provider_error(err, [sent]) is err
+    for text in (str(err), err.message, repr(err.body), str(cause)):
+        assert secret not in text
+        assert sent not in text
+    assert err.status_code == 401

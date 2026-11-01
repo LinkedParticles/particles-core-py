@@ -114,15 +114,19 @@ class TestParticlesApiKey:
         # a signal to skip authentication entirely.
         assert get_particles_api_key() == "dev-key"
 
-    def test_returns_empty_string_when_explicitly_empty(
-        self, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize("value", ["", " ", "\t", " \n "])
+    def test_an_empty_or_blank_key_is_no_key(
+        self, monkeypatch: pytest.MonkeyPatch, value: str
     ) -> None:
-        # Matches the prior call-site behaviour: os.environ.get("…", _DEV_KEY)
-        # only falls back when the var is *missing*. An explicit empty value
-        # passes through and is *not* equal to "dev-key", which means auth
-        # is enforced with an empty bearer — i.e. all requests are denied.
-        monkeypatch.setenv("PARTICLES_API_KEY", "")
-        assert get_particles_api_key() == ""
+        # Security review 2026-10-25, the empty-key residual: an empty value
+        # used to pass through as a key, so the startup gate let a non-loopback
+        # bind serve reads to the network. It now reads as no key.
+        monkeypatch.setenv("PARTICLES_API_KEY", value)
+        assert get_particles_api_key() == "dev-key"
+
+    def test_a_real_key_is_returned_unchanged(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("PARTICLES_API_KEY", " padded-secret ")
+        assert get_particles_api_key() == " padded-secret "
 
 
 class TestEngineToken:
@@ -138,6 +142,10 @@ class TestEngineToken:
 
     def test_returns_none_when_empty_string(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("PARTICLES_ENGINE_TOKEN", "")
+        assert get_engine_token_optional() is None
+
+    def test_returns_none_when_blank(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("PARTICLES_ENGINE_TOKEN", "  ")
         assert get_engine_token_optional() is None
 
     def test_independent_of_particles_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -208,3 +216,77 @@ class TestLLMApiKeyOptional:
 
         monkeypatch.delenv("PARTICLES_LLM_API_KEY_DEEPSEEK", raising=False)
         assert get_llm_api_key_optional("deepseek") is None
+
+
+class TestRedactSecrets:
+    """Q13 (SECURITY_REVIEW_20261025-1): known secrets never survive into error text."""
+
+    def test_every_known_secret_is_redacted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from particles.secrets import REDACTED, redact_known_secrets
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-redact-me-0001")
+        monkeypatch.setenv("NUMISTA_API_KEY", "numista-redact-me-0002")
+        monkeypatch.setenv("PARTICLES_LLM_API_KEY_GATEWAY", "gateway-redact-me-0003")
+        monkeypatch.setenv("PARTICLES_ENGINE_TOKEN", "engine-redact-me-0004")
+        monkeypatch.setenv("PARTICLES_OTEL_EXPORTER_HEADERS", "authorization=Bearer otel-0005xx")
+        text = (
+            "invalid api key: sk-ant-redact-me-0001; numista-redact-me-0002 "
+            "gateway-redact-me-0003 engine-redact-me-0004 got otel-0005xx"
+        )
+        out = redact_known_secrets(text)
+        for secret in (
+            "sk-ant-redact-me-0001",
+            "numista-redact-me-0002",
+            "gateway-redact-me-0003",
+            "engine-redact-me-0004",
+            "otel-0005xx",
+        ):
+            assert secret not in out
+        assert out.count(REDACTED) == 5
+
+    def test_a_caller_named_value_is_redacted(self) -> None:
+        from particles.secrets import redact_known_secrets
+
+        assert "built-header-value" not in redact_known_secrets(
+            "echo built-header-value", ["built-header-value"]
+        )
+
+    def test_the_dev_key_sentinel_and_short_values_are_left_alone(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from particles.secrets import redact_known_secrets
+
+        monkeypatch.setenv("PARTICLES_API_KEY", "dev-key")
+        monkeypatch.setenv("GITHUB_API_KEY", "short")
+        text = "use dev-key, a short reply"
+        assert redact_known_secrets(text, ["abc"]) == text
+
+    def test_a_malformed_otlp_header_item_still_counts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from particles.secrets import redact_known_secrets
+
+        monkeypatch.setenv("PARTICLES_OTEL_EXPORTER_HEADERS", "x-api-key: colon-form-secret")
+        assert "colon-form-secret" not in redact_known_secrets("saw colon-form-secret")
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+        "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+        "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+    ],
+)
+def test_the_sdk_otlp_header_values_are_known_secrets(
+    name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q13 (SECURITY_REVIEW_20261026-1): a header the OpenTelemetry SDK sends on its
+    own is scrubbed from an error like the Particles OTLP header secret."""
+    from particles.secrets import redact_known_secrets
+
+    monkeypatch.setenv(name, "authorization=Bearer audit6-otlp-token-0123456789")
+    assert "audit6-otlp-token" not in redact_known_secrets(
+        "collector said: bad token audit6-otlp-token-0123456789"
+    )

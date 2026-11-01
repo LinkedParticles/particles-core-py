@@ -13,6 +13,7 @@ injection and the enable/disable selection in :func:`_toggle_progress_bars`.
 from __future__ import annotations
 
 import importlib
+import re
 from dataclasses import FrozenInstanceError
 
 import numpy as np
@@ -241,3 +242,59 @@ class TestEmbeddingProfile:
         profile = EmbeddingProfile(model="m", dim=1, normalization="l2")
         with pytest.raises(FrozenInstanceError):
             profile.dim = 2  # type: ignore[misc]
+
+
+# --------------------------------------------------------------------------- #
+# The encoder revision is pinned (security review P38)
+# --------------------------------------------------------------------------- #
+def test_the_encoder_is_fetched_at_a_pinned_revision(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hub-side change cannot change which weights an install loads."""
+    import sys
+    import types
+
+    from particles import embeddings as ep
+
+    assert re.fullmatch(r"[0-9a-f]{40}", ep.EMBEDDING_MODEL_REVISION)
+    seen: list[dict[str, object]] = []
+
+    class _ST:
+        def __init__(self, model_id: str, **kwargs: object) -> None:
+            seen.append({"model_id": model_id, **kwargs})
+
+        def encode(self, *a: object, **k: object) -> list[list[float]]:
+            return [[0.0]]
+
+    monkeypatch.setitem(
+        sys.modules, "sentence_transformers", types.SimpleNamespace(SentenceTransformer=_ST)
+    )
+    monkeypatch.setattr(ep, "_hub_refused", lambda: False)
+    original = ep._embedding_model
+    ep.set_embedding_model(None)
+    try:
+        assert ep.get_embedding_model() is not None
+    finally:
+        ep.set_embedding_model(original)
+    assert seen == [{"model_id": ep.EMBEDDING_MODEL_ID, "revision": ep.EMBEDDING_MODEL_REVISION}]
+
+
+def test_offline_load_takes_only_the_pinned_revision() -> None:
+    """Under a refusing posture the encoder loads the pinned revision or nothing (Q58).
+
+    A cache whose ``main`` ref another tool refreshed from the hub would
+    otherwise decide which weights load.
+    """
+    from typing import Any
+
+    from particles import embeddings as ep
+
+    calls: list[dict[str, Any]] = []
+
+    def loader(model_id: str, **kwargs: Any) -> object:
+        calls.append(kwargs)
+        if kwargs.get("revision") == ep.EMBEDDING_MODEL_REVISION:
+            raise OSError("pinned snapshot not in the cache")
+        return object()
+
+    with pytest.raises(OSError, match=ep.EMBEDDING_MODEL_REVISION):
+        ep._load_cached(loader)
+    assert calls == [{"revision": ep.EMBEDDING_MODEL_REVISION, "local_files_only": True}]

@@ -54,7 +54,9 @@ class GitHubGistExtractor:
     ) -> ExtractionResult:
         try:
             data = json.loads(content)
-        except json.JSONDecodeError as exc:
+        except (ValueError, RecursionError) as exc:
+            # RecursionError: a blob nested past the decoder's depth (security
+            # review 2026-10-30, AB17).
             return ExtractionResult(quality_notes=[f"JSON parse error: {exc}"])
         if not isinstance(data, dict):
             return ExtractionResult(quality_notes=["Gist blob is not a JSON object"])

@@ -32,14 +32,15 @@ never cached and never counted as a miss.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import logging
 import socket
 import sys
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 from urllib.parse import urlsplit
 
 from particles.config import NetworkConfig, get_config
@@ -276,32 +277,133 @@ _install_lock = threading.Lock()
 _real_getaddrinfo: Callable[..., Any] | None = None
 
 
+#: Forward lookups: the first argument is the name the resolver is asked for.
+_LOOKUP_EVENTS = frozenset({"socket.getaddrinfo", "socket.gethostbyname"})
+#: Reverse lookups: the argument is an address (or, for ``gethostbyaddr``, a
+#: name it resolves first), and the query goes to the resolver all the same.
+_REVERSE_EVENTS = frozenset({"socket.gethostbyaddr", "socket.getnameinfo"})
+#: Traffic to a destination: a TCP/UDP connect, or a datagram sent to an
+#: address without a connect (``sendto`` / ``sendmsg`` on an unconnected socket).
+_SEND_EVENTS = frozenset({"socket.connect", "socket.sendto", "socket.sendmsg"})
+_WATCHED_EVENTS = _LOOKUP_EVENTS | _REVERSE_EVENTS | _SEND_EVENTS
+
+
+def _text(host: Any) -> str | None:
+    if isinstance(host, bytes):
+        return host.decode("ascii", "replace")
+    return host if isinstance(host, str) else None
+
+
 def _audit_hook(event: str, args: tuple[Any, ...]) -> None:
-    if event != "socket.connect" and event != "socket.getaddrinfo":
+    if event not in _WATCHED_EVENTS:
         return
     policy = _backstop_policy
     if policy is None:
         return
-    if event == "socket.getaddrinfo":
-        host = args[0]
-        if isinstance(host, bytes):
-            host = host.decode("ascii", "replace")
-        if isinstance(host, str) and host and not policy.allows_lookup(host):
+    if event in _LOOKUP_EVENTS:
+        host = _text(args[0])
+        if host and not policy.allows_lookup(host):
             raise EgressRefused(normalize_host(host), None, "name lookup", policy.posture)
+        return
+    if event in _REVERSE_EVENTS:
+        target = args[0]
+        if isinstance(target, tuple) and target:
+            target = target[0]
+        name = _text(target)
+        if name is None or not name:
+            return
+        # A reverse lookup of an address the posture admits (or of a listed
+        # name) is the resolver traffic an admitted destination already
+        # implies; any other is a query the posture never allowed.
+        admitted = (
+            policy.admits(name, None)
+            if _ip_or_none(name) is not None
+            else policy.allows_lookup(name)
+        )
+        if not admitted:
+            raise EgressRefused(normalize_host(name), None, "reverse lookup", policy.posture)
         return
     sock, address = args[0], args[1]
     if getattr(sock, "family", None) not in (socket.AF_INET, socket.AF_INET6):
         return
+    # ``sendto`` / ``sendmsg`` on a connected socket carry no address; the
+    # connect that fixed the destination was checked already.
     if not isinstance(address, tuple) or len(address) < 2:
         return
+    purpose = "connection" if event == "socket.connect" else "datagram"
     host, port = str(address[0]), address[1]
     port = port if isinstance(port, int) else None
     if _ip_or_none(host) is None:
         if not policy.allows(host, port):
-            raise EgressRefused(normalize_host(host), port, "connection", policy.posture)
+            raise EgressRefused(normalize_host(host), port, purpose, policy.posture)
         return
     if not policy.admits(host, port):
-        raise EgressRefused(normalize_host(host), port, "connection", policy.posture)
+        raise EgressRefused(normalize_host(host), port, purpose, policy.posture)
+
+
+def _refuse_named_destination(sock: Any, address: Any, purpose: str) -> None:
+    """Judge a connect or send that names a host, before the name is resolved (Q44).
+
+    CPython resolves the host of a ``connect`` / ``sendto`` address inside the
+    C call, before it raises the audit event and without raising a lookup
+    event, so by the time :func:`_audit_hook` sees a named destination its DNS
+    query has already left the host. This runs first, from the Python-level
+    wrappers :func:`ensure_backstop` puts on :class:`socket.socket`. An address
+    literal is left to the audit hook, which judges it after the call.
+    """
+    policy = _backstop_policy
+    if policy is None:
+        return
+    if getattr(sock, "family", None) not in (socket.AF_INET, socket.AF_INET6):
+        return
+    if not isinstance(address, tuple) or len(address) < 2:
+        return
+    host = _text(address[0])
+    if not host or _ip_or_none(host) is not None:
+        return
+    port = address[1] if isinstance(address[1], int) else None
+    if not policy.allows(host, port):
+        raise EgressRefused(normalize_host(host), port, purpose, policy.posture)
+
+
+def _guard_socket_methods() -> None:
+    """Wrap the ``socket.socket`` calls that take a destination (Q44)."""
+    real_connect = socket.socket.connect
+    real_connect_ex = socket.socket.connect_ex
+    real_sendto = socket.socket.sendto
+    # Windows has no sendmsg.
+    real_sendmsg: Callable[..., int] | None = getattr(socket.socket, "sendmsg", None)
+
+    def connect(self: socket.socket, address: Any) -> None:
+        _refuse_named_destination(self, address, "connection")
+        real_connect(self, address)
+
+    def connect_ex(self: socket.socket, address: Any) -> int:
+        _refuse_named_destination(self, address, "connection")
+        return real_connect_ex(self, address)
+
+    def sendto(self: socket.socket, data: Any, *args: Any) -> int:
+        # sendto(data, address) or sendto(data, flags, address).
+        if args:
+            _refuse_named_destination(self, args[-1], "datagram")
+        return real_sendto(self, data, *args)
+
+    def sendmsg(self: socket.socket, buffers: Any, *args: Any) -> int:
+        # sendmsg(buffers, ancdata, flags, address): the address is fourth.
+        if len(args) >= 3:
+            _refuse_named_destination(self, args[2], "datagram")
+        assert real_sendmsg is not None
+        return real_sendmsg(self, buffers, *args)
+
+    wrappers: list[tuple[str, Callable[..., Any]]] = [
+        ("connect", connect),
+        ("connect_ex", connect_ex),
+        ("sendto", sendto),
+    ]
+    if real_sendmsg is not None:
+        wrappers.append(("sendmsg", sendmsg))
+    for name, wrapper in wrappers:
+        setattr(socket.socket, name, wrapper)
 
 
 def _recording_getaddrinfo(host: Any, port: Any, *args: Any, **kwargs: Any) -> Any:
@@ -320,9 +422,11 @@ def ensure_backstop() -> None:
     Called by each process entry point beside ``setup_observability``. Under
     ``open`` it disarms (the hook stays installed, since an audit hook cannot be
     removed, but does nothing). Under a refusing posture it installs, once, an
-    audit hook refusing lookups and connects the policy does not admit, and a
-    wrapper around :func:`socket.getaddrinfo` that admits the addresses a
-    listed name resolves to.
+    audit hook refusing the forward and reverse lookups, connects and unconnected
+    datagram sends the policy does not admit, a wrapper around
+    :func:`socket.getaddrinfo` that admits the addresses a listed name resolves
+    to, and wrappers on the :class:`socket.socket` calls that take a destination,
+    which refuse a named host before CPython resolves it (Q44).
     """
     global _backstop_policy, _backstop_installed, _real_getaddrinfo
     policy = current_policy()
@@ -333,10 +437,99 @@ def ensure_backstop() -> None:
         if not _backstop_installed:
             _real_getaddrinfo = socket.getaddrinfo
             socket.getaddrinfo = _recording_getaddrinfo
+            _guard_socket_methods()
             sys.addaudithook(_audit_hook)
             _backstop_installed = True
         _backstop_policy = policy
+    _prefer_selector_loop()
     log.debug("egress backstop armed: network.egress=%s", policy.posture)
+
+
+def _prefer_selector_loop() -> None:
+    """On Windows, make the loops this process creates selector loops (Q15).
+
+    Windows' default loop is the proactor loop, whose connects go through
+    ``ConnectEx`` / ``WSAConnect`` on the raw descriptor rather than
+    ``socket.socket.connect``, so the audit hook never sees them. Every entry
+    point arms the backstop before it starts its loop, so setting the selector
+    policy here keeps a refusing posture on a loop the hook covers. A no-op on
+    every other platform, whose default loop is already a selector loop.
+    """
+    if sys.platform == "win32":
+        import warnings
+
+        with warnings.catch_warnings():
+            # The policy API is deprecated from Python 3.14 and still honoured.
+            warnings.simplefilter("ignore", DeprecationWarning)
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+
+class UncoveredEventLoop(RuntimeError):
+    """A refusing posture is armed on an event loop the backstop cannot see."""
+
+
+def require_covered_loop() -> None:
+    """Refuse to run a refusing posture on an event loop whose sockets skip the hook.
+
+    The backstop sees connects made through Python's ``socket`` module. A
+    stdlib selector loop makes them there. uvloop opens its sockets in libuv,
+    which raises no audit event, and Windows' proactor loop connects through
+    ``ConnectEx`` on the raw descriptor, so under either the posture would hold
+    only at the checked transports (security review 2026-10-25, Q15). Only a
+    selector loop is admitted. ``engine serve`` picks one itself; a raw
+    ``uvicorn`` launch with ``uvicorn[standard]`` installed picks uvloop, and
+    this is what stops it (B49). A no-op under ``open`` and outside a running
+    loop.
+    """
+    policy = current_policy()
+    if not policy.refusing:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if isinstance(loop, asyncio.selector_events.BaseSelectorEventLoop):
+        return
+    kind = f"{type(loop).__module__}.{type(loop).__qualname__}"
+    raise UncoveredEventLoop(
+        f"network.egress is {policy.posture}, and the event loop is {kind}, whose "
+        "sockets the no-egress backstop cannot see. Start the engine with "
+        "`particles engine serve`, or pass `--loop asyncio:SelectorEventLoop` "
+        "to uvicorn."
+    )
+
+
+_T = TypeVar("_T")
+
+
+async def on_covered_loop(coro: Coroutine[Any, Any, _T]) -> _T:
+    """Await ``coro`` once :func:`require_covered_loop` admits the running loop.
+
+    A refused loop closes ``coro`` unstarted and raises :class:`UncoveredEventLoop`.
+    """
+    try:
+        require_covered_loop()
+    except UncoveredEventLoop:
+        coro.close()
+        raise
+    return await coro
+
+
+def run_armed(coro: Coroutine[Any, Any, _T]) -> _T:
+    """Run ``coro`` under :func:`asyncio.run` with the backstop armed and its loop covered.
+
+    For every process entry point that starts its own loop (the CLI's ``run()``,
+    the hooks, the diagnostics' probes; security review 2026-10-26-1, D18, U13).
+    Raises :class:`UncoveredEventLoop` before ``coro`` starts when a refusing
+    posture would run on a loop the backstop cannot see, and whatever loading
+    the config raises; each caller handles both under its own error contract.
+    """
+    try:
+        ensure_backstop()
+    except BaseException:
+        coro.close()
+        raise
+    return asyncio.run(on_covered_loop(coro))
 
 
 def disarm_backstop() -> None:

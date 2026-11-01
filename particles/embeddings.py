@@ -35,6 +35,7 @@ from opentelemetry import trace
 
 from particles import egress
 from particles.config import get_config
+from particles.http import hub_client
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +52,12 @@ _tracer = trace.get_tracer("particles.embeddings")
 # changes this constant, which makes every previously-stored vector read as
 # stale (prompting a re-embed) instead of silently corrupting query results.
 EMBEDDING_MODEL_ID = "all-MiniLM-L6-v2"
+
+# The hub commit of that model this release loads. Pinned, so a change on the
+# hub cannot change which weights an install, or the published image, loads
+# (security review P38). Move it deliberately: new weights can move vectors
+# while the id above stays the same.
+EMBEDDING_MODEL_REVISION = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
 
 
 def get_embedding_model_id() -> str:
@@ -207,14 +214,26 @@ class _TracingEmbeddingModel(EmbeddingModel):
         # opted back in (embeddings.progress_bars). setdefault so an explicit
         # caller override still wins.
         kwargs.setdefault("show_progress_bar", get_config().embeddings.progress_bars)
-        with _tracer.start_as_current_span("embed.encode") as span, _encode_lock:
+        # The exception's type alone, never its message (security review
+        # 2026-10-26-1, R7).
+        with (
+            _tracer.start_as_current_span(
+                "embed.encode", record_exception=False, set_status_on_exception=False
+            ) as span,
+            _encode_lock,
+        ):
             span.set_attribute("embed.count", len(texts))
-            result: Any = self._inner.encode(
-                texts,
-                convert_to_numpy=convert_to_numpy,
-                normalize_embeddings=normalize_embeddings,
-                **kwargs,
-            )
+            try:
+                result: Any = self._inner.encode(
+                    texts,
+                    convert_to_numpy=convert_to_numpy,
+                    normalize_embeddings=normalize_embeddings,
+                    **kwargs,
+                )
+            except Exception as exc:
+                span.set_attribute("error.type", type(exc).__name__)
+                span.set_status(trace.Status(trace.StatusCode.ERROR))
+                raise
             return result  # type: ignore[no-any-return]
 
     def __getattr__(self, name: str) -> Any:
@@ -233,6 +252,23 @@ def _hub_refused() -> bool:
     """Whether ``network.egress`` refuses the Hugging Face Hub."""
     policy = egress.current_policy()
     return policy.refusing and not policy.allows(*egress.HUGGINGFACE_HOST)
+
+
+def _use_hub_client_writing_no_key_log() -> None:
+    """Have ``huggingface_hub`` download through :func:`particles.http.hub_client`.
+
+    Its default client verifies with :func:`ssl.create_default_context` under
+    ``SSL_CERT_FILE`` or ``SSL_CERT_DIR``, which honours an inherited
+    ``SSLKEYLOGFILE`` on the session with the Hub and on the hop to an
+    ``https://`` proxy (security review 2026-10-30-1). The factory is the
+    process's, so an embedding application's own Hub calls get it too: the
+    same client, with the key log off.
+    """
+    try:
+        from huggingface_hub import set_client_factory
+    except ImportError:  # an older hub: it downloads through requests, not httpx2
+        return
+    set_client_factory(hub_client)
 
 
 def _toggle_progress_bars(module_name: str, enable: str, disable: str, show: bool) -> None:
@@ -272,6 +308,24 @@ def _apply_progress_bar_config() -> None:
     )
 
 
+def _load_cached(loader: Any) -> Any:
+    """Load the pinned revision of the encoder from the local cache only.
+
+    Never the cache's ``main`` ref: that names whatever another tool last
+    fetched from the hub, so it would decide which weights load (security
+    review Q58). A cache holding only another revision loads nothing, and the
+    caller disables semantic features with the reason.
+    """
+    try:
+        return loader(EMBEDDING_MODEL_ID, revision=EMBEDDING_MODEL_REVISION, local_files_only=True)
+    except Exception as exc:
+        raise OSError(
+            f"revision {EMBEDDING_MODEL_REVISION} of {EMBEDDING_MODEL_ID} is not in the local "
+            "cache; fetch it once with huggingface.co allowed (`hf download "
+            f"sentence-transformers/{EMBEDDING_MODEL_ID} --revision {EMBEDDING_MODEL_REVISION}`)"
+        ) from exc
+
+
 def get_embedding_model() -> EmbeddingModel | None:
     """Return the shared SentenceTransformer instance (lazy-loaded).
 
@@ -293,12 +347,22 @@ def get_embedding_model() -> EmbeddingModel | None:
             )
 
             _apply_progress_bar_config()
-            with _tracer.start_as_current_span("embed.load") as span:
+            with _tracer.start_as_current_span(
+                "embed.load", record_exception=False, set_status_on_exception=False
+            ) as span:
                 span.set_attribute("embed.model_id", EMBEDDING_MODEL_ID)
-                if offline:
-                    inner = SentenceTransformer(EMBEDDING_MODEL_ID, local_files_only=True)  # type: ignore[no-untyped-call,unused-ignore]
-                else:
-                    inner = SentenceTransformer(EMBEDDING_MODEL_ID)  # type: ignore[no-untyped-call,unused-ignore]
+                try:
+                    if offline:
+                        inner = _load_cached(SentenceTransformer)
+                    else:
+                        _use_hub_client_writing_no_key_log()
+                        inner = SentenceTransformer(  # type: ignore[no-untyped-call,unused-ignore]
+                            EMBEDDING_MODEL_ID, revision=EMBEDDING_MODEL_REVISION
+                        )
+                except Exception as exc:
+                    span.set_attribute("error.type", type(exc).__name__)
+                    span.set_status(trace.Status(trace.StatusCode.ERROR))
+                    raise
             _embedding_model = _TracingEmbeddingModel(inner)
             log.info("Loaded embedding model %s", EMBEDDING_MODEL_ID)
         except Exception as exc:

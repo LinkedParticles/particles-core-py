@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from collections.abc import Iterator
 from typing import Any
@@ -35,6 +36,7 @@ from particles.extraction.general import (  # noqa: F401
     ExtractionResult,
     NormalizedDocument,
     _call_llm,
+    paragraph_spans,
 )
 from particles.extraction.incremental import ChunkUnit, extract_with_carry_forward
 from particles.http import SourceFetchError
@@ -42,6 +44,7 @@ from particles.url_safety import (
     Resolver,
     UnsafeUrlError,
     format_connect_pin,
+    pinned_subprocess_env,
     resolve_and_pin,
 )
 
@@ -49,7 +52,7 @@ log = logging.getLogger(__name__)
 
 SOURCE_TYPE = "REDDIT_POST"
 EXTRACTOR_ID = "reddit-extractor"
-EXTRACTOR_VERSION = "0.3.1"
+EXTRACTOR_VERSION = "0.3.2"
 # 0.2.0: chunked LLM extraction via extract_with_carry_forward;
 #        raised top_comment_count default 30→200 and comment_body_limit
 #        500→1000; emits REDDIT_COMMENT_LIMIT_HIT quality note.
@@ -59,6 +62,10 @@ EXTRACTOR_VERSION = "0.3.1"
 #        the LLM (`ExtremeAddict` → `u/ExtremeAddict`,
 #        `scifi` → `r/scifi`) so the Obsidian exporter's path-nesting
 #        rule routes them under `reddit.com/u/…` / `reddit.com/r/…`.
+# 0.3.2: a self-post body past single_call_threshold_chars is split into
+#        parts of comment_chunk_chars, and every comment line is clipped to
+#        that budget, so no model call is larger than the configured budget
+#        plus a header (security review 2026-10-30, AB18).
 DEFAULT_TRUST_WEIGHT = 0.40
 
 APPLICABILITY = [
@@ -70,9 +77,12 @@ APPLICABILITY = [
     )
 ]
 
+# No segment admits ``[ ] { }``: curl reads them as a URL glob, so one
+# deposited URL would fan out into many requests (security review 2026-10-25,
+# Q18; the curl calls below also pass ``--globoff``).
 _REDDIT_URL_RE = re.compile(
     r"https?://(?:www\.|old\.)?reddit\.com"
-    r"/r/(?P<sub>[^/]+)/comments/(?P<id>[^/]+)(?:/[^/]*)?"
+    r"/r/(?P<sub>[^/\[\]{}]+)/comments/(?P<id>[^/\[\]{}]+)(?:/[^/\[\]{}]*)?"
     r"/?$"
 )
 
@@ -84,7 +94,8 @@ _REDDIT_URL_RE = re.compile(
 # canonical-permalink validator (the open-redirect oracle) and must continue to
 # reject `/s/` forms so the post-resolution guard actually proves something.
 _REDDIT_SHARE_URL_RE = re.compile(
-    r"https?://(?:www\.|old\.)?reddit\.com/r/(?P<sub>[^/]+)/s/(?P<shareid>[^/?#]+)/?(?:[?#].*)?$"
+    r"https?://(?:www\.|old\.)?reddit\.com/r/(?P<sub>[^/\[\]{}]+)"
+    r"/s/(?P<shareid>[^/?#\[\]{}]+)/?(?:[?#][^\[\]{}]*)?$"
 )
 
 # Matches the leading post-permalink segments of a resolved Reddit path, so a
@@ -206,6 +217,14 @@ async def _fetch_with_curl(url: str, *, resolve: Resolver | None = None) -> byte
 
     proc = await asyncio.create_subprocess_exec(
         "curl",
+        # -q must come first: it stops curl reading ~/.curlrc, which could
+        # name a proxy or a --resolve of its own (P43).
+        "-q",
+        # The URL is the caller's: never expand a ``[a-b]`` / ``{a,b}`` glob
+        # in it into many requests (Q18).
+        "--globoff",
+        "--noproxy",
+        "*",
         "-sS",
         "--fail",
         "--proto",
@@ -226,6 +245,7 @@ async def _fetch_with_curl(url: str, *, resolve: Resolver | None = None) -> byte
         url,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=pinned_subprocess_env(os.environ),
     )
     stdout, stderr = await proc.communicate()
     if proc.returncode != 0:
@@ -317,6 +337,14 @@ async def _resolve_reddit_redirect(url: str, *, resolve: Resolver | None = None)
     pin = _curl_resolve_args(url, resolve)
     proc = await asyncio.create_subprocess_exec(
         "curl",
+        # -q must come first: it stops curl reading ~/.curlrc, which could
+        # name a proxy or a --resolve of its own (P43).
+        "-q",
+        # The URL is the caller's: never expand a ``[a-b]`` / ``{a,b}`` glob
+        # in it into many requests (Q18).
+        "--globoff",
+        "--noproxy",
+        "*",
         "-sS",
         "--fail",  # 4xx/5xx → non-zero exit; a 3xx redirect is NOT a failure
         "--proto",
@@ -326,6 +354,8 @@ async def _resolve_reddit_redirect(url: str, *, resolve: Resolver | None = None)
         "--max-redirs",
         "0",  # never follow — read the first-hop Location and validate it ourselves
         *pin,
+        "--max-filesize",
+        str(cfg.max_bytes),
         "--max-time",
         str(cfg.timeout_seconds),
         "-o",
@@ -337,6 +367,7 @@ async def _resolve_reddit_redirect(url: str, *, resolve: Resolver | None = None)
         url,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=pinned_subprocess_env(os.environ),
     )
     stdout, stderr = await proc.communicate()
     if proc.returncode != 0:
@@ -402,7 +433,9 @@ class RedditExtractor:
         """
         try:
             data = json.loads(content)
-        except json.JSONDecodeError as exc:
+        except (ValueError, RecursionError) as exc:
+            # RecursionError: a blob nested past the decoder's depth
+            # (security review 2026-10-30, AB17).
             return NormalizedDocument(quality_notes=[f"JSON parse error: {exc}"])
 
         post = _get_post(data)
@@ -666,6 +699,23 @@ def _count_unsettled_below_floor(data: Any) -> tuple[int, int]:
     return dropped, total
 
 
+# Characters a header line of the body chunk may hold: past Reddit's own
+# 300-character title limit, so a real post renders unchanged.
+_HEADER_LINE_CHARS = 400
+
+
+def _render_reddit_head(post: dict[str, Any]) -> list[str]:
+    """The thread's title and byline lines, each clipped to ``_HEADER_LINE_CHARS``."""
+    subreddit = post.get("subreddit", "unknown")
+    title = post.get("title", "")
+    author = post.get("author", "")
+    score = post.get("score", 0)
+    return [
+        _clip(f"REDDIT THREAD: r/{subreddit} — {title}", _HEADER_LINE_CHARS),
+        _clip(f"Posted by u/{author} [score: {score}]", _HEADER_LINE_CHARS),
+    ]
+
+
 def _render_reddit_body(post: dict[str, Any]) -> str:
     """The body chunk's text — post title and selftext only, no comments.
 
@@ -673,43 +723,73 @@ def _render_reddit_body(post: dict[str, Any]) -> str:
     chunk is the prime candidate for carry-forward when only comments
     have changed.
     """
-    subreddit = post.get("subreddit", "unknown")
-    title = post.get("title", "")
-    author = post.get("author", "")
-    score = post.get("score", 0)
     body = post.get("selftext", "").strip()
-
-    lines = [
-        f"REDDIT THREAD: r/{subreddit} — {title}",
-        f"Posted by u/{author} [score: {score}]",
-    ]
+    lines = _render_reddit_head(post)
     if body:
         lines.append("")
         lines.append(body)
     return "\n".join(lines)
 
 
-def _render_reddit_comment_lines(comments: list[dict[str, Any]], body_limit: int) -> list[str]:
-    return [f"[score:{c['score']}] u/{c['author']}: {c['body'][:body_limit]}" for c in comments]
+def _build_reddit_body_chunks(
+    post: dict[str, Any], single_call_threshold: int, chunk_chars: int
+) -> list[ChunkUnit]:
+    """The body chunk, or the body split into parts when it passes the threshold.
+
+    A self-post longer than ``single_call_threshold`` went to the model in
+    one call (security review 2026-10-30, AB18). It is split on paragraph
+    breaks into parts of at most ``chunk_chars`` (and never more than the
+    threshold), each under the thread's title and byline, so no part is
+    larger than the budget plus that header.
+    """
+    body_text = _render_reddit_body(post)
+    if not body_text.strip():
+        return []
+    if len(body_text) <= single_call_threshold:
+        return [ChunkUnit(chunk_id="body", chunk_text=body_text)]
+    body = post.get("selftext", "").strip()
+    head = "\n".join(_render_reddit_head(post))
+    spans = paragraph_spans(body, max(1, min(chunk_chars, single_call_threshold)))
+    total = len(spans)
+    return [
+        ChunkUnit(
+            chunk_id=f"body_{i}_of_{total}",
+            chunk_text=f"{head}\nPOST BODY (part {i}/{total}):\n\n{body[start:end]}",
+        )
+        for i, (start, end) in enumerate(spans, start=1)
+    ]
 
 
-def _chunk_reddit_comments_by_size(
-    comments: list[dict[str, Any]], chunk_chars: int, body_limit: int
-) -> list[list[dict[str, Any]]]:
-    """Group reddit comments into chunks whose rendered text fits the budget."""
-    chunks: list[list[dict[str, Any]]] = []
-    current: list[dict[str, Any]] = []
+def _clip(text: str, limit: int) -> str:
+    """``text`` cut to ``limit`` characters, marked when it was cut."""
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)] + "…"
+
+
+def _render_reddit_comment_lines(
+    comments: list[dict[str, Any]], body_limit: int, line_limit: int | None = None
+) -> list[str]:
+    """One line per comment, its body cut to ``body_limit`` and the line to ``line_limit``."""
+    lines = [f"[score:{c['score']}] u/{c['author']}: {c['body'][:body_limit]}" for c in comments]
+    if line_limit is None:
+        return lines
+    return [_clip(line, line_limit) for line in lines]
+
+
+def _chunk_lines_by_size(lines: list[str], chunk_chars: int) -> list[list[str]]:
+    """Greedy line grouping such that each group fits within ``chunk_chars``."""
+    chunks: list[list[str]] = []
+    current: list[str] = []
     current_size = 0
-    for c in comments:
-        body = c.get("body") or ""
-        # Overhead per line: "[score:N] u/{author}: " ≈ 30 chars
-        rendered_size = min(len(body), body_limit) + 30
-        if current and current_size + rendered_size > chunk_chars:
+    for line in lines:
+        size = len(line) + 1  # +1 for the newline separator
+        if current and current_size + size > chunk_chars:
             chunks.append(current)
             current = []
             current_size = 0
-        current.append(c)
-        current_size += rendered_size
+        current.append(line)
+        current_size += size
     if current:
         chunks.append(current)
     return chunks
@@ -724,43 +804,39 @@ def _build_reddit_chunks(
 ) -> list[ChunkUnit]:
     """Produce ChunkUnits for a reddit thread (body + 0-or-more comment chunks).
 
-    The body chunk is always its own unit; comment chunks are sized
-    adaptively, mirroring the gist extractor's strategy. A context header
-    on each comment chunk names the subreddit and post title so
-    paraphrased referents stay resolvable when chunks are extracted in
+    The body is its own unit, split into parts past the threshold; comment
+    chunks are sized adaptively, mirroring the gist extractor's strategy.
+    Every comment line is clipped to the chunk budget, so no chunk is larger
+    than the budget plus its header (security review 2026-10-30, AB18). A
+    context header on each comment chunk names the subreddit and post title
+    so paraphrased referents stay resolvable when chunks are extracted in
     isolation.
     """
-    chunks: list[ChunkUnit] = []
-    body_text = _render_reddit_body(post)
-    if body_text.strip():
-        chunks.append(ChunkUnit(chunk_id="body", chunk_text=body_text))
+    chunks = _build_reddit_body_chunks(post, single_call_threshold, chunk_chars)
 
     if not comments:
         return chunks
 
     subreddit = post.get("subreddit", "unknown")
     title = post.get("title", "")
-    header = f"# Context: comments on r/{subreddit} thread — {title[:120]}"
+    header = _clip(
+        f"# Context: comments on r/{subreddit} thread — {title[:120]}", _HEADER_LINE_CHARS
+    )
+    lines = _render_reddit_comment_lines(
+        comments, body_limit, max(1, min(chunk_chars, single_call_threshold))
+    )
 
-    rendered_size = sum(min(len(c.get("body") or ""), body_limit) + 30 for c in comments)
+    rendered_size = sum(len(line) + 1 for line in lines)
 
     if rendered_size <= single_call_threshold:
-        parts = [
-            header,
-            "TOP COMMENTS:",
-            *_render_reddit_comment_lines(comments, body_limit),
-        ]
+        parts = [header, "TOP COMMENTS:", *lines]
         chunks.append(ChunkUnit(chunk_id="comments", chunk_text="\n".join(parts)))
         return chunks
 
-    sub_chunks = _chunk_reddit_comments_by_size(comments, chunk_chars, body_limit)
+    sub_chunks = _chunk_lines_by_size(lines, chunk_chars)
     total = len(sub_chunks)
     for i, sub_chunk in enumerate(sub_chunks, start=1):
-        text_parts = [
-            header,
-            f"TOP COMMENTS (chunk {i}/{total}):",
-            *_render_reddit_comment_lines(sub_chunk, body_limit),
-        ]
+        text_parts = [header, f"TOP COMMENTS (chunk {i}/{total}):", *sub_chunk]
         chunks.append(
             ChunkUnit(
                 chunk_id=f"comments_{i}_of_{total}",

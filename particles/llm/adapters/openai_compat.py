@@ -364,7 +364,7 @@ class OpenAICompatProvider:
             # Config-load validation prevents this for registry-resolved
             # providers; a directly-constructed instance can still miss.
             raise CompletionError(f"no llm.providers entry named {self.name!r}") from None
-        api_key = get_llm_api_key_optional(self.name)
+        api_key = get_llm_api_key_optional(self.name, endpoint=cfg.base_url)
 
         # Structured output: only schema-carrying enforcement is
         # used — OpenAI's schemaless ``json_object`` mode forces an object root

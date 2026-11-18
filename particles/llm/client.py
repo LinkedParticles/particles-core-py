@@ -8,7 +8,8 @@ The ``AnthropicProvider`` adapter (``particles/llm/adapters/anthropic.py``) is
 the only production caller of ``get_client()``; every completion call site
 reaches the model through the :class:`CompletionProvider` port, not
 this client directly. ``ANTHROPIC_API_KEY`` is read at first use and the
-client is cached for the process lifetime.
+client is cached for the process lifetime. Explicit scheduled profiles instead
+use a context-local cache that is closed on exit and keyed by endpoint.
 
 Tests override the client via ``set_client()``; passing ``None`` clears the
 cache so the next ``get_client()`` rebuilds against the current environment.
@@ -22,7 +23,9 @@ import logging
 import socket
 import ssl
 import sys
+import threading
 from functools import cache
+from typing import cast
 
 import anthropic
 from anthropic._utils._httpx import get_environment_proxies
@@ -30,12 +33,18 @@ from anthropic._utils._httpx import get_environment_proxies
 from particles.config import get_config
 from particles.http import egress_request_hook, httpx2_tls_context, proxy_mounts_writing_no_key_log
 from particles.llm.registry import PlaintextKeyRefused
-from particles.secrets import get_anthropic_api_key, get_anthropic_base_url_optional
+from particles.secrets import (
+    get_anthropic_api_key,
+    get_anthropic_base_url_optional,
+    scheduled_client_cache,
+)
 from particles.url_safety import is_cleartext_remote, url_without_userinfo
 
 log = logging.getLogger(__name__)
 
 _client: anthropic.Anthropic | None = None
+_client_injected = False
+_client_lock = threading.RLock()
 
 
 @cache
@@ -49,7 +58,7 @@ def _warn_plaintext_key_once(base_url: str) -> None:
     )
 
 
-def _check_plaintext_base_url() -> None:
+def _check_plaintext_base_url(base_url: str | None = None) -> None:
     """Refuse the key for a cleartext, non-loopback ``ANTHROPIC_BASE_URL`` (Q14).
 
     The rule the OpenAI-compatible adapter applies to an entry's key (N12) and
@@ -59,7 +68,7 @@ def _check_plaintext_base_url() -> None:
     unless the operator set ``llm.anthropic_allow_plaintext_key``, in which case
     it warns once.
     """
-    base_url = get_anthropic_base_url_optional()
+    base_url = base_url or get_anthropic_base_url_optional()
     if base_url is None or not is_cleartext_remote(base_url):
         return
     if get_config().llm.anthropic_allow_plaintext_key:
@@ -86,8 +95,18 @@ def get_client() -> anthropic.Anthropic:
     ``ANTHROPIC_BASE_URL`` would carry the key over cleartext to a remote host.
     """
     global _client
-    if _client is None:
-        _check_plaintext_base_url()
+    with _client_lock:
+        if _client_injected and _client is not None:
+            return _client
+        endpoint = get_anthropic_base_url_optional() or "https://api.anthropic.com"
+        scoped = scheduled_client_cache("anthropic")
+        if scoped is not None:
+            cached = scoped.get(endpoint)
+            if cached is not None:
+                return cast(anthropic.Anthropic, cached)
+        elif _client is not None:
+            return _client
+        _check_plaintext_base_url(endpoint)
         # The SDK's own client factory, so every SDK default (timeout, limits,
         # keepalive, proxies) stands; the request hook adds the no-egress check
         # on every request. Redirects are not followed: anthropic
@@ -115,8 +134,9 @@ def get_client() -> anthropic.Anthropic:
         # to an ``https://`` proxy, which then falls back to that same default,
         # so the mounts passed here, which replace the SDK's, carry the
         # key-log-free context for both halves (2026-10-30-1, E28).
-        _client = anthropic.Anthropic(
-            api_key=get_anthropic_api_key(),
+        client = anthropic.Anthropic(
+            api_key=get_anthropic_api_key(endpoint=endpoint),
+            base_url=endpoint,
             open_telemetry={"traces": {"content_mode": "metadata_only"}, "propagation": False},
             http_client=anthropic.DefaultHttpxClient(
                 follow_redirects=False,
@@ -127,7 +147,11 @@ def get_client() -> anthropic.Anthropic:
                 event_hooks={"request": [egress_request_hook("llm purpose (anthropic)")]},
             ),
         )
-    return _client
+        if scoped is None:
+            _client = client
+        else:
+            scoped[endpoint] = client
+        return client
 
 
 def _tls_context() -> ssl.SSLContext:
@@ -167,7 +191,13 @@ def sent_credentials() -> list[str | None]:
     Empty when no client is built, or when an injected test double holds no
     strings.
     """
-    client = _client
+    scoped = scheduled_client_cache("anthropic")
+    endpoint = get_anthropic_base_url_optional() or "https://api.anthropic.com"
+    client = (
+        _client
+        if _client_injected or scoped is None
+        else cast(anthropic.Anthropic | None, scoped.get(endpoint))
+    )
     if client is None:
         return []
     values: list[object] = [getattr(client, "api_key", None), getattr(client, "auth_token", None)]
@@ -186,5 +216,10 @@ def set_client(client: anthropic.Anthropic | None) -> None:
     Used by tests; passing ``None`` clears the cache so the next ``get_client()``
     rebuilds. See ``tests/AGENTS.md`` for the mocking pattern.
     """
-    global _client
-    _client = client
+    global _client, _client_injected
+    with _client_lock:
+        _client = client
+        _client_injected = client is not None
+        scoped = scheduled_client_cache("anthropic")
+        if scoped is not None:
+            scoped.clear()

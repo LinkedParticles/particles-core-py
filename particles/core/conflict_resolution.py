@@ -95,8 +95,10 @@ Two extra verdicts are emitted by the pre-ladder gate the caller may apply:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Any
 
 from particles.core.generics import is_generic_claim
@@ -111,7 +113,7 @@ from particles.core.schema import (
     is_truth_apt,
 )
 from particles.core.scoring.confidence import CalibrationSource
-from particles.core.status import Status
+from particles.core.status import Status, StatusReason
 
 
 class ConflictVerdict(StrEnum):
@@ -138,9 +140,9 @@ class ConflictVerdict(StrEnum):
     """Rung 1.5 of §6.4 (cap. 2, modality-independent):
     ``existing``'s
     provenance document supersedes ``new``'s. ``existing`` stays ACTIVE; the
-    caller stores ``new`` but demotes it to PROVENANCE_STALE / DOCUMENT_SUPERSEDED
-    (the loser stays auditable — never a silent drop, under the §6.4
-    demotion-only rule).
+    caller stores ``new`` born PROVENANCE_STALE / DOCUMENT_SUPERSEDED, never
+    ACTIVE. The loser stays auditable, never a silent drop, under
+    the §6.4 demotion-only rule.
     Emitted regardless of either claim's truth-aptness."""
 
     UPDATE_SUPERSEDES = "UPDATE_SUPERSEDES"
@@ -152,13 +154,25 @@ class ConflictVerdict(StrEnum):
     UPDATE_SUPERSEDED_BY_EXISTING = "UPDATE_SUPERSEDED_BY_EXISTING"
     """Rung 2.5 mirror: ``existing`` is the newer claim (``new`` is an
     out-of-order older one, e.g. a backfilled transcript). Caller stores ``new``
-    demoted to PROVENANCE_STALE / SUPERSEDED_BY_UPDATE; ``existing`` stays ACTIVE."""
+    born PROVENANCE_STALE / SUPERSEDED_BY_UPDATE, never ACTIVE;
+    ``existing`` stays ACTIVE."""
 
     INCONSISTENT = "INCONSISTENT"
     """No clear winner — emit an INCONSISTENCY particle."""
 
     NO_CONFLICT = "NO_CONFLICT"
     """Pair is not in conflict at all (e.g. below caller's similarity floor)."""
+
+
+#: The mirror verdicts whose loser is born demoted, and the reason each writes.
+#: ``store.insert_particle`` admits a born-``PROVENANCE_STALE``
+#: row with either reason only when its caller names the verdict here.
+MIRROR_LOSER_REASONS: Mapping[ConflictVerdict, StatusReason] = MappingProxyType(
+    {
+        ConflictVerdict.DOCUMENT_SUPERSEDED_BY_EXISTING: StatusReason.DOCUMENT_SUPERSEDED,
+        ConflictVerdict.UPDATE_SUPERSEDED_BY_EXISTING: StatusReason.SUPERSEDED_BY_UPDATE,
+    }
+)
 
 
 def is_generic_instance_pair(a: Particle, b: Particle) -> bool:

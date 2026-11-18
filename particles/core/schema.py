@@ -18,6 +18,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from particles.core.provisional import ProvisionalMark
 from particles.core.schema_version import (
     SchemaCompatibility,
     parse_schema_version,
@@ -1399,6 +1400,14 @@ class QueryRequest(BaseModel):
     # nothing the composer contributes is ever written to the store. An SDK
     # extension parameter, like ``observer_project``.
     grounded: bool | None = None
+    # when the answer refuses (the relevance floor or the responder's
+    # marker), the hits are withheld from the response by default,
+    # because an agent reads the whole result and the unrelated facts cost its
+    # context. True returns them as
+    # before, still marked by ``answer_refused`` so a renderer can relabel
+    # them. A person's transparency display (the web UI, ``--show-particles``)
+    # sets it. No effect when the answer did not refuse.
+    include_refused_candidates: bool = False
     # structural claim filters over the annotation.
     # With a question they prefilter the semantic candidate set (ranking
     # untouched); without one they select the deterministic
@@ -2044,11 +2053,30 @@ class StructuralAggregate(BaseModel):
     buckets: list[AggregateBucket] = Field(default_factory=list)
 
 
+class HitSource(BaseModel):
+    """One query hit's source, readable.
+
+    The hit's first SOURCE provenance ref, resolved to its corpus entry's
+    source type and URI and its snapshot's publication date: the readable form
+    of what the particle's provenance carries only as ids. A read-time view,
+    never stored.
+    """
+
+    source_type: str
+    uri: str | None = None
+    published: datetime | None = None
+
+
 class QueryResponse(BaseModel):
     answer: str
     particles: list[Particle]
     effective_confidences: list[float]
     content_published_ats: list[datetime | None] = Field(default_factory=list)
+    # parallel to ``particles`` — each hit's first SOURCE ref,
+    # readable, or None for a hit with none. Empty when the path that built the
+    # response loaded no sources (an aggregate, the vocabulary listing), and on
+    # an engine that predates the field.
+    sources: list[HitSource | None] = Field(default_factory=list)
     coverage_gaps: list[str] = Field(
         default_factory=list
     )  # deprecated: entry_ids with PENDING/FAILED status
@@ -2169,6 +2197,11 @@ class QueryResponse(BaseModel):
     # to widen top_k under a refusal is incoherent). Disclosure only — never
     # feeds ranking or ``effective_confidences``.
     answer_refused: bool = False
+    # the number of hits withheld because the answer refused and the
+    # request did not set ``include_refused_candidates``. ``particles`` and
+    # every parallel list are then empty together; ``relevance`` and the
+    # coverage fields stay. 0 whenever nothing was withheld.
+    withheld_candidates: int = 0
     # the per-sentence attribution of a grounded answer — each unit
     # cited (with the retrieved particle ids it rests on), the composer's own
     # inference, its background, or unattributed. ``answer`` then carries the
@@ -2246,6 +2279,9 @@ class GraphNode(BaseModel):
     cargo: list[str] = Field(default_factory=list)
     # How many cargo particles the per-subject cap dropped (0 = uncapped).
     cargo_truncated: int = 0
+    # the mark of a Subject an agent principal minted and nobody
+    # confirmed; None for a confirmed Subject.
+    provisional: ProvisionalMark | None = None
 
 
 class GraphEdge(BaseModel):
@@ -2415,6 +2451,9 @@ class QualityReport(BaseModel):
     # Particles
     active_particles: int
     inconsistency_particles: int
+    # ACTIVE beliefs with no stored embedding (REVIEW records excluded): semantic
+    # query scores only embedded rows, so these are never retrieved.
+    active_without_embedding: int = 0
     calibration: list[CalibrationBucket]
     extractor_direct_fraction: float
     # Corpus
@@ -2483,6 +2522,11 @@ class LintFinding(BaseModel):
     # than one claim per side; every other record names one.
     # ``None`` on every other finding type.
     conflict_sides: list[list[str]] | None = None
+    # What an ``OPEN_INCONSISTENCY`` finding's ``detail`` says beyond quoting
+    # the record's sides, for a surface that draws the sides itself (
+    # §2): the held-claim examination line, or ``""`` when the
+    # detail says nothing more. ``None`` on every other finding type.
+    conflict_note: str | None = None
     # The ladder rung whose verdict the finding rests on, ``name@version``:
     # on a census ``CONTRADICTION`` finding, the second
     # reading when one confirmed it, else the contradiction probe. ``None``
@@ -2573,6 +2617,10 @@ class SuggestReport(BaseModel):
     judged_pairs: int = 0
     applied_pairs: int = 0
     warnings: list[str] = Field(default_factory=list)
+    # candidate pairs a withholding rung kept out of ``clusters``,
+    # keyed by the rung's stamp (``identifier_cross@1``). Empty when the
+    # caller passed no rung, which every caller but curation does.
+    withheld: dict[str, int] = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -2691,6 +2739,10 @@ class UnmergeGroup(BaseModel):
     restored_ids: list[str] = Field(default_factory=list)
     skipped: list[UnmergeSkip] = Field(default_factory=list)
     relations_deleted: int = 0
+    #: The tag the merge wrote its ``CO_EVIDENTIAL`` edges under, and so the
+    #: only tag this revert withdraws: ``REREAD_DUPLICATE`` for a re-read merge,
+    #: ``EXACT_DUPLICATE`` otherwise.
+    relation_tag: RelationCreatedBy = RelationCreatedBy.EXACT_DUPLICATE
     #: True once the writes actually landed (never in a dry run).
     reverted: bool = False
 

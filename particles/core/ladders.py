@@ -31,28 +31,49 @@ shell passes in, so a prompt edit changes the stamp every verdict carries.
 ``semantic_lint``) and ``update_slot_second`` (model, ``verification``,
 confirmation on ``CHANGES``).
 
-**The duplicate ladder**: the ``duplicate_judge`` model rung. The
-restatement ladder of a re-extracted ``MUTABLE`` source asks the
-same question with the local ``duplicate_key`` rung (``SAME`` under the §6.10
-key) before it; the judge's ``SAME`` carries nothing until it is admitted.
+**The restatement ladder** (the duplicate question of a re-extracted
+``MUTABLE`` source): the local ``duplicate_key`` rung (``SAME`` under
+the §6.10 key), then the ``duplicate_judge`` model rung, whose
+``SAME`` carries nothing until it is admitted. Curation asks the judge alone,
+after its own content-hash pass, and the judge counts its verdicts under the
+same rung stamp (``ingest/duplicate_judge``).
+
+**The curation duplicate rung**: ``identifier_cross`` (pure),
+``DIFFERENT`` when each claim names an identifier the other lacks. Curation's
+duplicate step asks it of every candidate pair before the equivalence judge
+and withholds the pairs it calls different; it never answers ``SAME``.
 
 **The candidate ladder** (the abstraction gate):
 ``population_quantifier`` (pure, ``NOT_ENTAILED`` on a kind-ranging
 quantifier) and the ``entailment_judge`` model rung.
+
+**The episode ladder** (the one per-claim question):
+``credit`` (pure, admitted: a used or directly asserted claim is
+``STANDING``), the ``session-anchor`` and ``shape`` shadow rungs (pure,
+recorded and never returned), then the stored model reading, one rung per
+writer stamp (``prompt.episode@<digest>``, ``regen.episode@<digest>``,
+``operator@1``). The reading's cost was paid when it was written; the rung
+reads the stored value. Its verdict chooses how pair questions are put to the
+owner and is a premise of no other ladder.
 
 Pure: no I/O, no logging.
 """
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 from particles.core.conflict_resolution import is_generic_instance_pair
 from particles.core.duplicate_key import normalize_content
+from particles.core.episode import SHAPES_DIGEST, EpisodeInput, EpisodeReading, shapes
 from particles.core.generics import population_quantifier
+from particles.core.identifier_cross import crossed
 from particles.core.rung_ladder import (
     CandidateVerdict,
     ContradictionVerdict,
     CostClass,
     DuplicateVerdict,
+    EpisodeVerdict,
     Ladder,
     QuestionKind,
     Rung,
@@ -62,18 +83,24 @@ from particles.core.schema import Particle, is_truth_apt
 
 __all__ = [
     "ADJUDICABILITY",
+    "CREDIT",
     "DUPLICATE_KEY",
+    "IDENTIFIER_CROSS",
     "RESTATEMENT_KEY",
     "GENERIC_GUARD",
+    "SESSION_ANCHOR",
+    "SHAPE",
     "POPULATION_QUANTIFIER",
     "CandidateInput",
     "ClaimPair",
     "NormalizedForms",
     "TextPair",
+    "UpdatePair",
+    "WITHHELD_REASONS",
     "candidate_ladder",
     "contradiction_ladder",
     "duplicate_key_rung",
-    "duplicate_ladder",
+    "episode_ladder",
     "restatement_ladder",
     "update_ladder",
 ]
@@ -84,6 +111,28 @@ ClaimPair = tuple[Particle, Particle]
 TextPair = tuple[str, str]
 #: A candidate abstraction's text and its premises' texts.
 CandidateInput = tuple[str, tuple[str, ...]]
+
+
+class UpdatePair(NamedTuple):
+    """The update question's input: two claim texts, earlier first.
+
+    ``sourced`` says whether the shell holds each claim's source passage, which
+    decides the confirmation rung: the passage reading when it does, the
+    claim-text reading (the assertion door, whose lineage is no source) when
+    it does not. The passages themselves stay in the shell.
+    """
+
+    earlier: str
+    later: str
+    sourced: bool = False
+
+
+def _sourced(pair: UpdatePair) -> bool:
+    return pair.sourced
+
+
+def _unsourced(pair: UpdatePair) -> bool:
+    return not pair.sourced
 
 
 def _adjudicability(pair: ClaimPair) -> ContradictionVerdict:
@@ -193,34 +242,38 @@ def contradiction_ladder(
     )
 
 
-def update_ladder(version: str) -> Ladder[TextPair, UpdateVerdict]:
-    """The update probe as a two-rung ladder with a confirmation rung.
+def update_ladder(version: str) -> Ladder[UpdatePair, UpdateVerdict]:
+    """The update probe as a ladder with a confirmation rung.
 
     The first reading answers; a first ``CHANGES`` is read again on
-    ``verification`` and the second reading's verdict, abstention included,
-    replaces it, so rung 2.5 retires only on two ``CHANGES``.
+    ``verification`` and that reading's verdict, abstention included, replaces
+    it, so rung 2.5 retires only on two ``CHANGES``. The confirmation reads the
+    source passages when the pair has them (``update_slot_passage``) and the
+    two claim texts when it has none (``update_slot_second``, the assertion
+    door): one question, more evidence, never two confirmations.
     """
+    changes = frozenset({UpdateVerdict.CHANGES.value})
     return Ladder(
         kind=QuestionKind.UPDATE,
         abstain=UpdateVerdict.ABSTAIN,
         rungs=(
             Rung(name="update_slot", version=version, cost=CostClass.MODEL),
             Rung(
+                name="update_slot_passage",
+                version=version,
+                cost=CostClass.MODEL,
+                applies=_sourced,
+                confirms=changes,
+                content_keyed=False,
+            ),
+            Rung(
                 name="update_slot_second",
                 version=version,
                 cost=CostClass.MODEL,
-                confirms=frozenset({UpdateVerdict.CHANGES.value}),
+                applies=_unsourced,
+                confirms=changes,
             ),
         ),
-    )
-
-
-def duplicate_ladder(version: str) -> Ladder[TextPair, DuplicateVerdict]:
-    """The curation duplicate judge as a one-rung ladder."""
-    return Ladder(
-        kind=QuestionKind.DUPLICATE,
-        abstain=DuplicateVerdict.ABSTAIN,
-        rungs=(Rung(name="duplicate_judge", version=version, cost=CostClass.MODEL),),
     )
 
 
@@ -235,6 +288,28 @@ def _same_key(pair: TextPair) -> DuplicateVerdict:
 RESTATEMENT_KEY: Rung[TextPair, DuplicateVerdict] = Rung(
     name="duplicate_key", version="2", cost=CostClass.LOCAL, decide=_same_key
 )
+
+
+def _identifier_cross(pair: TextPair) -> DuplicateVerdict:
+    a, b = pair
+    return DuplicateVerdict.DIFFERENT if crossed(a, b) else DuplicateVerdict.ABSTAIN
+
+
+#: ``DIFFERENT`` when each claim names a digit-bearing identifier the other
+#: lacks, read at minimum token length 3. Admitted from the start:
+#: on 2026-11-08 the owner labelled 30 randomly drawn pairs it calls
+#: ``DIFFERENT`` on their store, and all 30 were correct. A
+#: different length, tokenizer or normalisation is a new version, which runs
+#: in shadow until it meets the bar on its own labels.
+IDENTIFIER_CROSS: Rung[TextPair, DuplicateVerdict] = Rung(
+    name="identifier_cross", version="1", cost=CostClass.PURE, decide=_identifier_cross
+)
+
+#: Why each withholding rung keeps a duplicate candidate pair off the curation
+#: queue, by rung name, as every surface that discloses the count words it.
+WITHHELD_REASONS: dict[str, str] = {
+    IDENTIFIER_CROSS.name: "each claim names an identifier the other lacks",
+}
 
 
 def restatement_ladder(judge_version: str) -> Ladder[TextPair, DuplicateVerdict]:
@@ -281,3 +356,86 @@ def candidate_ladder(judge_version: str) -> Ladder[CandidateInput, CandidateVerd
             Rung(name="entailment_judge", version=judge_version, cost=CostClass.MODEL),
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# The episode ladder
+# ---------------------------------------------------------------------------
+
+
+def _credit(item: EpisodeInput) -> EpisodeVerdict:
+    if item.credited or item.asserted:
+        return EpisodeVerdict.STANDING
+    return EpisodeVerdict.ABSTAIN
+
+
+#: A claim someone acted on or asserted is never folded. Its
+#: ``STANDING`` leaves the claim's cards as they are, so it is admitted.
+CREDIT: Rung[EpisodeInput, EpisodeVerdict] = Rung(
+    name="credit",
+    version="1",
+    cost=CostClass.PURE,
+    decide=_credit,
+    content_keyed=False,
+)
+
+
+def _session_anchor(item: EpisodeInput) -> EpisodeVerdict:
+    if item.valid_from_basis == "session":
+        return EpisodeVerdict.SESSION_BOUND
+    return EpisodeVerdict.ABSTAIN
+
+
+#: An act the extractor anchored at the session's date. Shadow:
+#: it reaches acts only, and only claims from extractor 0.18.0 onward.
+SESSION_ANCHOR: Rung[EpisodeInput, EpisodeVerdict] = Rung(
+    name="session-anchor",
+    version="1",
+    cost=CostClass.PURE,
+    decide=_session_anchor,
+    shadow=True,
+    content_keyed=False,
+)
+
+
+def _shape(item: EpisodeInput) -> EpisodeVerdict:
+    if shapes(item.content):
+        return EpisodeVerdict.SESSION_BOUND
+    return EpisodeVerdict.ABSTAIN
+
+
+#: The lexical session-report shapes. Shadow: about 0.73 precise on the
+#: author's sample (Context).
+SHAPE: Rung[EpisodeInput, EpisodeVerdict] = Rung(
+    name="shape",
+    version=SHAPES_DIGEST,
+    cost=CostClass.PURE,
+    decide=_shape,
+    shadow=True,
+)
+
+
+def _stored_reading(item: EpisodeInput) -> EpisodeVerdict:
+    return item.reading.verdict if item.reading is not None else EpisodeVerdict.ABSTAIN
+
+
+def episode_ladder(reading: EpisodeReading | None) -> Ladder[EpisodeInput, EpisodeVerdict]:
+    """The episode ladder for one claim, its last rung named by the stored reading's stamp.
+
+    A reading is a rung per writer stamp, so the ladder is
+    built per claim: with no reading, the claim settles on ``credit`` or
+    abstains, and the shadow rungs' verdicts are still recorded.
+    """
+    rungs: list[Rung[EpisodeInput, EpisodeVerdict]] = [CREDIT, SESSION_ANCHOR, SHAPE]
+    if reading is not None:
+        stamp = reading.stamp
+        rungs.append(
+            Rung(
+                name=stamp.name,
+                version=stamp.version,
+                cost=CostClass.MODEL,
+                decide=_stored_reading,
+                content_keyed=False,
+            )
+        )
+    return Ladder(kind=QuestionKind.EPISODE, abstain=EpisodeVerdict.ABSTAIN, rungs=tuple(rungs))

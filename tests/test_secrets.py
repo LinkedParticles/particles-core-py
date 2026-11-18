@@ -12,6 +12,8 @@ shape (e.g. silently returning ``""``) is caught immediately.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
 
 from particles.secrets import (
@@ -25,6 +27,11 @@ from particles.secrets import (
     get_particles_api_key,
     get_particles_config_path,
 )
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from particles.secrets import EngineTokenFileError
 
 
 class TestAnthropicApiKey:
@@ -290,3 +297,189 @@ def test_the_sdk_otlp_header_values_are_known_secrets(
     assert "audit6-otlp-token" not in redact_known_secrets(
         "collector said: bad token audit6-otlp-token-0123456789"
     )
+
+
+class TestEngineTokenFile:
+    """``PARTICLES_ENGINE_TOKEN_FILE``, the engine bearer's checked file source."""
+
+    TOKEN = "ptk_agent_abc123_" + "s" * 40
+
+    @pytest.fixture
+    def token_dir(self, tmp_path: Path) -> Path:
+        directory = tmp_path / "tokens"
+        directory.mkdir(mode=0o700)
+        directory.chmod(0o700)
+        return directory
+
+    def _write(self, directory: Path, text: str | bytes, mode: int = 0o600) -> Path:
+        path = directory / "hooks"
+        data = text.encode() if isinstance(text, str) else text
+        path.write_bytes(data)
+        path.chmod(mode)
+        return path
+
+    def _refusal(self, monkeypatch: pytest.MonkeyPatch, path: str) -> EngineTokenFileError:
+        from particles.secrets import EngineTokenFileError
+
+        monkeypatch.setenv("PARTICLES_ENGINE_TOKEN_FILE", path)
+        with pytest.raises(EngineTokenFileError) as info:
+            get_engine_token_optional()
+        assert self.TOKEN not in str(info.value)
+        assert "s" * 20 not in str(info.value)
+        return info.value
+
+    def test_reads_the_token_with_its_trailing_newline_stripped(
+        self, monkeypatch: pytest.MonkeyPatch, token_dir: Path
+    ) -> None:
+        import os
+
+        path = self._write(token_dir, self.TOKEN + "\n")
+        monkeypatch.setenv("PARTICLES_ENGINE_TOKEN_FILE", str(path))
+        assert get_engine_token_optional() == self.TOKEN
+        assert self.TOKEN not in os.environ.values()
+
+    def test_mode_0400_passes(self, monkeypatch: pytest.MonkeyPatch, token_dir: Path) -> None:
+        path = self._write(token_dir, self.TOKEN, mode=0o400)
+        monkeypatch.setenv("PARTICLES_ENGINE_TOKEN_FILE", str(path))
+        assert get_engine_token_optional() == self.TOKEN
+
+    def test_read_once_per_process(self, monkeypatch: pytest.MonkeyPatch, token_dir: Path) -> None:
+        path = self._write(token_dir, self.TOKEN)
+        monkeypatch.setenv("PARTICLES_ENGINE_TOKEN_FILE", str(path))
+        assert get_engine_token_optional() == self.TOKEN
+        path.write_text("ptk_agent_other_" + "t" * 40)
+        assert get_engine_token_optional() == self.TOKEN
+
+    def test_empty_variable_counts_as_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("PARTICLES_ENGINE_TOKEN", "")
+        monkeypatch.setenv("PARTICLES_ENGINE_TOKEN_FILE", "")
+        assert get_engine_token_optional() is None
+
+    def test_empty_token_pin_leaves_the_file_as_the_source(
+        self, monkeypatch: pytest.MonkeyPatch, token_dir: Path
+    ) -> None:
+        path = self._write(token_dir, self.TOKEN)
+        monkeypatch.setenv("PARTICLES_ENGINE_TOKEN", "")
+        monkeypatch.setenv("PARTICLES_ENGINE_TOKEN_FILE", str(path))
+        assert get_engine_token_optional() == self.TOKEN
+
+    def test_both_set_is_refused(self, monkeypatch: pytest.MonkeyPatch, token_dir: Path) -> None:
+        path = self._write(token_dir, self.TOKEN)
+        monkeypatch.setenv("PARTICLES_ENGINE_TOKEN", "ptk_agent_env_" + "e" * 40)
+        assert self._refusal(monkeypatch, str(path)).check == "both-set"
+
+    def test_relative_and_tilde_paths_are_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        assert self._refusal(monkeypatch, "tokens/hooks").check == "relative-path"
+        assert self._refusal(monkeypatch, "~/.particles/hooks").check == "relative-path"
+
+    def test_missing_file(self, monkeypatch: pytest.MonkeyPatch, token_dir: Path) -> None:
+        assert self._refusal(monkeypatch, str(token_dir / "absent")).check == "missing"
+
+    def test_symlink_is_refused(self, monkeypatch: pytest.MonkeyPatch, token_dir: Path) -> None:
+        target = self._write(token_dir, self.TOKEN)
+        link = token_dir / "link"
+        link.symlink_to(target)
+        assert self._refusal(monkeypatch, str(link)).check == "symlink"
+
+    def test_hard_link_is_refused(self, monkeypatch: pytest.MonkeyPatch, token_dir: Path) -> None:
+        import os
+
+        target = self._write(token_dir, self.TOKEN)
+        os.link(target, token_dir / "second")
+        assert self._refusal(monkeypatch, str(target)).check == "hard-link"
+
+    @pytest.mark.parametrize("mode", [0o640, 0o604, 0o644])
+    def test_group_or_other_bits_are_refused(
+        self, monkeypatch: pytest.MonkeyPatch, token_dir: Path, mode: int
+    ) -> None:
+        path = self._write(token_dir, self.TOKEN, mode=mode)
+        assert self._refusal(monkeypatch, str(path)).check == "mode"
+
+    def test_another_owner_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch, token_dir: Path
+    ) -> None:
+        # A root-owned 0440 secret read by a non-root user is the container shape.
+        import os
+
+        path = self._write(token_dir, self.TOKEN)
+        monkeypatch.setattr(os, "geteuid", lambda: os.getuid() + 1)
+        assert self._refusal(monkeypatch, str(path)).check == "owner"
+
+    def test_group_writable_parent_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch, token_dir: Path
+    ) -> None:
+        path = self._write(token_dir, self.TOKEN)
+        token_dir.chmod(0o770)
+        assert self._refusal(monkeypatch, str(path)).check == "parent-writable"
+
+    def test_sticky_world_writable_parent_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch, token_dir: Path
+    ) -> None:
+        path = self._write(token_dir, self.TOKEN)
+        token_dir.chmod(0o1777)
+        try:
+            assert self._refusal(monkeypatch, str(path)).check == "parent-writable"
+        finally:
+            token_dir.chmod(0o700)
+
+    def test_group_writable_ancestor_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # Another account could move the private parent aside and put its own
+        # in its place (security review on PR #1359, S1).
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        inner = shared / "tokens"
+        inner.mkdir(mode=0o700)
+        inner.chmod(0o700)
+        path = self._write(inner, self.TOKEN)
+        shared.chmod(0o775)
+        try:
+            assert self._refusal(monkeypatch, str(path)).check == "ancestor-writable"
+            shared.chmod(0o1777)
+            monkeypatch.setenv("PARTICLES_ENGINE_TOKEN_FILE", str(path))
+            assert get_engine_token_optional() == self.TOKEN  # sticky, like /tmp
+        finally:
+            shared.chmod(0o700)
+
+    def test_not_a_regular_file(self, monkeypatch: pytest.MonkeyPatch, token_dir: Path) -> None:
+        sub = token_dir / "dir"
+        sub.mkdir(mode=0o700)
+        assert self._refusal(monkeypatch, str(sub)).check == "not-regular"
+
+    @pytest.mark.parametrize(
+        ("content", "check"),
+        [
+            (b"", "empty"),
+            (b"\n", "empty"),
+            (b"one\ntwo\n", "not-one-line"),
+            (b"ptk_agent_a b", "malformed"),
+            (b"ptk\x01agent", "malformed"),
+            (b"\xff\xfe", "not-utf8"),
+            (b"x" * 5000, "too-large"),
+        ],
+    )
+    def test_content_checks(
+        self, monkeypatch: pytest.MonkeyPatch, token_dir: Path, content: bytes, check: str
+    ) -> None:
+        path = self._write(token_dir, content)
+        assert self._refusal(monkeypatch, str(path)).check == check
+
+    def test_file_value_is_redacted(self, monkeypatch: pytest.MonkeyPatch, token_dir: Path) -> None:
+        from particles.secrets import redact_known_secrets
+
+        path = self._write(token_dir, self.TOKEN)
+        monkeypatch.setenv("PARTICLES_ENGINE_TOKEN_FILE", str(path))
+        get_engine_token_optional()
+        assert self.TOKEN not in redact_known_secrets(f"echo {self.TOKEN} back")
+
+    def test_file_path_names_the_source(
+        self, monkeypatch: pytest.MonkeyPatch, token_dir: Path
+    ) -> None:
+        from particles.secrets import engine_token_file_path
+
+        path = self._write(token_dir, self.TOKEN)
+        monkeypatch.setenv("PARTICLES_ENGINE_TOKEN_FILE", str(path))
+        assert engine_token_file_path() == str(path)
+        monkeypatch.setenv("PARTICLES_ENGINE_TOKEN", "ptk_agent_env_" + "e" * 40)
+        assert engine_token_file_path() is None

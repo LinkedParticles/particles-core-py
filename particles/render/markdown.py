@@ -1315,17 +1315,31 @@ class DigestEntry:
     contested_bases: tuple[str, ...] = ()
 
 
-def observer_scope_line(note: ObserverScopeNote) -> str:
-    """The one-line disclosure a project-observer read carries. Never silent."""
+def reference_withheld_clause(count: int) -> str:
+    """The words for beliefs an unqueried surface left out as reference."""
+    return f"{count} reference belief(s) answer questions but are not listed"
+
+
+def observer_scope_line(note: ObserverScopeNote, reference_withheld: int = 0) -> str:
+    """The one-line disclosure a project-observer read carries. Never silent.
+
+    ``reference_withheld`` is the digest's count of beliefs left out because
+    only reference entries put them in view; zero adds nothing.
+    """
     if not note.engaged:
-        return (
+        line = (
             f"_Project observer `{note.project}` not applied: this store has not been "
-            "rescoped yet (`particles memory rescope`), so this is the whole store._"
+            "rescoped yet (`particles memory rescope`), so this is the whole store"
         )
+        if reference_withheld:
+            line += f"; {reference_withheld_clause(reference_withheld)}"
+        return line + "._"
     line = (
         f"_Observer: project `{note.project}` — {note.in_scope} of {note.total} ACTIVE "
         "belief(s) in scope (global, or observed in this project)"
     )
+    if reference_withheld:
+        line += f"; {reference_withheld_clause(reference_withheld)}"
     if note.unattributed:
         line += f"; {note.unattributed} unattributed"
     if note.lapsed:
@@ -1349,6 +1363,74 @@ def render_digest(
     return render_digest_located(store, entries, total_active, observer, spend_line)[0]
 
 
+@dataclass(frozen=True)
+class RetirementSource:
+    """One source's automatic retirements, as the digest discloses them.
+
+    The gather (``operations.retirement_notice``) groups the retirements by the
+    corpus entry their replacing claims came from and fills one of these per
+    entry, newest first; the renderer stays pure.
+    """
+
+    #: How the source is named: ``session 4f2a…``, ``memory file notes.md``.
+    label: str
+    #: The newest retirement's date, ``YYYY-MM-DD``.
+    date: str
+    #: Claims this source retired in the window.
+    count: int
+    #: One retired claim and the claim that replaced it.
+    example_retired: str
+    example_replacement: str
+    #: The command that restores them: ``--from-entry`` for a source, the
+    #: claim's id when it is the only one.
+    restore: str
+
+
+def _quoted_claim(text: str, limit: int = 140) -> str:
+    # A quotation mark inside the claim is escaped, so a claim cannot close
+    # its own quotes and pass text off as the line's.
+    flat = _inert_line(text).replace('"', '\\"')
+    return f'"{flat if len(flat) <= limit else flat[: limit - 1] + "…"}"'
+
+
+def render_retirement_notice(
+    sources: list[RetirementSource], *, window: str, max_sources: int, more_command: str
+) -> list[str]:
+    """The digest's automatic-retirement section, one line per source.
+
+    ``window`` completes the header ("since your last session", "in the last
+    7 days"). At most ``max_sources`` source lines are listed, newest first,
+    then one line counts the rest and names ``more_command``. The header counts
+    every retirement whatever the cut, so a bulk retirement from one source
+    takes one line and cannot push the others out of view. No sources, no
+    lines: the digest is byte-identical to one rendered without the section.
+    Each claim is flattened and quoted, so a claim cannot add a line of its own.
+    """
+    if not sources:
+        return []
+    total = sum(s.count for s in sources)
+    noun = "source" if len(sources) == 1 else "sources"
+    lines = [f"_Retired automatically {window}: {total}, from {len(sources)} {noun}._"]
+    for src in sources[:max_sources]:
+        # The label holds a source's URI tail, which its author controls, so it
+        # is escaped like the claims beside it: no line, markup or format
+        # character of its own, and no forged `` · restore:`` tail.
+        label = _inert_line(src.label)
+        example = f"{_quoted_claim(src.example_retired)} → {_quoted_claim(src.example_replacement)}"
+        if src.count == 1:
+            lines.append(f"- {label} ({src.date}) retired 1: {example} · restore: {src.restore}")
+        else:
+            lines.append(
+                f"- {label} ({src.date}) retired {src.count}, e.g. {example}"
+                f" · restore all: {src.restore}"
+            )
+    rest = sources[max_sources:]
+    if rest:
+        claims = sum(s.count for s in rest)
+        lines.append(f"- {len(rest)} more source(s) retired {claims} claim(s): `{more_command}`")
+    return lines
+
+
 def render_digest_located(
     store: str,
     entries: list[DigestEntry],
@@ -1356,6 +1438,9 @@ def render_digest_located(
     observer: ObserverScopeNote | None = None,
     spend_line: str | None = None,
     refused_line: str | None = None,
+    retirement_lines: list[str] | None = None,
+    *,
+    reference_withheld: int = 0,
 ) -> tuple[str, list[int]]:
     """Render the digest, and where each entry's line starts in it.
 
@@ -1387,12 +1472,32 @@ def render_digest_located(
     because the extraction model declined them, as one italic line before the
     spend line. ``None`` leaves the output byte-identical to before.
 
+    ``retirement_lines`` (:func:`render_retirement_notice`) go
+    directly under the header, before the ranked list, so a byte budget that
+    cuts the digest cuts the list and never the disclosure. Empty or ``None``
+    leaves the output byte-identical to before.
+
+    ``reference_withheld`` is how many beliefs the caller left
+    out because only reference entries put them in view. Under an observer it
+    joins the observer line; store-wide it is one italic line of its own under
+    the header. Zero leaves the output byte-identical to before.
+
     Pure: no session and no clock — ``asserted_at`` renders as its date, and
     recency is already folded into the effective-confidence ordering, so the
     output is deterministic for a given input.
     """
     header = f"# Memory digest — {store}"
-    scope_lines = [observer_scope_line(observer), ""] if observer is not None else []
+    if observer is not None:
+        scope_lines = [observer_scope_line(observer, reference_withheld), ""]
+    elif reference_withheld:
+        scope_lines = [
+            f"_{reference_withheld_clause(reference_withheld)} (`particles query` finds them)._",
+            "",
+        ]
+    else:
+        scope_lines = []
+    if retirement_lines:
+        scope_lines = [*retirement_lines, "", *scope_lines]
     if not entries:
         where = (
             f"in view for project `{observer.project}` in `{store}`"

@@ -23,6 +23,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Literal
 
 from particles.core.conflict_resolution import RETIRED_VALUE_KEY
 from particles.core.contradiction_disclosure import census_sides
@@ -219,6 +220,29 @@ def is_retired_value(inconsistency: Particle) -> bool:
     source, so neither review nor the cascade writes a trust verdict for it.
     """
     return bool(inconsistency.properties and inconsistency.properties.get(RETIRED_VALUE_KEY))
+
+
+RetirementKind = Literal["retracted", "superseded", "reviewed"]
+
+
+def retirement_kind(particle: Particle | None) -> RetirementKind | None:
+    """How claim A of a retired-value hold was retired, in the curator's terms.
+
+    ``retracted`` and ``superseded`` are the operator's explicit verdicts;
+    ``reviewed`` is a claim that lost a conflict review. ``None`` for a
+    missing claim or one in any other state, which a hold does not expect.
+    The three are the duplicate suppressor's judgment retirements.
+    """
+    if particle is None:
+        return None
+    match particle.status, particle.status_reason:
+        case Status.RETRACTED, StatusReason.EXPLICIT_RETRACTION:
+            return "retracted"
+        case Status.SUPERSEDED, StatusReason.EXPLICIT_SUPERSESSION:
+            return "superseded"
+        case Status.PROVENANCE_STALE, StatusReason.CONFLICT_RESOLVED:
+            return "reviewed"
+    return None
 
 
 def decide_demotion(loser: Particle | None) -> Demotion:

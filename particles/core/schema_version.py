@@ -119,16 +119,6 @@ def major_prefix_range(current: str) -> tuple[str, str]:
     return f"{major}.", f"{major}/"
 
 
-def split_by_compatibility(
-    counts: dict[str, int], current: str
-) -> dict[SchemaCompatibility, dict[str, int]]:
-    """Group a ``{stamp: count}`` census by how each stamp relates to ``current``."""
-    grouped: dict[SchemaCompatibility, dict[str, int]] = {}
-    for stamp, count in counts.items():
-        grouped.setdefault(schema_compatibility(stamp, current), {})[stamp] = count
-    return grouped
-
-
 def stamp_sort_key(stamp: str) -> tuple[int, tuple[int, int, int], str]:
     """Order stamps by value, malformed ones last and by text (for messages)."""
     parsed = parse_schema_version(stamp)

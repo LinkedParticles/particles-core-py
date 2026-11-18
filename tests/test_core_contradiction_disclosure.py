@@ -10,6 +10,7 @@ from particles.core.contradiction_disclosure import (
     CENSUS_ORIGIN,
     ORIGIN_KEY,
     PAIRS_KEY,
+    READING_KEY,
     READING_OBSERVED,
     READING_STANDING,
     REPLACES_KEY,
@@ -32,6 +33,7 @@ from particles.core.contradiction_disclosure import (
     group_pairs,
     is_census_record,
     plan_group,
+    reading_stamp,
     select_under_cap,
     split_sides,
 )
@@ -95,6 +97,7 @@ class TestGrouping:
             (("b",), ("c",)),
             (("c",), ("a",)),
         ]
+        assert [p.pairs for p in planned] == [(g,) for g in group]
 
     def test_plan_group_orients_the_representative(self) -> None:
         planned, unsided = plan_group([_pair("new", "old")], lambda x, y: (y, x))
@@ -137,6 +140,22 @@ class TestCoverage:
             record = RecordState("r", Sides(a=("a",), b=("b",)), open=False, cause=cause)
             assert covered_pairs([record], {}) == frozenset()
 
+    def test_every_open_record_covers_its_own_pairs(self) -> None:
+        records = [
+            RecordState("r1", Sides(a=("a1",), b=("b1",)), open=True),
+            RecordState("r2", Sides(a=("a2",), b=("b2",)), open=True),
+        ]
+        assert covered_pairs(records, {}) == {frozenset(("a1", "b1")), frozenset(("a2", "b2"))}
+
+    def test_a_judged_record_after_a_mechanical_one_covers_members_with_no_sources(self) -> None:
+        # Neither member appears in the current sources or the fingerprint: no
+        # stating entry was gained, so the judgment still stands.
+        records = [
+            RecordState("m", Sides(a=("x",), b=("y",)), open=False, cause=CloseCause.LAPSED),
+            RecordState("j", Sides(a=("a",), b=("b",)), open=False, cause=CloseCause.REVIEW),
+        ]
+        assert covered_pairs(records, {}) == {frozenset(("a", "b"))}
+
 
 class TestLapse:
     PAIRS = [_pair("a1", "b"), _pair("a2", "b")]
@@ -155,12 +174,15 @@ class TestLapse:
 
     def test_gone_member_with_partners_intact_keeps(self) -> None:
         pairs = [_pair("a1", "b1"), _pair("a1", "b2")]
-        assert decide_lapse(pairs, {"b2": MemberState.GONE}).action is LapseAction.KEEP
+        decision = decide_lapse(pairs, {"b2": MemberState.GONE})
+        assert decision.action is LapseAction.KEEP
+        assert decision.dropped == ("b2",)
 
     def test_lapsed_but_active_member_regroups(self) -> None:
         decision = decide_lapse(self.PAIRS, {"a2": MemberState.LAPSED})
         assert decision.action is LapseAction.REGROUP
         assert [(p.a, p.b) for p in decision.remaining] == [("a1", "b")]
+        assert decision.dropped == ("a2",)
 
     def test_merged_member_is_replaced_by_its_survivor(self) -> None:
         decision = decide_lapse(self.PAIRS, {"a2": MemberState.MERGED}, {"a2": "a2-survivor"})
@@ -176,6 +198,17 @@ class TestLapse:
         decision = decide_lapse(pairs, {"b2": MemberState.GONE})
         assert decision.action is LapseAction.REGROUP
         assert [(p.a, p.b) for p in decision.remaining] == [("a1", "b1")]
+
+    def test_a_dropped_first_pair_keeps_the_pairs_after_it(self) -> None:
+        pairs = [_pair("a1", "b1"), _pair("a2", "b2")]
+        decision = decide_lapse(pairs, {"b1": MemberState.GONE})
+        assert decision.action is LapseAction.REGROUP
+        assert [(p.a, p.b) for p in decision.remaining] == [("a2", "b2")]
+
+    def test_a_merged_side_b_member_is_replaced_by_its_survivor(self) -> None:
+        decision = decide_lapse([_pair("a", "b")], {"b": MemberState.MERGED}, {"b": "b-survivor"})
+        assert decision.action is LapseAction.REGROUP
+        assert [(p.a, p.b) for p in decision.remaining] == [("a", "b-survivor")]
 
 
 class TestReread:
@@ -302,6 +335,95 @@ class TestRecord:
         pair = _pair("a", "b", "why", same=True)
         assert ConfirmedPair.from_payload(pair.to_payload()) == pair
         assert ConfirmedPair.from_payload({"a": "a", "b": "a"}) is None
+
+
+class TestRecordEdges:
+    """The record's reason, its trigger ref, and readers of a malformed payload."""
+
+    @staticmethod
+    def _record(
+        sides: Sides, pairs: list[ConfirmedPair], *members: Particle, snapshot: str | None = None
+    ) -> Particle:
+        return build_census_record(
+            sides=sides,
+            pairs=pairs,
+            members={p.id: p for p in members},
+            labels={},
+            sources={},
+            trigger_entry_id="e2",
+            trigger_snapshot_id=snapshot,
+        )
+
+    def test_the_representative_pairs_reason_wherever_it_is_listed(self) -> None:
+        a1, a2, b = _claim("x"), _claim("x again"), _claim("not x")
+        record = self._record(
+            Sides(a=(a1.id, a2.id), b=(b.id,)),
+            [_pair(a2.id, b.id, "the second phrasing"), _pair(a1.id, b.id, "the representative")],
+            a1,
+            a2,
+            b,
+        )
+        assert record.content.endswith("Second reading: the representative")
+
+    def test_with_no_representative_pair_the_first_pairs_reason(self) -> None:
+        a, a2, b, b2 = _claim("x"), _claim("x again"), _claim("not x"), _claim("never x")
+        record = self._record(
+            Sides(a=(a.id, a2.id), b=(b.id, b2.id)),
+            [_pair(a2.id, b2.id, "the first pair"), _pair(a.id, b2.id, "the second pair")],
+            a,
+            a2,
+            b,
+            b2,
+        )
+        assert record.content.endswith("Second reading: the first pair")
+
+    def test_with_no_pairs_no_reason_is_recorded(self) -> None:
+        a, b = _claim("x"), _claim("not x")
+        record = self._record(Sides(a=(a.id,), b=(b.id,)), [], a, b)
+        assert record.content.endswith("Second reading: no reason recorded")
+        assert record.properties is not None
+        assert record.properties[PAIRS_KEY] == []
+
+    def test_the_trigger_ref_keeps_its_snapshot(self) -> None:
+        a, b = _claim("x"), _claim("not x")
+        record = self._record(Sides(a=(a.id,), b=(b.id,)), [_pair(a.id, b.id)], a, b, snapshot="s2")
+        trigger = record.provenance[2]
+        assert (trigger.type, trigger.corpus_entry_id, trigger.snapshot_id) == (
+            ProvenanceRefType.SOURCE,
+            "e2",
+            "s2",
+        )
+
+    def test_a_pair_payload_needs_two_string_ids(self) -> None:
+        assert ConfirmedPair.from_payload({"a": "x", "b": 5}) is None
+        assert ConfirmedPair.from_payload({"a": 5, "b": "x"}) is None
+        assert ConfirmedPair.from_payload({"a": "x"}) is None
+
+    def test_a_pair_payload_without_same_source_is_cross_source(self) -> None:
+        pair = ConfirmedPair.from_payload({"a": "x", "b": "y"})
+        assert pair == ConfirmedPair(a="x", b="y", same_source=False, reason="")
+
+    def test_a_census_record_with_an_empty_side_has_no_sides(self) -> None:
+        def census(sides: object) -> Particle:
+            return _claim("x").model_copy(
+                update={"properties": {ORIGIN_KEY: CENSUS_ORIGIN, SIDES_KEY: sides}}
+            )
+
+        assert census_sides(census({"a": ["x"], "b": []})) is None
+        assert census_sides(census({"a": [], "b": ["y"]})) is None
+        assert census_sides(census({"a": ["x"], "b": ["y"]})) == Sides(a=("x",), b=("y",))
+
+    def test_reading_stamp_and_replaces_read_only_a_non_empty_string(self) -> None:
+        def record(key: str, value: object) -> Particle:
+            return _claim("x").model_copy(update={"properties": {key: value}})
+
+        for bad in ("", 5, None):
+            assert reading_stamp(record(READING_KEY, bad)) is None
+            assert census_replaces(record(REPLACES_KEY, bad)) is None
+        assert reading_stamp(record(READING_KEY, READING_OBSERVED)) == READING_OBSERVED
+        assert census_replaces(record(REPLACES_KEY, "old")) == "old"
+        assert reading_stamp(_claim("x")) is None
+        assert census_replaces(_claim("x")) is None
 
 
 class TestShareAnObserver:

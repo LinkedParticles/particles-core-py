@@ -279,10 +279,6 @@ class SweepPoint:
     rank_lift: float
     heads: tuple[HeadOutcome, ...]
 
-    def head(self, head_size: int) -> HeadOutcome | None:
-        """The outcome for one surface, or ``None`` if it was not swept."""
-        return next((h for h in self.heads if h.head_size == head_size), None)
-
 
 @dataclass(frozen=True)
 class RankLiftBand:

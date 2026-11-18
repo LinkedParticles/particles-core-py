@@ -61,6 +61,13 @@ class WriteLockConfig(BaseModel):
     path: str | None = None
 
 
+#: The names a store laid out as one directory uses: its database file and its
+#: blob directory, the compiled-in defaults' names below. ``db backup`` writes
+#: a copy under them, and the container's ``/data`` volume uses them.
+STORE_DB_FILE_NAME = "particles.db"
+STORE_BLOB_DIR_NAME = "corpus_blobs"
+
+
 class StorageConfig(BaseModel):
     blob_dir: str = "./corpus_blobs"
     database_url: str = "sqlite+aiosqlite:///./particles.db"
@@ -351,6 +358,16 @@ class ApiConfig(BaseModel):
     run in-process (they never cross the HTTP boundary unless a remote engine is
     configured), turning this on does not throttle local single-process use.
 
+    ``write_rate_limit_per_minute`` is a second, separate token bucket for the
+    agent writes that make no model call (``/particles/retract``,
+    ``/particles/link``, ``/particles/unlink``, ``/particles/tag``,
+    ``/particles/untag``, ``/memory/useful``; security review 2026-10-26-1,
+    R6). It is keyed like ``rate_limit_per_minute`` (the key's principal, else
+    the client address) and applies to every caller, an operator key included,
+    but shares no tokens with it, so an agent's burst of tags or links neither
+    spends nor is throttled by the allowance its deposits and queries need.
+    ``0`` (or any value ``≤ 0``) disables it.
+
     ``require_auth_for_reads`` extends the bearer gate to the **read** surface
     (security review F2). The bearer gates the *write* verbs only;
     the read routes (``/particles``, ``/corpus``, ``/subjects``, ``/quality``,
@@ -411,10 +428,18 @@ class ApiConfig(BaseModel):
     bind_host: str = "127.0.0.1"
     trusted_proxies: list[str] = Field(default_factory=list)
     rate_limit_per_minute: int = 60
+    write_rate_limit_per_minute: int = 300
+    # The unclaimed snapshots one metered agent principal may hold waiting for
+    # extraction; a deposit past it is refused with 429. 0 = off.
+    max_pending_extractions_per_principal: int = Field(default=50, ge=0)
     require_auth_for_reads: bool = False
     allowed_origins: list[str] = Field(default_factory=list)
     allowed_hosts: list[str] = Field(default_factory=list)
     keys_file: str = "~/.particles/engine-keys.json"
+    # Build each served store's candidate cache and run one confidence-ranked
+    # retrieval in the background at start, so the first MEMORY.md render
+    # after a start costs what a warm one does.
+    warm_up_on_start: bool = True
 
     @field_validator("allowed_hosts")
     @classmethod
@@ -578,11 +603,19 @@ class EngineConfig(BaseModel):
     a token reaches a remote engine only over ``https://`` or a loopback hop
     (an SSH or Tailscale forward). Set it only for an engine on a network you
     trust end to end.
+
+    ``tuning_drift_ignore`` names settings this client and its engine set
+    differently on purpose. ``hook doctor`` compares the two sides'
+    matched settings (``particles.config_tuning``) and counts these rather
+    than warning on them. Each entry is a dotted path as the doctor prints it
+    (``consolidation.max_pending_entries``), and covers every setting under it;
+    ``*`` matches one segment.
     """
 
     base_url: str | None = None
     timeout_seconds: float = 60.0
     allow_plaintext_token: bool = False
+    tuning_drift_ignore: list[str] = Field(default_factory=list)
 
 
 class ObservabilityConfig(BaseModel):
@@ -857,10 +890,17 @@ _LIST_PRICES_PER_MTOK: dict[str, tuple[float, float]] = {
 # entries come from gate (2026-10-22): on 40 byte-identical
 # extraction prompts it billed the same input tokens as claude-sonnet-5-5
 # (124k each), so the same tokenizer factor, and wrote 1.63 times its output
-# (196k against 120k), so 0.534 × 1.63.
+# (196k against 120k), so 0.534 × 1.63. claude-opus-5-5, claude-fable-5-1 and
+# claude-sonnet-5 counted the same input tokens as claude-sonnet-5-5 on 58,515
+# byte-identical characters (21,139 each; claude-sonnet-5 21,131; token-counting
+# endpoint, 2026-11-05), so they share its factor. Without these entries the
+# leakage estimate counted an Opus judge's input at 4.0 and came in a third low.
 _SHIPPED_CHARS_PER_TOKEN: dict[str, float] = {
     "claude-sonnet-5-5": 2.98,
     "claude-haiku-5-5": 2.98,
+    "claude-opus-5-5": 2.98,
+    "claude-fable-5-1": 2.98,
+    "claude-sonnet-5": 2.98,
 }
 _SHIPPED_OUTPUT_SCALE: dict[str, float] = {
     "claude-sonnet-5-5": 0.534,
@@ -1917,6 +1957,11 @@ class UpdateSupersessionConfig(BaseModel):
     # false restores the contradiction probe in front of every pair (the
     # behaviour before 1.187.0), kept so a benchmark can run both gates.
     same_slot_admits: bool = True
+    # rung 2.5 retirements whose winning claim comes from one
+    # corpus entry, in any rolling 24 hours, across every route that retires by
+    # update. Counted from UPDATE_SUPERSESSION events, so a re-run or a
+    # re-deposit does not reset it. A pair past the cap continues to rung 3.
+    max_retirements_per_entry: int = Field(default=5, ge=1)
 
 
 class ReconciliationConfig(BaseModel):
@@ -1979,80 +2024,54 @@ class UtilityRuleConfig(BaseModel):
     ``floor`` / ``cap`` triple when the bounded multiplier was superseded.
     ``0.0`` disables the lift (projection ranks by effective confidence alone).
 
-    The default ``0.015`` is **empirically calibrated** (re-centred,
-    re-measured post-dedup, re-centred
-    again), not derived. The admissible band is a property of the
-    **surface**, not of the store, because a larger head has more room to expose
-    duplicate clusters — so the three head sizes this SDK renders disagree.
-    Measured on the dogfood store (27,048 ACTIVE beliefs) after the
-    subject-agnostic exact-duplicate merge; the rows below cover the
-    projection surfaces and the digest:
+    The default ``0.065`` is **empirically calibrated**, not derived, and has
+    been re-measured several times.
+    The latest measurement (2026-11-08, a backup of the dogfood store: 61,007
+    ACTIVE beliefs, 1,062 use events in the 30-day half-life window over 185
+    sessions) is the first on use credited only when a belief was shown and
+    applied, and judges the value by the rank-lift monitor's
+    criterion: the head holds at least three quarters of the
+    beliefs applied outside it in two or more sessions (the floor), and keeps
+    at least a quarter of its slots for beliefs with no use yet (the ceiling).
+    Gated use is sparse (53 ACTIVE beliefs carry any ``R``) and the head is a
+    7,454-way tie at the uncalibrated-confidence cap of 0.700, so a
+    used belief at 0.57 to 0.67 needs ``λ·ln(1 + R)`` to close that gap:
 
-    ==========================================  =====  ====================
-    surface                                     ``N``  band (≥95% distinct)
-    ==========================================  =====  ====================
-    projection ``top_k``                        60     0.011 – (no ceiling)
-    projection ``max_lines``                    120    0.006 – (no ceiling)
-    digest ``digest_max_beliefs``               200    0.004 – (no ceiling)
-    ==========================================  =====  ====================
+    ==========================================  =====  ==============
+    surface                                     ``N``  band
+    ==========================================  =====  ==============
+    projection ``top_k``                        60     0.038–0.111
+    projection ``max_lines``                    120    0.038–0.120
+    digest ``digest_max_beliefs``               200    0.038–0.120
+    ==========================================  =====  ==============
 
-    Note what those bands lack: an **upper edge**. Every prior calibration was
-    squeezed between a floor (the target must reach the head) and a
-    duplicate-cluster ceiling, and ``0.011`` was the log-midpoint of the
-    resulting ``[0.0075, 0.0165]`` intersection. The clusters that set that
-    ceiling were drained, so the largest in-head duplicate cluster is now
-    **2 at every λ up to 0.6** and the log-midpoint rule no longer yields a
-    finite answer.
+    (0.120 is the monitor grid's edge, not a measured ceiling.)
 
-    The selection rule is therefore now **margin above the binding floor**:
-    ``0.015`` sits 1.36× above the ``N = 60`` floor of ``0.011`` (one grid step
-    below it, at ``0.010``, the target drops to rank 61 — outside the
-    head), holds that target at rank 24 rather than 48, and keeps all 60
-    ``N = 60`` head slots distinct and 120/120 at ``N = 120``. In-band choice
-    above that is otherwise inconsequential.
+    The previous ``0.015`` held none of the 13 off-head-used beliefs in any
+    head. With a finite band again, the selection rule is the log-midpoint of
+    the intersection, the rule set aside only while the band had no upper edge:
+    ``0.065``, about 1.7× inside each edge. It holds
+    all 13 in every head, leaves 47 % of the 60 slots to beliefs with no use
+    yet, and keeps every head slot distinct (duplicate clusters bound nothing
+    up to ``λ = 0.6``).
 
-    **What bounds λ from above is now the owner lens, not duplicates.**
-    Its ``ω`` floor tracks λ, because a larger utility term holds the head
-    harder against a flat-step cohort. Measured here:
+    Two couplings move with it. An owner lens at ``ω = 0.04`` sits on
+    its owner-share ceiling at this value and at ``0.015`` alike, so a store
+    that sets ``ω`` re-checks it with ``particles memory sweep-owner-lift``.
+    The ``explicit_weight`` of a useful press was sized against a
+    far smaller ``λ``: one press now buys ``0.065·ln 26 ≈ 0.21`` of lift.
 
-    ====== ==========  ==================================
-    λ      ω floor     shipped ``ω = 0.04``
-    ====== ==========  ==================================
-    0.011  0.018       admissible, 2.2× margin
-    0.015  0.024       admissible, 1.67× margin
-    0.020  0.032       admissible, 1.25× margin
-    0.025  0.040       on its floor
-    0.030  0.048       out of band — cohort leaves the head
-    ====== ==========  ==================================
-
-    So raising λ past ≈0.02 is a **joint λ/ω re-calibration**, not a one-line
-    change to this value.
-
-    ``λ`` is deliberately **not** auto-fitted — no label says
-    which belief *should* occupy a head slot, and the confidence spread a fit
-    would key on is flattened to exactly zero by the cap. Re-calibrate
-    against your own store with ``particles memory sweep-rank-lift`` rather than
-    porting this number; it is a property of one store's confidence spread and
-    event volume.
-
-    If the sweep's *ceiling* is what binds for you, the fix is deduplication,
-    not a smaller ``λ`` — but check that your dedup pass can
-    actually *reach* the clusters setting the ceiling. On the dogfood store it
-    could not at first: merge cut near-duplicate mass from 16.0% to
-    3.1% of ACTIVE, yet the ceiling *fell* (0.0190 → 0.0165 at ``N = 200``)
-    rather than rising, because the two clusters that set it were 21
-    **byte-identical** copies each carrying 1/21 and 0/21 subject links, and
-    ``suggest_co_evidential`` iterates Subjects so it never saw them—
-    reporting zero groups while 211 exact-duplicate groups / 534
-    redundant ACTIVE copies remained. The grouping was made subject-agnostic
-    and the ceiling then left the measurable range entirely:
-    305 groups / 350 redundant copies remain (1.29% of ACTIVE), largest cluster
-    7, none of them in the head. That is the payoff predicted,
-    arriving one dedup pass later than it expected.
+    ``λ`` is deliberately **not** auto-fitted: no label says
+    which belief *should* occupy a head slot. Re-calibrate against your own
+    store with ``particles memory sweep-rank-lift --off-head-cohort`` rather
+    than porting this number; the nightly rank-lift monitor reports
+    when the configured value leaves its band. If a duplicate-cluster ceiling
+    is what binds on your store, the fix is deduplication,
+    not a smaller ``λ``.
     """
 
     half_life_uses_days: float = Field(default=30.0, gt=0.0)
-    rank_lift: float = Field(default=0.015, ge=0.0)
+    rank_lift: float = Field(default=0.065, ge=0.0)
 
 
 class UtilityMiningConfig(BaseModel):
@@ -2219,7 +2238,7 @@ class ObserverScopeConfig(BaseModel):
     (``claude_code.observer_scope``), not this section's.
     """
 
-    harness_tags: list[str] = Field(default_factory=lambda: ["claude-code"])
+    harness_tags: list[str] = Field(default_factory=lambda: ["claude-code", "codex"])
 
 
 _CALIBRATION_SOURCE_VALUES = frozenset(
@@ -2675,7 +2694,10 @@ class GithubConfig(BaseModel):
 
 
 class QueryConfig(BaseModel):
-    default_top_k: int = 40
+    # the default ``top_k`` of the MCP ``query`` tool and the CLI's
+    # ``--top-k``. REST ``QueryRequest.top_k`` keeps its published schema
+    # default (40) and does not read this.
+    default_top_k: int = Field(default=40, ge=1, le=200)
     default_min_confidence: float = 0.0
     # minimum effective_equivalence for a CO_EVIDENTIAL edge to
     # collapse a pair at query time. 0.0 reproduces pre-0106 behaviour (collapse
@@ -2693,13 +2715,14 @@ class QueryConfig(BaseModel):
     # its reported effective_confidence) so a richly-linked NARRATIVE label
     # doesn't dominate top-k (§Harder). 1.0 = no demotion (old behaviour).
     narrative_rank_weight: float = Field(default=0.6, ge=0.0, le=1.0)
-    # Truncation-warning heuristic: warn that top_k may be too low when the
-    # combined-score gap between the last rendered result and the first
-    # excluded one is below truncation_min_gap, OR when more than
-    # truncation_near_count excluded particles scored within
-    # truncation_near_margin of the cutoff.
-    truncation_min_gap: float = Field(default=0.05, ge=0.0)
-    truncation_near_margin: float = Field(default=0.15, ge=0.0)
+    # Truncation warning: top_k cut a plateau. It fires when the last rendered
+    # result scores within truncation_plateau_drop (a fraction) of the first,
+    # AND more than truncation_near_count excluded particles score as well as
+    # that plateau. A store's scores are continuous, so a tail near the cutoff
+    # is always dense; only a head that has not fallen away from its first hit
+    # says the cut is arbitrary. (An absolute 0.15 margin and a 0.05 gap test
+    # fired on every query against a store of a few hundred beliefs.)
+    truncation_plateau_drop: float = Field(default=0.10, ge=0.0, le=1.0)
     truncation_near_count: int = Field(default=5, ge=0)
     # when the max raw cosine similarity over the rendered top-k is
     # below this floor, the semantic query answers deterministically that the
@@ -2710,6 +2733,21 @@ class QueryConfig(BaseModel):
     # (all-MiniLM-L6-v2; measured off-topic band ≤ 0.15, on-topic ≥ 0.6);
     # re-examine on a non-reference profile. 0.0 disables the gate.
     relevance_floor: float = Field(default=0.25, ge=0.0, le=1.0)
+    # the exact identifier-token addend's weight ``μ``. A question's
+    # identifier tokens are its tokens that contain a digit and are at least
+    # exact_token_min_length long (``RFC 9110`` yields ``9110``); a candidate
+    # whose content contains a share X of them gains μ·X on its rank score
+    # before the top_k cut. Read-time ordering only: effective_confidence and
+    # the relevance floor are untouched. 0.0 (the default) is inert, so a store
+    # ranks as before until its operator sets it; the value was measured on one
+    # store (0.1 there), so measure it on yours before relying on it. It does not
+    # reach a record named without its number, an identifier shorter than the
+    # minimum, or a belief with no embedding.
+    exact_token_weight: float = Field(default=0.0, ge=0.0)
+    # the shortest digit-bearing token that counts as an
+    # identifier, so small counts and ordinals ("top 40", "run #3") lift
+    # nothing. A store whose records carry two-character numbers may set 2.
+    exact_token_min_length: int = Field(default=3, ge=1)
     # Output budget for the §9.3 NL answer call. This is a *total output*
     # allowance on the wire, not a response-length cap: an extended-thinking
     # model spends its thinking tokens from the same budget, so a value sized
@@ -2736,6 +2774,12 @@ class QueryConfig(BaseModel):
     # default follows the leakage measurement recorded in
     # docs/benchmarks/leakage.md.
     grounded_answers: bool = False
+    # Date each particle line in the answer prompt (``dated YYYY-MM-DD``: when
+    # the claim began to hold, else its source's date) and tell the composer
+    # that, between conflicting values, the most recently dated is current. A
+    # prompt with no dated line is unchanged. Without dates the composer sided
+    # with whichever value more particles repeated.
+    answer_dates: bool = True
     # Keep each store's ACTIVE candidates decoded in memory between reads,
     # re-reading only the rows the store's change journal names as changed
     # (particles/store/candidate_cache.py). Semantic query, extraction, the
@@ -3050,6 +3094,33 @@ class WikiConfig(BaseModel):
     # keep only per-subject articles. Suppressed automatically when the run is
     # narrowed with `--subjects` (narratives are subject-less).
     emit_narrative_notes: bool = True
+    # the operator's own first-attempt synthesis prompt, in place of
+    # the built-in encyclopedic one, for every prose exporter and the default
+    # projection section (the shared article-synthesis engine reads it). Three
+    # optional placeholders are filled in: ``{framing}``, ``{direction}`` and
+    # ``{allowed_ids}``; write a literal brace as ``{{`` / ``}}``. The flowing,
+    # narrative and strict-retry prompts stay built in. ``None`` (the default)
+    # keeps the built-in prompt. A set template is part of the synthesis cache
+    # key, so changing it regenerates every cached article.
+    prompt_template: str | None = None
+
+    @field_validator("prompt_template")
+    @classmethod
+    def _prompt_template_formats(cls, value: str | None) -> str | None:
+        """Refuse a template ``str.format`` cannot fill (an unknown or bad placeholder)."""
+        if value is None:
+            return None
+        if not value.strip():
+            raise ValueError("wiki.prompt_template is empty; omit it to use the built-in prompt")
+        try:
+            value.format(allowed_ids="", framing="", direction="")
+        except (KeyError, IndexError, AttributeError, ValueError) as exc:
+            raise ValueError(
+                "wiki.prompt_template has a placeholder other than {framing}, "
+                "{direction} or {allowed_ids}, or an unpaired brace (write a literal "
+                f"brace as '{{{{' or '}}}}'): {type(exc).__name__}: {exc}"
+            ) from exc
+        return value
 
 
 class LogseqConfig(BaseModel):
@@ -3073,7 +3144,7 @@ class NotionConfig(BaseModel):
     """Notion exporter tuneables — **non-secret only**.
 
     The integration token is a SECRET and lives in ``secrets.py``
-    (``NOTION_API_KEY``), read via :func:`particles.secrets.get_notion_api_key`,
+    (``NOTION_API_KEY``), read via :func:`particles.http.service_credential`,
     **never here** and never in ``config.yaml``. Everything on this
     model is an ordinary, non-secret operational parameter — which database to
     sync into and what to name its properties. A Notion database id is not a
@@ -3230,6 +3301,21 @@ _DEFAULT_REFETCH_FLOORS: dict[str, int] = {
 }
 
 
+class HostConfig(BaseModel):
+    """This installation's host identity.
+
+    Each ``file://`` corpus entry records the host whose filesystem its path
+    names, and the local refresh reads only its own host's entries. The id is a
+    random UUID kept in ``id_file`` beside the operating system's machine
+    identifier; a file carried to another machine is not believed there.
+    """
+
+    # Absolute, ``~`` expanded; a relative path is refused, since an id file a
+    # cloned repository ships would decide which host's files this one claims.
+    # The container's baked config pins it under the data volume.
+    id_file: str = "~/.particles/host-id"
+
+
 class LocalRefreshConfig(BaseModel):
     """The local-source refresh tier — change detection for ``file://`` entries.
 
@@ -3381,6 +3467,12 @@ class McpRecallConfig(BaseModel):
     digest_stores: list[str] = Field(default_factory=list)
     # Max beliefs rendered per digest (top-N by effective confidence). 0 = no cap.
     digest_max_beliefs: int = Field(default=200, ge=0)
+    # the digest's automatic-retirement section lists at most this
+    # many source lines (newest first), then one line for the rest.
+    digest_max_retirements: int = Field(default=5, ge=1)
+    # Days the section looks back when no earlier render is on record for the
+    # observer; `particle restore --from-entry` restores within the same window.
+    digest_retirement_window_days: int = Field(default=7, ge=1)
 
 
 class McpMemoryCompatConfig(BaseModel):
@@ -3437,9 +3529,27 @@ class McpConfig(BaseModel):
     per §6.6 assertion it lists, so one call cannot fan out past the cap, and a
     call listing more than the cap is refused (P26). ``0`` disables it. Other
     reads are not counted.
+
+    ``query_detail``, ``query_list`` and ``query_hits`` set the ``query``
+    tool's defaults: the hit shape, whether the list holds the
+    answer's citations, and how many hits it lists.
     """
 
     rate_limit_per_minute: int = Field(default=60, ge=0)
+    # the ``query`` tool's result. ``compact`` lists slim hits (id,
+    # content, effective confidence, a readable source, valid_from, contest
+    # markers) with null and empty keys dropped; ``summary`` is the older slim
+    # shape; ``full`` is the whole ``QueryResponse``. A call's ``detail`` wins.
+    query_detail: Literal["compact", "summary", "full"] = "compact"
+    # under ``compact``, ``cited`` composes a grounded answer and
+    # lists only the hits it cites (the top ``query_hits`` when it cites
+    # nothing); ``ranked`` lists the top ``query_hits`` under an ungrounded
+    # answer, and is the named revert.
+    query_list: Literal["cited", "ranked"] = "cited"
+    # the most hits a compact ``query`` result lists, after the
+    # answer is composed over all ``top_k``; the cited list's ceiling and its
+    # fallback. The ``summary`` and ``full`` shapes list every retrieved hit.
+    query_hits: int = Field(default=10, ge=0)
     write: McpWriteConfig = Field(default_factory=McpWriteConfig)
     recall: McpRecallConfig = Field(default_factory=McpRecallConfig)
     memory_compat: McpMemoryCompatConfig = Field(default_factory=McpMemoryCompatConfig)
@@ -3462,7 +3572,9 @@ class ClaudeCodeHarvestConfig(BaseModel):
     # Ceiling on inline extractions per SessionEnd run (current session first).
     max_extract_entries_per_session: int = Field(default=3, ge=0)
     # How many recent transcripts the level-triggered catch-up sweep re-checks
-    # after handling the current session. 0 disables the sweep.
+    # after handling the current session, drawn from every
+    # transcript directory of the session's project, its linked worktrees'
+    # included. 0 disables the sweep.
     catchup_limit: int = Field(default=5, ge=0)
     # Whether a completed walk of a memory directory records an ABSENT record
     # for each previously harvested memory file it no longer finds, so the
@@ -3476,6 +3588,10 @@ class ClaudeCodeHarvestConfig(BaseModel):
     # reports it. A directory of fewer than five files is held
     # back only by the first-absence rule.
     max_absent_fraction: float = Field(default=0.25, ge=0.0, le=1.0)
+    # The bound on the detached SessionEnd worker's harvest of one session, and
+    # on each render it runs. The hook itself only hands off, so
+    # claude_code.hook_deadline_seconds no longer bounds the harvest.
+    worker_deadline_seconds: float = Field(default=120.0, gt=0)
 
 
 class ClaudeCodeConfig(BaseModel):
@@ -3515,6 +3631,28 @@ class ClaudeCodeConfig(BaseModel):
     # rescope`` has run on the store.
     observer_scope: Literal["store", "project"] = "project"
     harvest: ClaudeCodeHarvestConfig = Field(default_factory=ClaudeCodeHarvestConfig)
+
+
+class CodexHarvestConfig(BaseModel):
+    """Bounds and consent for detached Codex conversation capture."""
+
+    enabled: bool = True
+    allow_remote: bool = False
+    catchup_limit: int = Field(default=5, ge=0)
+    worker_deadline_seconds: float = Field(default=60.0, gt=0)
+    max_rollout_bytes: int = Field(default=64 * 1024 * 1024, gt=0)
+
+
+class CodexConfig(BaseModel):
+    """Local Codex adapter settings, independent of Claude's observer policy."""
+
+    home_dir: str = "~/.codex"
+    state_dir: str = "~/.particles/codex"
+    identity_lock_path: str = "~/.particles/project-identity.lock"
+    digest_max_bytes: int = Field(default=9000, ge=0)
+    hook_deadline_seconds: float = Field(default=10.0, gt=0)
+    observer_scope: Literal["store", "project"] = "project"
+    harvest: CodexHarvestConfig = Field(default_factory=CodexHarvestConfig)
 
 
 class AgentMemoryProjectionGitConfig(BaseModel):
@@ -3660,6 +3798,64 @@ class CurationStakesConfig(BaseModel):
     use_norm_cap: int = Field(default=20, ge=1)
 
 
+class SubjectSuggestionsConfig(BaseModel):
+    """Subject suggestions on the assign-subject form.
+
+    ``GET /particles/{id}/subject-suggestions`` offers the subjects a belief
+    names in its text, then the subjects its nearest linked beliefs carry. Read
+    only: nothing here changes a belief, a link or a rank.
+    """
+
+    # How many of the most similar ACTIVE beliefs that carry a subject are read.
+    neighbours: int = Field(default=20, ge=1, le=200)
+    # A neighbour subject is offered only when at least this many of those
+    # beliefs carry it; 1 offers one-off subjects such as a single PR number.
+    min_support: int = Field(default=2, ge=1)
+    # Suggestions returned when the request names no limit (the route clamps
+    # any limit to 20).
+    limit: int = Field(default=5, ge=1, le=20)
+
+
+class CurationEpisodeConfig(BaseModel):
+    """The episode reading and its admission (§4).
+
+    ``particles episode`` regenerates the stored reading of transcript-only
+    claims with a call-aware rate cap, a resumable per-run cap (``0`` means the
+    whole backlog) and a commit interval, the ``particles modality`` shape.
+    Each call reads up to ``claims_per_call`` claims of one source entry,
+    each beside its passage cut to ``passage_chars``. ``admitted`` names the
+    ``(stratum, stamp combination)`` entries that reached the withholding bar
+    on the owner's labels, as ``<stratum>:<stamp>[+<stamp>]`` over the
+    distinct stamps a card's members were read under; until a curation
+    build withholds cards (stage 2), it decides only which shadow counts are
+    reported as admitted.
+    """
+
+    admitted: list[str] = Field(default_factory=list)
+    rate_limit_per_minute: int = Field(default=60, ge=0)
+    batch_limit: int = Field(default=500, ge=0)
+    commit_interval: int = Field(default=25, ge=1)
+    claims_per_call: int = Field(default=10, ge=1, le=50)
+    passage_chars: int = Field(default=1200, ge=0)
+    sheet_size: int = Field(default=60, ge=1)
+    # The thinking a reader call is priced at in the dry run's estimate; a
+    # model that thinks by default spends it from the reply budget.
+    estimate_thinking_tokens: int = Field(default=1500, ge=0)
+
+
+class CurationIdentifierCrossConfig(BaseModel):
+    """The identifier-cross duplicate rung.
+
+    The rung withholds a duplicate candidate pair whose two claims each name a
+    digit-bearing identifier the other lacks (``1.114.1`` against ``1.114.2``).
+    It has no tuning: its token length is part of its version.
+    """
+
+    # Off: the next curation build carries every candidate pair again, and the
+    # withheld count reads "identifier_cross@1 off".
+    enabled: bool = True
+
+
 class CurationConfig(BaseModel):
     """Curation surface — the curation queue + session model.
 
@@ -3694,6 +3890,11 @@ class CurationConfig(BaseModel):
     # wrong LLM clear (hard-suppression is deferred). 1.0 disables the
     # demotion; PARAPHRASE / UNSURE / absent verdicts are never demoted.
     duplicate_distinct_demotion: float = Field(default=0.1, ge=0.0, le=1.0)
+    # withhold a duplicate candidate pair whose claims name different
+    # identifiers, before the equivalence judge and before grouping.
+    identifier_cross: CurationIdentifierCrossConfig = Field(
+        default_factory=CurationIdentifierCrossConfig
+    )
     # Projection manifests: paths to ``operations.projection`` doc
     # manifests whose selected particles get ``projection_blocking`` leverage —
     # a belief that feeds a generated doc is worth tending first. Empty leaves
@@ -3723,6 +3924,13 @@ class CurationConfig(BaseModel):
     # `curate --precision` and the quality report's `curation_precision` block
     # read the gesture log. `curate --precision --since DATE` overrides it.
     precision_window_days: int = Field(default=30, ge=1)
+    # the suggested subjects the assign-subject form lists.
+    subject_suggestions: SubjectSuggestionsConfig = Field(default_factory=SubjectSuggestionsConfig)
+    # the source types whose claims are reports of a session. The
+    # episode question is asked only of a claim every source of which is one.
+    session_source_types: list[str] = Field(default_factory=lambda: ["CONVERSATION"])
+    # the stored episode reading and its admission.
+    episode: CurationEpisodeConfig = Field(default_factory=lambda: CurationEpisodeConfig())
 
 
 class ReindexConfig(BaseModel):
@@ -4115,6 +4323,22 @@ class ConsolidationCensusConfig(BaseModel):
     interval_hours: int = Field(default=168, ge=0)
 
 
+class ConsolidationEmbedConfig(BaseModel):
+    """The consolidation embed pass: vectors for beliefs stored without one.
+
+    A belief written while the encoder could not load is stored with no vector,
+    and every cosine read (query, the duplicate finders, the census) skips it.
+    The pass embeds those beliefs locally, with no model call, and puts them in
+    the run's delta scope so the sweeps and the census pair them.
+    """
+
+    # ACTIVE beliefs filled per run, oldest first. Kept small because filled
+    # beliefs compete with the run's new beliefs for the census and update
+    # sweep's capped probes; a larger backlog drains over several runs. 0 turns
+    # the pass off.
+    max_per_run: int = Field(default=500, ge=0)
+
+
 class ConsolidationConfig(BaseModel):
     """The scheduled consolidation cycle — cadence + cost gating only.
 
@@ -4127,6 +4351,10 @@ class ConsolidationConfig(BaseModel):
     # ``--if-due`` threshold: skip when the last successful CONSOLIDATION_RUN is
     # younger than this. Default 20 h = daily scheduling with headroom for clock
     # drift, so an hourly catch-up retry is harmless.
+    credential_profile: str | None = None
+    # Only declared loopback routes can pass scheduled readiness without a key.
+    # Remove local when it points to an authenticated gateway.
+    keyless_extraction_providers: list[str] = Field(default_factory=lambda: ["local"])
     min_interval_hours: int = 20
     # Pass 1 (extract catch-up) on/off. Extraction is LLM-priced; off leaves the
     # PENDING backlog to interactive verbs.
@@ -4134,6 +4362,11 @@ class ConsolidationConfig(BaseModel):
     # Pass 1 per-run cap: PENDING snapshots extracted per cycle, oldest first.
     # A capped run discloses the remainder; the next run continues.
     max_pending_entries: int = Field(default=20, ge=0)
+    # Pass 1's share per metered agent principal: at most this
+    # many of one principal's snapshots per run, whatever max_pending_entries
+    # and extract_budget_usd are. Strict: slots it leaves are not handed over.
+    # 0 admits none of them (`extract --all-pending` still drains them).
+    max_pending_per_metered_principal: int = Field(default=5, ge=0)
     # Pass 1 priority class: entries carrying any of these tags
     # take the cap's slots first, longest-owed first; everything else fills
     # what remains. The cap is unchanged. Empty restores plain longest-owed order.
@@ -4188,6 +4421,8 @@ class ConsolidationConfig(BaseModel):
     contradiction_disclosure: ContradictionDisclosureConfig = Field(
         default_factory=ContradictionDisclosureConfig
     )
+    # The embed pass, after the extract catch-up.
+    embed: ConsolidationEmbedConfig = Field(default_factory=ConsolidationEmbedConfig)
     # The re-anchor pass, between the update sweep and the census.
     reanchor: ReanchorConfig = Field(default_factory=ReanchorConfig)
     # The held-claim release pass, between re-anchor and the census.
@@ -4201,6 +4436,26 @@ class ConsolidationConfig(BaseModel):
     # skipped and disclosed ("spent US$X of US$Y; pass N skipped"), a chunk is
     # not submitted. Zero-LLM passes always run. ``None`` is unbounded.
     budget_usd: float | None = Field(default=None, ge=0)
+    # Pass 1's own nightly dollar budget, in US$ at list price with
+    # the batch discount, as ``llm/usage`` meters it. Set, pass 1 reads in
+    # rounds admitted against it (round 1 at each snapshot's worst case, later
+    # rounds at the estimate corrected by tonight's measured spend) until it is
+    # spent; under ``budget_usd`` too, the smaller one applies. ``None`` keeps
+    # today's single round of ``max_pending_entries``. Has no effect on an
+    # unpriced extraction route. Raise ``max_pending_entries`` beside it: that
+    # count stays the per-run ceiling.
+    extract_budget_usd: float | None = Field(default=None, ge=0)
+    # Most rounds one budgeted pass 1 runs; each costs one batch
+    # turnaround.
+    extract_max_rounds: int = Field(default=6, ge=1)
+    # Share of ``batch_wait.budget_seconds`` a budgeted pass 1 may use before it
+    # starts no new round, so the later passes keep the batch price.
+    extract_batch_wait_share: float = Field(default=0.5, gt=0, le=1)
+    # Pass 1 queue order: transcripts (``CONVERSATION`` entries)
+    # outside the priority class are read least-tried, then the entry with the
+    # newest pending snapshot first, each entry's snapshots oldest first, ahead
+    # of the other sources. False restores the order exactly.
+    transcripts_newest_first: bool = True
     # The census cadence: pass 3 runs weekly by default, and the
     # nights between serve its stored cards.
     census: ConsolidationCensusConfig = Field(default_factory=ConsolidationCensusConfig)
@@ -4473,6 +4728,25 @@ class RotBenchmarkConfig(BaseModel):
     # Above this many projected LLM calls the CLI asks before spending
     # (--yes pre-confirms). The `oracle` arm projects zero and never asks.
     confirm_call_threshold: int = Field(default=100, ge=0)
+    # The door arm: other memories through the rot world. Where the
+    # arms manifest lives (kept outside any repository while results are
+    # internal), where competitor builds are cached on their pin and the world,
+    # and where reports of record go.
+    door_manifest: str = "~/.particles/benchmark/rot/arms.toml"
+    door_cache_dir: str = "~/.particles/benchmark/rot/compare/cache"
+    door_runs_dir: str = "~/.particles/benchmark/rot/compare"
+    # Cost-projection assumptions for the answer the Particles door (the MCP
+    # query tool at its defaults) generates for every probe.
+    estimate_answer_input_tokens: int = Field(default=6000, ge=0)
+    estimate_answer_output_tokens: int = Field(default=400, ge=0)
+    # The answer stage: how many reader calls run at once, and the
+    # cost-projection assumptions its estimate discloses. A door the estimate
+    # has not seen yet (an uncached build) is priced at the door size below,
+    # the largest door measured (Particles', 2026-11-02).
+    reader_concurrency: int = Field(default=4, ge=1, le=64)
+    estimate_reader_chars_per_token: float = Field(default=3.5, gt=0)
+    estimate_reader_output_tokens: int = Field(default=80, ge=0)
+    estimate_reader_door_chars: int = Field(default=66000, ge=0)
 
     @field_validator("checkpoints")
     @classmethod
@@ -4510,8 +4784,10 @@ class RelevanceFloorBenchmarkConfig(BaseModel):
     # Seed of the `--limit` sample (stratified by source).
     sample_seed: int = 0
     # Version of the reference-free grounded-and-useful judge prompt. Never
-    # edit a protocol's text in place; add a version.
-    judge_protocol: int = Field(default=1, ge=1)
+    # edit a protocol's text in place; add a version. 1 labels a responder
+    # refusal unanswerable unjudged; 2 (the default) also judges whether the
+    # top-k a refusal withheld answers the question.
+    judge_protocol: int = Field(default=2, ge=1)
     # Concurrent questions in the judged stage (each holds its own session).
     concurrency: int = Field(default=4, ge=1)
     # A transient answer/judge failure is retried this many times with a
@@ -4588,6 +4864,9 @@ class LeakageBenchmarkConfig(BaseModel):
     # Tokens one rendered particle adds to a prompt (the top-k is not
     # retrieved before the projection, so its size is assumed too).
     estimate_particle_tokens: int = Field(default=45, ge=0)
+    # Judge calls are one a sentence. 8 fitted the first run (2026-10-03);
+    # answers over a richer context ran about 15 on 2026-11-04, so
+    # `--calibrate-from <report.json>` replaces this with a saved run's figure.
     estimate_sentences_per_answer: float = Field(default=8.0, ge=0.0)
     estimate_judge_prompt_overhead_tokens: int = Field(default=600, ge=0)
     estimate_judge_output_tokens: int = Field(default=120, ge=0)
@@ -4785,6 +5064,7 @@ class ParticlesConfig(BaseModel):
     embeddings: EmbeddingsConfig = Field(default_factory=EmbeddingsConfig)
     mcp: McpConfig = Field(default_factory=McpConfig)
     claude_code: ClaudeCodeConfig = Field(default_factory=ClaudeCodeConfig)
+    codex: CodexConfig = Field(default_factory=CodexConfig)
     agent_memory: AgentMemoryConfig = Field(default_factory=AgentMemoryConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     extraction: ExtractionConfig = Field(default_factory=ExtractionConfig)
@@ -4858,6 +5138,7 @@ class ParticlesConfig(BaseModel):
     benchmark: BenchmarkConfig = Field(default_factory=BenchmarkConfig)
     refetch_floors: dict[str, int] = Field(default_factory=lambda: dict(_DEFAULT_REFETCH_FLOORS))
     local_refresh: LocalRefreshConfig = Field(default_factory=LocalRefreshConfig)
+    host: HostConfig = Field(default_factory=HostConfig)
     local_files: LocalFilesConfig = Field(default_factory=LocalFilesConfig)
     rule_sources: RuleSourcesConfig = Field(default_factory=RuleSourcesConfig)
 
@@ -4954,6 +5235,7 @@ CLIENT_SECTIONS: frozenset[str] = frozenset(
         "extraction_vision",
         "github",
         "hackernews",
+        "host",
         "http",
         "journal_extractor",
         "llm",
@@ -4975,6 +5257,9 @@ CLIENT_SECTIONS: frozenset[str] = frozenset(
 
 # (env_var, section, field) — string value; Pydantic coerces types on validation
 _ENV_OVERRIDES: list[tuple[str, str, str]] = [
+    ("CODEX_HOME", "codex", "home_dir"),
+    ("PARTICLES_CODEX_STATE_DIR", "codex", "state_dir"),
+    ("PARTICLES_PROJECT_IDENTITY_LOCK", "codex", "identity_lock_path"),
     ("DATABASE_URL", "storage", "database_url"),
     ("PARTICLES_BLOB_DIR", "storage", "blob_dir"),
     ("PARTICLES_USER_AGENT", "http", "user_agent"),
@@ -4983,6 +5268,7 @@ _ENV_OVERRIDES: list[tuple[str, str, str]] = [
     ("PARTICLES_API_RATE_LIMIT_PER_MINUTE", "api", "rate_limit_per_minute"),
     ("PARTICLES_API_REQUIRE_AUTH_FOR_READS", "api", "require_auth_for_reads"),
     ("PARTICLES_API_KEYS_FILE", "api", "keys_file"),
+    ("PARTICLES_HOST_ID_FILE", "host", "id_file"),
     ("PARTICLES_API_KEYS_DIR_GROUP", "api", "keys_dir_group"),
     ("PARTICLES_MAX_PAGE_SIZE", "storage", "max_page_size"),
     # Stamped by the image, not set by an operator (deploy/Dockerfile).
@@ -5040,6 +5326,21 @@ def env_override_names() -> frozenset[str]:
     removes these, so no override of the operator's reaches the run.
     """
     return frozenset(name for name, _section, _field in _ENV_OVERRIDES)
+
+
+def env_override_fields(environ: Mapping[str, str]) -> dict[str, str]:
+    """Each override ``environ`` sets, as variable name to the dotted field it sets.
+
+    The fields :func:`load_config` would take from the environment, so a
+    caller can say a value came from a variable rather than a file.
+    """
+    fields: dict[str, str] = {}
+    for env_var, section, field_name in _ENV_OVERRIDES:
+        value = environ.get(env_var)
+        if value is None or (value == "" and env_var in _EMPTY_MEANS_UNSET):
+            continue
+        fields[env_var] = f"{section}.{field_name}"
+    return fields
 
 
 #: Environment variables that choose where a secret, a prompt or telemetry is

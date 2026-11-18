@@ -143,13 +143,6 @@ class Sides:
     def members(self) -> tuple[str, ...]:
         return self.a + self.b
 
-    def side_of(self, particle_id: str) -> str | None:
-        if particle_id in self.a:
-            return "a"
-        if particle_id in self.b:
-            return "b"
-        return None
-
     def crossing_pairs(self) -> frozenset[frozenset[str]]:
         """Every pair with one member on each side: what the record covers while open."""
         return frozenset(frozenset((x, y)) for x in self.a for y in self.b)

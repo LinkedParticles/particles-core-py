@@ -12,7 +12,8 @@ answer it. This module is the pure half of that protocol:
 
 * a per-kind verdict vocabulary that always contains ``ABSTAIN``
   (:class:`ContradictionVerdict`, :class:`UpdateVerdict`,
-  :class:`DuplicateVerdict`, :class:`CandidateVerdict`);
+  :class:`DuplicateVerdict`, :class:`CandidateVerdict`, and the per-claim
+  :class:`EpisodeVerdict`);
 * :class:`Rung`: ``applies``, ``decide``, an ordinal :class:`CostClass`, and a
   name-plus-version :class:`RungStamp`;
 * **confirmation rungs**, which run only on a named provisional verdict of a
@@ -50,6 +51,7 @@ __all__ = [
     "CostClass",
     "DuplicateVerdict",
     "CandidateVerdict",
+    "EpisodeVerdict",
     "Ladder",
     "LadderRun",
     "QuestionKind",
@@ -74,6 +76,11 @@ class QuestionKind(StrEnum):
     """Are the two claims one claim?"""
     ENTAILMENT = "entailment"
     """Is a candidate entailed by the conjunction of its premises?"""
+    EPISODE = "episode"
+    """Is one transcript claim true only of the moment its session reports?
+
+    The one per-claim question: its verdict chooses how the pair
+    questions are put to the owner and is a premise of no other question."""
 
 
 class ContradictionVerdict(StrEnum):
@@ -111,6 +118,16 @@ class CandidateVerdict(StrEnum):
 
     ENTAILED = "entailed"
     NOT_ENTAILED = "not_entailed"
+    ABSTAIN = "abstain"
+
+
+class EpisodeVerdict(StrEnum):
+    """The episode ladder's vocabulary."""
+
+    SESSION_BOUND = "session_bound"
+    """The claim reports its session's moment: a state then, or an act performed in it."""
+    STANDING = "standing"
+    """The claim holds beyond the session, or records history a reader would ask for."""
     ABSTAIN = "abstain"
 
 
@@ -316,6 +333,7 @@ class LadderRun(Generic[I, V]):
     _position: int = 0
     _pending: Rung[I, V] | None = None
     _provisional: tuple[V, RungStamp] | None = None
+    _confirmed: bool = False
     _trail: list[tuple[RungStamp, V]] = field(default_factory=list)
     _shadow: list[tuple[RungStamp, V]] = field(default_factory=list)
 
@@ -330,11 +348,16 @@ class LadderRun(Generic[I, V]):
         its abstention replaces the provisional verdict here, with the
         confirming rung named as the decider, and it joins no trail since it
         never ran. An unconfirmed provisional verdict never stands on its own.
+        Two confirmation rungs may confirm one verdict for different inputs
+        (their ``applies`` split the inputs): one that does not
+        apply passes the verdict on to the next, and abstains only when no
+        later one runs. Once one has answered or abstained, no other runs.
         """
         if self._pending is not None:
             raise RuntimeError(f"rung {self._pending.name} was offered and never recorded")
         avail = availability or Availability()
         rungs = self.ladder.rungs
+        passed: Rung[I, V] | None = None
         while self._position < len(rungs):
             rung = rungs[self._position]
             self._position += 1
@@ -345,16 +368,26 @@ class LadderRun(Generic[I, V]):
                     self._pending = rung
                     return rung
                 continue
-            if self._provisional[0].value not in rung.confirms:
+            if self._confirmed or self._provisional[0].value not in rung.confirms:
                 continue
-            if avail.admits(rung) and rung.applies(self.item):
+            if not rung.applies(self.item):
+                # Another confirmation rung may see this input.
+                passed = passed or rung
+                continue
+            if avail.admits(rung):
                 self._pending = rung
                 return rung
-            # The confirming rung cannot run (unavailable, or it does not
-            # apply): it abstains, and its abstention replaces the provisional
-            # verdict. It did not run, so it joins no trail.
-            self._provisional = (self.ladder.abstain, rung.stamp)
+            # The confirming rung cannot run: it abstains, and its abstention
+            # replaces the provisional verdict. It did not run, so it joins no
+            # trail.
+            self._settle_unconfirmed(rung)
+        if passed is not None and not self._confirmed:
+            self._settle_unconfirmed(passed)
         return None
+
+    def _settle_unconfirmed(self, rung: Rung[I, V]) -> None:
+        self._provisional = (self.ladder.abstain, rung.stamp)
+        self._confirmed = True
 
     def record(self, rung: Rung[I, V], verdict: V) -> None:
         """Hand back the verdict of the rung :meth:`next_rung` offered."""
@@ -374,6 +407,7 @@ class LadderRun(Generic[I, V]):
     def _replace(self, rung: Rung[I, V], verdict: V) -> None:
         self._trail.append((rung.stamp, verdict))
         self._provisional = (verdict, rung.stamp)
+        self._confirmed = True
 
     def settled(self) -> Settled[V]:
         """What stands: the provisional verdict and its rung, or ``ABSTAIN`` and no rung."""

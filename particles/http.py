@@ -9,13 +9,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import ssl
-from collections.abc import AsyncGenerator, Callable, Mapping
-from contextlib import asynccontextmanager
-from typing import Any
+from collections.abc import AsyncGenerator, Callable, Iterator, Mapping
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
+from typing import Any, Literal
 
 import httpx
 
-from particles import egress
+from particles import egress, secrets
 from particles.url_safety import ValidatingTransport
 
 log = logging.getLogger(__name__)
@@ -447,3 +448,71 @@ async def get_with_retry(
             f"{label} unavailable ({resp.status_code}) after {len(backoffs) + 1} attempts: {url}"
         )
     return resp
+
+
+# ---------------------------------------------------------------------------
+# Service credentials: whose authority an outbound fetch spends
+# ---------------------------------------------------------------------------
+
+#: The services whose operator-held credential an outbound fetch may carry.
+ServiceName = Literal["github", "numista", "notion"]
+
+#: Why the current scope withholds every service credential, or ``None``.
+_withheld_because: ContextVar[str | None] = ContextVar(
+    "particles_service_credentials_withheld", default=None
+)
+
+
+@contextmanager
+def withhold_service_credentials(reason: str) -> Iterator[None]:
+    """Fetch without the operator's service credentials for the rest of this scope.
+
+    The Engine enters it wherever a fetch's target was chosen by someone other
+    than the operator: a confined (agent) principal's deposit, a link a
+    deposited source names and the deposit follows, and the refresh of an entry
+    either of those made. Inside it :func:`service_credential` returns ``None``,
+    so ``GITHUB_API_KEY`` cannot read a private repository the caller names
+    (security review 2026-11-17-1, RA1). Scopes nest; the outermost reason is
+    kept.
+    """
+    token = _withheld_because.set(_withheld_because.get() or reason)
+    try:
+        yield
+    finally:
+        _withheld_because.reset(token)
+
+
+class ServiceCredentialWithheld(ValueError):
+    """A fetch needs a service credential the current scope withholds.
+
+    Raised by a fetch with no anonymous mode (the Numista API) inside
+    :func:`withhold_service_credentials`; the engine's deposit routes answer it
+    with 403 and its message.
+    """
+
+
+def service_credentials_withheld() -> str | None:
+    """Why the current scope withholds service credentials, or ``None`` when it does not."""
+    return _withheld_because.get()
+
+
+def service_credential(service: ServiceName) -> str | None:
+    """The operator's credential for ``service``, or ``None`` while the scope withholds it.
+
+    The one reader of the service secrets an outbound fetch carries
+    (``tests/test_service_credential_chokepoint.py`` fails on any other). Outside
+    a withholding scope it keeps each secret's own contract: GitHub's is
+    optional (``None`` when unset), and Numista's and Notion's raise
+    ``ValueError`` when unset, since neither API has an anonymous mode. A caller
+    that needs a credential it was refused names the scope's reason
+    (:func:`service_credentials_withheld`) in its error.
+    """
+    if _withheld_because.get() is not None:
+        return None
+    match service:
+        case "github":
+            return secrets.get_github_api_key_optional()
+        case "numista":
+            return secrets.get_numista_api_key()
+        case "notion":
+            return secrets.get_notion_api_key()

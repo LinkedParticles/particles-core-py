@@ -80,25 +80,41 @@ class PromptComponent:
     (:func:`assemble_prompt`), so the output-schema frame is itself a
     component, placed last: its ``rule`` is the schema's head and its
     ``field`` the schema's tail.
+
+    ``trailer`` is text placed after the schema, at the very end of the
+    prompt. It is for the per-source part of the instructions (the general
+    extractor's reference date), so that everything before it is identical
+    across sources and can be sent as one prompt-cache prefix.
     """
 
     name: str
     rule: str = ""
     field: str = ""
+    trailer: str = ""
 
     @property
     def digest(self) -> str:
-        """The content hash of this component's text (rule, then field)."""
+        """The content hash of this component's text (rule, field, then any trailer).
+
+        A component with no trailer hashes exactly as it did before the slot
+        existed, so its recorded digest does not change.
+        """
+        if self.trailer:
+            return component_digest(self.rule, self.field, self.trailer)
         return component_digest(self.rule, self.field)
 
 
 def assemble_prompt(components: Sequence[PromptComponent]) -> str:
-    """The prompt the ``components`` make: every rule, then every field.
+    """The prompt the ``components`` make: every rule, then every field, then every trailer.
 
     The only way an extractor that records components builds its prompt, so
     every byte of the prompt belongs to exactly one component.
     """
-    return "".join(c.rule for c in components) + "".join(c.field for c in components)
+    return (
+        "".join(c.rule for c in components)
+        + "".join(c.field for c in components)
+        + "".join(c.trailer for c in components)
+    )
 
 
 @dataclass(frozen=True)

@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -219,3 +219,36 @@ class TestGenerationHold:
     def test_an_undated_ref_keeps_it_out(self) -> None:
         assert not self._hold(_sourced(CASCADED, ("E", None)), _sourced(HELD, ("E", "s2")))
         assert not self._hold(_sourced(CASCADED, ("E", "s9")), _sourced(HELD, ("E", "s2")))
+
+    def test_a_derived_partner_with_no_source_ref_is_not(self) -> None:
+        """A cascaded A is often derived: its premise refs are PARTICLE-typed, never SOURCE."""
+        derived = CASCADED.model_copy(
+            update={
+                "provenance": [
+                    ProvenanceRef(
+                        type=ProvenanceRefType.PARTICLE, corpus_entry_id="p0", snapshot_id="p0"
+                    )
+                ]
+            }
+        )
+        assert not self._hold(derived, _sourced(HELD, ("E", "s2")))
+
+    def test_two_claims_from_one_snapshot_are_not(self) -> None:
+        """Neither is the newer generation, so the cascade did not retire A for B's source."""
+        assert not self._hold(_sourced(CASCADED, ("E", "s2")), _sourced(HELD, ("E", "s2")))
+
+    def test_naive_and_offset_capture_times_order_by_instant(self) -> None:
+        """SQLite hands capture times back naive; they read as UTC beside an offset one."""
+        plus5 = timezone(timedelta(hours=5))
+        a, b = _sourced(CASCADED, ("E", "s1")), _sourced(HELD, ("E", "s2"))
+
+        def hold(a_at: datetime, b_at: datetime) -> bool:
+            return is_generation_hold(a, b, current={"E": "s2"}, captured={"s1": a_at, "s2": b_at})
+
+        # 03:00+05:00 is 22:00 UTC the day before, so B is the older snapshot.
+        assert not hold(datetime(2026, 10, 2), datetime(2026, 10, 2, 3, tzinfo=plus5))
+        # 06:00+05:00 is 01:00 UTC, after a naive midnight.
+        assert hold(datetime(2026, 10, 2), datetime(2026, 10, 2, 6, tzinfo=plus5))
+        # An offset A against a naive B reads the same way round.
+        assert hold(datetime(2026, 10, 2, 3, tzinfo=plus5), datetime(2026, 10, 1, 23))
+        assert not hold(datetime(2026, 10, 2, 6, tzinfo=plus5), datetime(2026, 10, 2))

@@ -37,7 +37,7 @@ import hashlib
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, date, datetime, time
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -96,11 +96,18 @@ class ChunkUnit:
             append-only delta read, as its own labelled section
             that the model extracts nothing from. ``None`` on every other
             chunk. When set, the cache key covers it too.
+        reference_day: The day a transcript's day mark puts in force where
+            this chunk's shown text begins: its REFERENCE DATE
+            in place of the source's own date. ``None`` before any mark and on
+            every source with no marks. When set, the cache key covers it too
+            (§5), so the same paragraph read against another day is read
+            again rather than carried forward.
     """
 
     chunk_id: str
     chunk_text: str
     context: str | None = None
+    reference_day: date | None = None
 
     @property
     def prompt_text(self) -> str:
@@ -116,8 +123,22 @@ class ChunkUnit:
 
     @property
     def prompt_hash(self) -> str:
-        """SHA-256 of :attr:`prompt_text`: the chunk's carry-forward key and ``chunk_hash``."""
-        return _hash_chunk(self.prompt_text)
+        """The chunk's carry-forward key and ``chunk_hash``.
+
+        SHA-256 of :attr:`prompt_text`, followed by a line naming
+        :attr:`reference_day` when a day mark set one. The line
+        is part of the key only, never of what the model is shown, and a
+        chunk with no mark before it keeps exactly the key it always had.
+        """
+        if self.reference_day is None:
+            return _hash_chunk(self.prompt_text)
+        return _hash_chunk(f"{self.prompt_text}\n[day {self.reference_day.isoformat()}]")
+
+    def reference(self, published_at: datetime | None) -> datetime | None:
+        """The REFERENCE DATE this chunk's call carries: its mark's day, else ``published_at``."""
+        if self.reference_day is None:
+            return published_at
+        return datetime.combine(self.reference_day, time.min, tzinfo=UTC)
 
 
 def _own_carried(
@@ -156,15 +177,17 @@ def _llm_kwargs(
 ) -> dict[str, Any]:
     """The optional keywords one chunk's default ``_call_llm`` carries, each only when set.
 
-    The reference anchor when the source exposes a publication instant,
-    the tool-turn flag when this chunk carries a relabelled turn,
-    the context section of a delta chunk. The
-    common call stays byte-identical to the bare one, and no test double sees
-    a keyword it did not ask for.
+    The reference anchor when the source exposes a publication instant
+    or a day mark sets the chunk's own, the
+    tool-turn flag when this chunk carries a relabelled turn,
+    the context section of a delta chunk. The common call stays
+    byte-identical to the bare one, and no test double sees a keyword it did
+    not ask for.
     """
     kwargs: dict[str, Any] = {}
-    if reference_published_at is not None:
-        kwargs["reference_published_at"] = reference_published_at
+    reference = chunk.reference(reference_published_at)
+    if reference is not None:
+        kwargs["reference_published_at"] = reference
     if _chunk_has_tool_turns(chunk, tool_turns_present):
         kwargs["tool_turns_present"] = True
     if chunk.context is not None:
@@ -440,7 +463,7 @@ async def _extract_chunks_pooled(
     planned = [
         _build_llm_request(
             chunk.chunk_text,
-            reference_published_at=reference_published_at,
+            reference_published_at=chunk.reference(reference_published_at),
             tool_turns_present=_chunk_has_tool_turns(chunk, tool_turns_present),
             context=chunk.context,
         )

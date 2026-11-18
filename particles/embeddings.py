@@ -160,10 +160,33 @@ def cosine_similarities(
     if not vectors:
         return []
     matrix = np.stack(vectors)
+    clamped: list[float] = stacked_cosine_similarities(query, matrix, row_norms(matrix)).tolist()
+    return clamped
+
+
+def row_norms(
+    matrix: np.ndarray[Any, np.dtype[np.floating[Any]]],
+) -> np.ndarray[Any, np.dtype[np.floating[Any]]]:
+    """The L2 norm of each row of ``matrix``, as :func:`cosine_similarities` computes it."""
+    norms: np.ndarray[Any, np.dtype[np.floating[Any]]] = np.sqrt(
+        np.einsum("ij,ij->i", matrix, matrix)
+    )
+    return norms
+
+
+def stacked_cosine_similarities(
+    query: np.ndarray[Any, np.dtype[np.floating[Any]]],
+    matrix: np.ndarray[Any, np.dtype[np.floating[Any]]],
+    norms: np.ndarray[Any, np.dtype[np.floating[Any]]],
+) -> np.ndarray[Any, np.dtype[np.floating[Any]]]:
+    """:func:`cosine_similarities` over an already stacked matrix and its :func:`row_norms`.
+
+    The same formula, epsilon and clamp, as an array: a caller that keeps the
+    matrix between calls skips the stacking.
+    """
     dots = np.einsum("ij,j->i", matrix, query)
-    norms = np.sqrt(np.einsum("ij,ij->i", matrix, matrix))
     raw = dots / (norms * np.linalg.norm(query) + 1e-10)
-    clamped: list[float] = np.clip(raw, 0.0, 1.0).tolist()
+    clamped: np.ndarray[Any, np.dtype[np.floating[Any]]] = np.clip(raw, 0.0, 1.0)
     return clamped
 
 

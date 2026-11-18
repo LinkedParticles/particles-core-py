@@ -31,11 +31,18 @@ import time
 from collections.abc import Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
 from particles.config import get_config
 from particles.core import bounded_yaml
+from particles.core.episode import (
+    EPISODE_KEY,
+    EPISODE_RULE_KEY,
+    EXTRACTOR_WRITER,
+    reading_verdict,
+)
+from particles.core.rung_ladder import EpisodeVerdict
 from particles.core.schema import (
     SCHEMA_VERSION,
     ApplicabilityClause,
@@ -77,6 +84,8 @@ from particles.extraction.components import (
     record_component,
     record_prompt_components,
 )
+from particles.extraction.day_marks import day_at, mark_days
+from particles.extraction.episode import EPISODE_DEFINITION
 from particles.extraction.polarity import (
     NON_ASSERTED_POLARITIES,
     POLARITY_ASSERTED,
@@ -102,7 +111,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 EXTRACTOR_ID = "general-extractor"
-EXTRACTOR_VERSION = "0.19.0"
+EXTRACTOR_VERSION = "0.22.0"
 # 0.4.0: prompt now preserves URL schemes.
 # 0.5.0: HTML chunking moves to paragraph boundaries with hash-input
 #        normalisation and routes through extract_with_carry_forward.
@@ -215,6 +224,34 @@ EXTRACTOR_VERSION = "0.19.0"
 #        a bare description subject ("the user", "the commit") is stripped.
 #        Every other source's prompt and output are byte-for-byte 0.18.0, so a
 #        reindex is worth running only on session transcripts.
+# 0.20.0: a session act is dated by the day of its turn. On a
+#        session source the prompt gains ``prompt.session_days``: a turn
+#        heading may carry a date (``## User · 2026-09-14``), which holds until
+#        the next one, and a turn with none above it falls on the REFERENCE
+#        DATE; the two session rules now date an act, an ``as-of`` state and
+#        relative time by the turn's day. The REFERENCE DATE of a chunk that
+#        starts after a mark is that mark's day, and its carry-forward key
+#        names the day. The gate drops a ``session`` start outside the
+#        session's span. Every other source's prompt and output are
+#        byte-for-byte 0.19.0; an append-only transcript is not re-read by
+#        the bump, and ``memory redate --reread`` re-reads the
+#        multi-day sessions already extracted.
+# 0.21.0: the REFERENCE DATE moves to the prompt's last line. It
+#        was the one per-source byte in the instructions and sat mid-rules
+#        (inside the validity rule, or as its own rule with validity off), so
+#        the cache prefix stopped there and the rules after it and the whole
+#        output schema were re-billed at full input price on every call. The
+#        date line is now the table's trailer and the validity rule cites it;
+#        no rule's meaning changes. A reindex buys nothing but the new stamp.
+# 0.22.0: the episode reading. On a session source the prompt
+#        gains ``prompt.episode``: each claim carries ``episode``,
+#        ``session_bound`` for a report of the session's moment (a state then,
+#        or an act performed in it) and ``standing`` otherwise, stored as
+#        ``extraction:episode`` with the component's stamp. It feeds no write,
+#        rank or confidence; the curation queue reads it. Every other source's
+#        prompt and output are byte-for-byte 0.21.0, and an append-only
+#        transcript is not re-read by the bump; ``particles
+#        episode`` reads the claims already stored.
 #: The interval every emitted ``confidence_value`` is clamped into
 #: (D1). Strict interiority is the whole point: ``calibration.is_saturated``
 #: treats a value within ``_EPS = 1e-7`` of an endpoint as immovable, so
@@ -326,8 +363,8 @@ Rules:
 # from other sources, so a deictic or relative reference ("my flat", "last
 # month") silently changes referent when the speaker's situation changes. Shared
 # with the journal extractor, so it names no date line of its own: the general
-# prompt supplies the reference date through ``_REFERENCE_DATE_RULE`` (or the
-# validity rule, which already carries it). The examples deliberately name
+# prompt supplies the reference date through ``_REFERENCE_DATE_LINE``, the last
+# line of its instructions. The examples deliberately name
 # nothing a test fixture uses, so a passing test is resolution, not copying.
 REFERENCE_RULE = """
 - Resolve references before you write a claim. Each claim is stored on its own
@@ -358,10 +395,15 @@ REFERENCE_RULE = """
   relative wording. Never invent a place, a date, an employer, or any other
   anchor the source does not give."""
 
-# The reference date for REFERENCE_RULE when the validity rule (which carries
-# the same placeholder) is off, so relative time always has an anchor.
-_REFERENCE_DATE_RULE = """
-- REFERENCE DATE: the source was published/captured on {reference_date}."""
+# The reference date every rule that resolves relative time cites (REFERENCE_RULE,
+# the validity rule, the session rules), so relative time always has an anchor.
+# It is the one per-source line of the instructions, so it is the prompt's
+# trailer: everything before it is identical across sources and is sent as one
+# prompt-cache prefix. In 0.20.0 it sat mid-rules, which left about a
+# third of the instructions, the schema included, uncached on every call.
+_REFERENCE_DATE_LINE = """
+
+REFERENCE DATE: the source was published/captured on {reference_date}."""
 
 # optional document-scope classification clause. Appended to the
 # rules and the JSON schema only when ``extraction_scope.enabled`` is set, so
@@ -447,9 +489,9 @@ _STANCE_SCHEMA_FIELD = (
 # dangerous direction is emission (a spurious ``valid_until`` silently retires a
 # durable fact via the §9.3 staleness lint), so the rule draws the
 # mention-vs-boundary line explicitly and says "when unsure, omit it". The
-# {reference_date} placeholder is filled per-call with the source's publication
-# instant (or the extraction wall-clock) so relative expressions resolve to
-# absolute dates in the model, never in the parser.
+# REFERENCE DATE it cites is ``_REFERENCE_DATE_LINE``, filled per call with the
+# source's publication instant (or the extraction wall-clock) so relative
+# expressions resolve to absolute dates in the model, never in the parser.
 _VALIDITY_RULE = """
 - valid_until: set this ONLY when the claim asserts a state or arrangement that
   CEASES to be true at a specific future time — a genuine validity boundary.
@@ -465,9 +507,9 @@ _VALIDITY_RULE = """
   - The test: does the claim STOP being true after the date? Only then is there
     a valid_until. When unsure, OMIT it — a missing boundary is harmless, a wrong
     one silently retires a true fact.
-  - REFERENCE DATE: the source was published/captured on {reference_date}.
-    Resolve relative expressions ("tomorrow", "next week", "until Q3") against it.
-    Only emit valid_until if you can name an absolute calendar date.
+  - Resolve relative expressions ("tomorrow", "next week", "until Q3") against
+    the REFERENCE DATE, the last line of these instructions. Only emit
+    valid_until if you can name an absolute calendar date.
 - validity_confidence: when you set valid_until, your self-assessed certainty
   [0.0–1.0] that this is a real validity boundary AND that you resolved the date
   correctly. null when you set no boundary.
@@ -514,18 +556,35 @@ _VALIDITY_SCHEMA_FIELD = (
     ',\n  "valid_from_cue": "<short verbatim cue quote, or null>"'
 )
 
+# a session transcript that runs over several days marks the
+# turn where the day changes (``## User · 2026-09-14``). Woven in on a session
+# source only, before the two session rules that date by it; the REFERENCE
+# DATE of each call is the day in force where the text it shows begins, so a
+# turn with no mark above it in that text falls on the REFERENCE DATE.
+_SESSION_DAYS_RULE = """
+- SESSION DAYS: a turn heading may carry a date ("## User · 2026-09-14",
+  "## Assistant · 2026-09-14"). That turn, and every later turn up to the
+  next dated heading, happened on that day; a turn with no dated heading
+  above it in the text you are shown happened on the REFERENCE DATE. This is
+  the turn's day. Resolve relative expressions in a turn ("yesterday", "next
+  week") against the turn's day, not against the REFERENCE DATE. A line that
+  begins with a backslash ("\\## User · ...") is quoted text, never a
+  dated heading."""
+
 # woven in only when the source is a session transcript (a source
 # type in ``extraction_validity.session_source_types``), so every other
 # prompt is byte-for-byte unchanged. The reference date of a harness deposit
 # is the session's own start (``hook session-end`` passes it), so an act the
-# session performed is dated to the day it happened.
+# session performed is dated to the day it happened, and by the day of the turn
+# that reports it.
 _SESSION_VALIDITY_RULE = """
-- SESSION SOURCE: this source is the transcript of a session held on the
-  REFERENCE DATE. A past-tense claim that reports an act performed IN the
-  session ("the tests passed", "the cherry-pick landed cleanly", "the user
-  chose option (a)", "the PR was opened") happened on that day: set
-  valid_from to the REFERENCE DATE, valid_kind to EVENT, and valid_from_basis
-  to "session", with valid_from_cue the past-tense phrase. Do NOT use
+- SESSION SOURCE: this source is the transcript of a working session. A
+  past-tense claim that reports an act performed IN the session ("the tests
+  passed", "the cherry-pick landed cleanly", "the user chose option (a)", "the
+  PR was opened") happened on the day of the turn that reports it (see
+  SESSION DAYS): set valid_from to that day, valid_kind to EVENT, and
+  valid_from_basis to "session", with valid_from_cue the past-tense phrase.
+  An "as-of" STATE takes the turn's day too. Do NOT use
   "session" for a past event the session merely mentions or recalls ("the
   treaty was signed in 1919", "PR #502 was merged last week", "I moved last
   year"): those keep the rules above, dated only when the text states a date.
@@ -536,7 +595,7 @@ _SESSION_VALIDITY_RULE = """
 # session worked on ("the pull request") names a different thing in every
 # session, so two sessions' true records read as one claim with two values.
 # Independent of the validity rule: the REFERENCE DATE it cites is in every
-# prompt (the validity rule or ``_REFERENCE_DATE_RULE``). The examples name
+# prompt (``_REFERENCE_DATE_LINE``). The examples name
 # nothing a test fixture uses, as in ``REFERENCE_RULE``.
 _SESSION_ARTIFACT_RULE = """
 - SESSION ARTIFACTS: this source is a working session's transcript, and each
@@ -555,9 +614,10 @@ _SESSION_ARTIFACT_RULE = """
   - put that name in "subjects", never the description: "acme/widgets#326",
     not "the pull request". Never list a bare description ("the user", "the
     assistant", "the session", "the repository") as a subject;
-  - open a claim that reports an act performed in the session with the
-    REFERENCE DATE ("On 2026-03-14, pull request acme/widgets#326 was
-    merged"), so two sessions' records of two acts never read as one claim
+  - open a claim that reports an act performed in the session with the day
+    of the turn that reports it (see SESSION DAYS: "On 2026-03-14, pull
+    request acme/widgets#326 was merged"), so two sessions' records of two
+    acts never read as one claim
     with two values. A present-tense state keeps its own wording.
   When the source does not name the thing, keep the description. Never invent
   a number, a hash, a version or a name."""
@@ -614,6 +674,19 @@ APPEND_CONTEXT_RULE = """
 """
 
 
+# on a session transcript, each claim says whether it reports
+# only the session's moment. The definition is shared word for word with the
+# regeneration reader (``extraction/episode.py``); the reading feeds no write.
+_EPISODE_RULE = (
+    """
+- EPISODE (this source is a working session's transcript): give each claim an
+  "episode" of
+"""
+    + EPISODE_DEFINITION
+)
+_EPISODE_SCHEMA_FIELD = ',\n  "episode": "session_bound" | "standing"'
+
+
 #: Component names. Stable identifiers: a stored record names a
 #: component by these, so renaming one reads as "removed and added" to every
 #: snapshot stamped before the rename. Change the text freely; keep the name.
@@ -624,8 +697,10 @@ PROMPT_MODALITY = "prompt.modality"
 PROMPT_POLARITY = "prompt.polarity"
 PROMPT_STANCE = "prompt.stance"
 PROMPT_VALIDITY = "prompt.validity"
+PROMPT_SESSION_DAYS = "prompt.session_days"
 PROMPT_SESSION_VALIDITY = "prompt.session_validity"
 PROMPT_SESSION_ARTIFACTS = "prompt.session_artifacts"
+PROMPT_EPISODE = EXTRACTOR_WRITER
 PROMPT_REFERENCE_DATE = "prompt.reference_date"
 PROMPT_STRUCTURE = "prompt.structure"
 PROMPT_TOOL_TURNS = "prompt.tool_turns"
@@ -650,6 +725,17 @@ def modality_prompt_component() -> PromptComponent:
     one carry one identity while the rule text is unchanged.
     """
     return PromptComponent(PROMPT_MODALITY, _MODALITY_RULE, _MODALITY_SCHEMA_FIELD)
+
+
+def episode_prompt_component() -> PromptComponent:
+    """The episode rule as one extraction component."""
+    return PromptComponent(PROMPT_EPISODE, _EPISODE_RULE, _EPISODE_SCHEMA_FIELD)
+
+
+def episode_extractor_stamp() -> str:
+    """The stamp an extracted episode reading carries: the component's ``name@digest``."""
+    component = episode_prompt_component()
+    return f"{component.name}@{component.digest[:12]}"
 
 
 def extract_prompt_components(
@@ -685,7 +771,10 @@ def extract_prompt_components(
         else None,
         PromptComponent(PROMPT_VALIDITY, _VALIDITY_RULE, _VALIDITY_SCHEMA_FIELD)
         if validity_enabled
-        else PromptComponent(PROMPT_REFERENCE_DATE, _REFERENCE_DATE_RULE),
+        else None,
+        # only on a session transcript; the two session rules
+        # below date by the turn's day it defines.
+        PromptComponent(PROMPT_SESSION_DAYS, _SESSION_DAYS_RULE) if session_source else None,
         # only on a session transcript, and only under the validity
         # rule it extends.
         PromptComponent(PROMPT_SESSION_VALIDITY, _SESSION_VALIDITY_RULE)
@@ -695,6 +784,8 @@ def extract_prompt_components(
         PromptComponent(PROMPT_SESSION_ARTIFACTS, _SESSION_ARTIFACT_RULE)
         if session_source
         else None,
+        # only on a session transcript.
+        episode_prompt_component() if session_source else None,
         PromptComponent(PROMPT_STRUCTURE, _STRUCTURE_RULE, _STRUCTURE_SCHEMA_FIELD)
         if structure_enabled
         else None,
@@ -704,6 +795,9 @@ def extract_prompt_components(
         # only on a delta read with a context section.
         PromptComponent(PROMPT_APPEND_CONTEXT, APPEND_CONTEXT_RULE) if context_present else None,
         PromptComponent(PROMPT_SCHEMA, _EXTRACT_SCHEMA_HEAD, _EXTRACT_SCHEMA_TAIL),
+        # The one per-source line, after the schema, so every byte before it
+        # can be cached across sources.
+        PromptComponent(PROMPT_REFERENCE_DATE, trailer=_REFERENCE_DATE_LINE),
     ]
     return [component for component in table if component is not None]
 
@@ -733,9 +827,9 @@ def _build_extract_prompt(
     ``structured_claim`` field. Disabling any feature removes exactly its rule
     and field. The reference-resolution rule (0.16.0) is always present.
 
-    The prompt always carries a ``{reference_date}`` placeholder, in the
-    validity rule when it is on and in ``_REFERENCE_DATE_RULE`` otherwise, so
-    relative time in a claim can be resolved either way. :func:`_call_llm`
+    The prompt always ends with a ``{reference_date}`` placeholder
+    (``_REFERENCE_DATE_LINE``, the table's trailer), so relative time in a
+    claim can be resolved whichever rules are on. :func:`_call_llm`
     substitutes it per call (the source's publication instant or the extraction
     wall-clock); the substitution uses ``str.replace`` — never ``str.format`` —
     because the JSON schema block contains literal braces.
@@ -761,6 +855,38 @@ def _build_extract_prompt(
 #: reply is gated, so the flag never threads through every call signature
 #: (the ``_REPLY_TALLY`` pattern). ``False`` outside an extraction.
 _SESSION_SOURCE: ContextVar[bool] = ContextVar("particles_session_source", default=False)
+
+#: The span of days a ``session`` anchor may name on the source under
+#: extraction: the day of its ``content_published_at`` (the
+#: session's start; ``None`` when unknown) and the day of its ``captured_at``.
+#: Set beside :data:`_SESSION_SOURCE`; ``None`` outside an extraction.
+_SESSION_SPAN: ContextVar[tuple[date | None, date] | None] = ContextVar(
+    "particles_session_span", default=None
+)
+
+
+def _session_span(snapshot: Snapshot) -> tuple[date | None, date]:
+    """The days a ``session`` anchor of ``snapshot`` may name."""
+
+    def day(moment: datetime) -> date:
+        aware = moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+        return aware.astimezone(UTC).date()
+
+    first = snapshot.content_published_at
+    return (day(first) if first is not None else None, day(snapshot.captured_at))
+
+
+def _marked_days(text: str, starts: Sequence[int]) -> list[date | None]:
+    """The day a day mark puts in force at each of ``starts``.
+
+    ``None`` where no mark precedes the offset, and everywhere when the source
+    is not a session transcript, so every other source's chunks keep their key
+    and their reference date.
+    """
+    if not _SESSION_SOURCE.get():
+        return [None] * len(starts)
+    marks = mark_days(text)
+    return [day_at(marks, start) for start in starts]
 
 
 def _configured_prompt_components(
@@ -962,6 +1088,7 @@ def _extraction_response_schema(
     stance_enabled: bool = False,
     validity_enabled: bool = False,
     structure_enabled: bool = False,
+    session_source: bool = False,
 ) -> dict[str, Any]:
     """The JSON Schema of the extraction reply — the candidate array.
 
@@ -1009,6 +1136,11 @@ def _extraction_response_schema(
         }
         properties["valid_from_confidence"] = {"type": ["number", "null"]}
         properties["valid_from_cue"] = {"type": ["string", "null"]}
+    if session_source:
+        properties["episode"] = {
+            "type": ["string", "null"],
+            "enum": [EpisodeVerdict.SESSION_BOUND.value, EpisodeVerdict.STANDING.value, None],
+        }
     if structure_enabled:
         properties["structured_claim"] = {
             "type": ["object", "null"],
@@ -1409,6 +1541,7 @@ class GeneralExtractor:
             source_type in get_config().extraction_validity.session_source_types
         )
         token = _SESSION_SOURCE.set(session_source)
+        span_token = _SESSION_SPAN.set(_session_span(snapshot) if session_source else None)
         try:
             result = await self._extract_single_pass(
                 content,
@@ -1423,6 +1556,7 @@ class GeneralExtractor:
                 append_prefix=append_prefix,
             )
         finally:
+            _SESSION_SPAN.reset(span_token)
             _SESSION_SOURCE.reset(token)
         # An agent session's worktree / cwd / branch is true for minutes, never
         # a durable belief. Filtered here, after every text path returns, so
@@ -1602,9 +1736,12 @@ class GeneralExtractor:
         cfg = get_config().extraction
         normalised = _normalise_for_hashing(text)
         chunk_texts = _split_into_paragraph_chunks(normalised, cfg.html_chunk_size)
+        spans = paragraph_spans(normalised, cfg.html_chunk_size)
+        # a chunk that starts after a day mark is dated by it.
+        days = _marked_days(normalised, [start for start, _ in spans])
         chunks = [
-            ChunkUnit(chunk_id=f"chunk_{i}", chunk_text=t)
-            for i, t in enumerate(chunk_texts, start=1)
+            ChunkUnit(chunk_id=f"chunk_{i}", chunk_text=t, reference_day=day)
+            for i, (t, day) in enumerate(zip(chunk_texts, days, strict=True), start=1)
         ]
         log.info(
             "GeneralExtractor: %d HTML chunk(s) after paragraph splitting"
@@ -1639,7 +1776,6 @@ class GeneralExtractor:
         # which only ever deletes characters from ``text``, so an offset in it
         # is a lower bound on the same point in ``text``: the next read may
         # re-read a few characters, and never skips any.
-        spans = paragraph_spans(normalised, cfg.html_chunk_size)
         if result.unread_chunk_ids:
             first = next(i for i, c in enumerate(chunks) if c.chunk_id in result.unread_chunk_ids)
             result.read_through = spans[first][0]
@@ -1685,9 +1821,13 @@ class GeneralExtractor:
             chunk_chars=cfg.append_chunk_chars,
             context_chars=cfg.append_context_chars,
         )
+        # dated by the mark in force where the shown text begins.
+        days = _marked_days(text, [p.shown_start for p in planned])
         chunks = [
-            ChunkUnit(chunk_id=f"delta_{i}", chunk_text=p.text, context=p.context)
-            for i, p in enumerate(planned, start=1)
+            ChunkUnit(
+                chunk_id=f"delta_{i}", chunk_text=p.text, context=p.context, reference_day=day
+            )
+            for i, (p, day) in enumerate(zip(planned, days, strict=True), start=1)
         ]
         log.info(
             "GeneralExtractor: append-only delta of %d chars after %d already read, %d chunk(s)",
@@ -2433,13 +2573,13 @@ def _build_llm_request(
     # ("tomorrow", "last month") to absolute dates. ``str.replace`` (not
     # ``str.format``) — the JSON schema block carries literal braces.
     #
-    # prompt caching: the ~1.3k+-token instruction block repeats on
-    # every extraction call in a run, so mark its invariant prefix as a cache
+    # prompt caching: the instruction block repeats on every
+    # extraction call in a run, so mark its invariant prefix as a cache
     # boundary. The reference_date is the ONE per-source-varying byte in the
-    # instructions, so the boundary sits *before* it — everything after (the
-    # date, the remaining rules, the schema) stays uncached, so a cache hit
-    # survives across sources. ``cache_split`` is the offset into the
-    # (identical-up-to-here) system string where caching stops.
+    # instructions and sits in the prompt's last line, so the boundary falls
+    # just before it: every rule and the whole schema are cached, and only the
+    # date and the fence clause stay uncached. ``cache_split`` is the offset
+    # into the (identical-up-to-here) system string where caching stops.
     cache_split = template.index("{reference_date}")
     anchor = reference_published_at or datetime.now(UTC)
     instructions = template.replace("{reference_date}", anchor.date().isoformat())
@@ -2470,6 +2610,7 @@ def _build_llm_request(
         stance_enabled=_cfg.extraction_stance.enabled,
         validity_enabled=validity_enabled,
         structure_enabled=_cfg.structured_claim.enabled,
+        session_source=_SESSION_SOURCE.get(),
     )
     return _PlannedLLMCall(
         request=CompletionRequest(
@@ -3179,6 +3320,7 @@ def _gate_valid_from(
     floor: float,
     raw_basis: object = None,
     session_source: bool = False,
+    session_span: tuple[date | None, date] | None = None,
 ) -> tuple[datetime | None, ValidKind | None, float | None, str | None, str | None, str]:
     """Apply the start-emission gate to one item.
 
@@ -3192,7 +3334,9 @@ def _gate_valid_from(
     the gate drops. ``session`` is an act the session performed,
     anchored at its date: accepted only while ``session_source`` (the source
     is a transcript), and only for an EVENT, since a ``session`` STATE is what
-    ``as-of`` already says and is read as that. Any condition failing yields ``None`` values and a
+    ``as-of`` already says and is read as that. With ``session_span``,
+    a ``session`` start before the session's first day or after the
+    snapshot's capture day is dropped. Any condition failing yields ``None`` values and a
     non-empty ``note`` naming the drop, never a silent drop. A wrong start
     misplaces a claim in a window and retires nothing, so the gate is biased
     toward under-emission for accuracy rather than safety.
@@ -3242,6 +3386,25 @@ def _gate_valid_from(
             ),
             stated,
         )
+    if basis_raw == session_basis and session_span is not None:
+        # every true turn falls between the session's start and the
+        # snapshot's capture, so a day outside that span is a misread (or a
+        # forged mark); it is dropped, never clamped to a guessed day.
+        first, captured = session_span
+        day = parsed.astimezone(UTC).date()
+        if (first is not None and day < first) or day > captured:
+            return (
+                None,
+                None,
+                None,
+                None,
+                (
+                    f"VALID_FROM_SESSION_OUTSIDE_SPAN: start {day.isoformat()} dropped "
+                    f"(the session runs {first.isoformat() if first else '?'} to "
+                    f"{captured.isoformat()})"
+                ),
+                stated,
+            )
     if basis_raw == session_basis and kind_raw == ValidKind.STATE.value:
         # A state known to hold in the session is the as-of reading, not an act.
         basis_raw = ValidFromBasis.AS_OF.value
@@ -3306,33 +3469,43 @@ def _parse_extraction_reply(
             raw = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
-        # Response may be truncated mid-array (max_tokens reached). Try to
-        # recover complete objects by trimming after the last closing brace.
-        # Whatever followed the cut is lost: nothing re-reads this text, so the
-        # note says so rather than promising a later pass picks it up.
-        last_brace = raw.rfind("}")
-        if last_brace != -1:
+        if exc.msg == "Extra data":
+            # A whole array followed by more text (a closing remark, a stray
+            # fence after the strip above kept it): the array is the reply.
+            # Read as unusable, it cost a retry and lost the claims when the
+            # retry did the same.
+            data = json.loads(raw[: exc.pos])
+            notes.append(
+                f"Reply carried {len(raw) - exc.pos} characters after its JSON array; "
+                f"they were ignored"
+            )
+        else:
+            # Response may be truncated mid-array (max_tokens reached). Try to
+            # recover complete objects by trimming after the last closing brace.
+            # Whatever followed the cut is lost: nothing re-reads this text, so
+            # the note says so rather than promising a later pass picks it up.
+            last_brace = raw.rfind("}")
+            if last_brace == -1:
+                log.warning("Failed to parse extraction response: %s", exc)
+                return [], [f"JSON parse error: {exc}"], "unparsed"
             try:
                 data = json.loads(raw[: last_brace + 1] + "]")
-                shape = "truncated"
-                notes.append(
-                    f"Reply hit the model output-token limit; kept {len(data)} complete "
-                    f"claims, and any claims after the cut were lost"
-                )
-                # Not yet a loss: the caller may retry this reply at a larger
-                # budget, and the snapshot may still be handed back whole.
-                # ``_settle_reply`` warns once the reply is final.
-                log.info(
-                    "Extraction reply hit the output-token limit; %d complete claim(s) "
-                    "recovered before the cut",
-                    len(data),
-                )
             except json.JSONDecodeError:
                 log.warning("Failed to parse extraction response: %s", exc)
                 return [], [f"JSON parse error: {exc}"], "unparsed"
-        else:
-            log.warning("Failed to parse extraction response: %s", exc)
-            return [], [f"JSON parse error: {exc}"], "unparsed"
+            shape = "truncated"
+            notes.append(
+                f"Reply hit the model output-token limit; kept {len(data)} complete "
+                f"claims, and any claims after the cut were lost"
+            )
+            # Not yet a loss: the caller may retry this reply at a larger
+            # budget, and the snapshot may still be handed back whole.
+            # ``_settle_reply`` warns once the reply is final.
+            log.info(
+                "Extraction reply hit the output-token limit; %d complete claim(s) "
+                "recovered before the cut",
+                len(data),
+            )
 
     if not isinstance(data, list):
         return [], ["Response is not a JSON array"], "unparsed"
@@ -3510,6 +3683,7 @@ def _parse_extraction_reply(
                 floor=validity_cfg.min_boundary_confidence,
                 raw_basis=item.get("valid_from_basis"),
                 session_source=_SESSION_SOURCE.get(),
+                session_span=_SESSION_SPAN.get(),
             )
             if fnote:
                 notes.append(f"Item {i}: {fnote}")
@@ -3533,6 +3707,15 @@ def _parse_extraction_reply(
                     properties[VALID_FROM_CUE_KEY] = fcue
                 if fconf is not None:
                     properties[VALID_FROM_CONFIDENCE_KEY] = fconf
+
+        # the episode reading, on a session source only, stamped
+        # with the component that asked it. No answer, no reading.
+        if _SESSION_SOURCE.get():
+            episode = reading_verdict(item.get("episode"))
+            if episode is not None:
+                properties = properties or {}
+                properties[EPISODE_KEY] = episode.value
+                properties[EPISODE_RULE_KEY] = episode_extractor_stamp()
 
         # the derived S-P-O annotation, stamped with THIS extractor's
         # identity — the stamp records what actually produced the triple, which

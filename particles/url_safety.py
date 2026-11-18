@@ -47,6 +47,7 @@ import ipaddress
 import logging
 import os
 import re
+import shutil
 import socket
 import stat
 import time
@@ -433,6 +434,28 @@ def pinned_subprocess_env(environ: Mapping[str, str]) -> dict[str, str]:
             kept = [p for p in os.defpath.split(os.pathsep) if _only_trusted_users_write(p)]
         env["PATH"] = os.pathsep.join(kept) if kept else _NO_PROGRAM_PATH
     return env
+
+
+def trusted_path(environ: Mapping[str, str] | None = None) -> str:
+    """``environ``'s ``PATH`` (default ``os.environ``) cut to the entries no other user may write.
+
+    The same entries :func:`pinned_subprocess_env` keeps, so a program found
+    here is one a pinned subprocess would also find.
+    """
+    source = os.environ if environ is None else environ
+    return pinned_subprocess_env({"PATH": source.get("PATH", os.defpath)})["PATH"]
+
+
+def trusted_which(name: str, environ: Mapping[str, str] | None = None) -> str | None:
+    """``shutil.which(name)`` over :func:`trusted_path` only.
+
+    An empty or relative ``PATH`` entry would find a program in the working
+    directory, which may be a clone (security review 2026-10-28-1, O61;
+    2026-11-17-1, RA2). Run what this finds with :func:`pinned_subprocess_env`
+    or with ``PATH`` set to :func:`trusted_path`, so the programs it starts are
+    looked up there too.
+    """
+    return shutil.which(name, path=trusted_path(environ))
 
 
 #: A ``PATH`` under which no program can be found (``/dev/null`` is no directory).

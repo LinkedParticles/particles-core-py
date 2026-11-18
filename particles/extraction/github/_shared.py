@@ -27,8 +27,7 @@ from typing import Any
 
 from particles.core.schema import ApplicabilityClause
 from particles.extraction.general import CandidateParticle, ExtractionResult, _call_llm
-from particles.http import TransientHttpError, get_with_retry
-from particles.secrets import get_github_api_key_optional
+from particles.http import TransientHttpError, get_with_retry, service_credential
 
 # ---------------------------------------------------------------------------
 # Identity constants — one set per source type (multi-extractor module)
@@ -175,12 +174,18 @@ def _parse_iso_utc(value: str | None) -> datetime | None:
 
 
 def _api_headers() -> dict[str, str]:
-    """Headers for api.github.com requests. Bearer auth added when key is set."""
+    """Headers for api.github.com requests.
+
+    Bearer auth is added when the operator's ``GITHUB_API_KEY`` is set and the
+    scope does not withhold it: a confined principal's deposit and a followed
+    link fetch anonymously, so the caller reads only what it could read itself
+    (:func:`particles.http.service_credential`; security review 2026-11-17-1, RA1).
+    """
     headers = {
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    api_key = get_github_api_key_optional()
+    api_key = service_credential("github")
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     return headers

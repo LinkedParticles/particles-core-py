@@ -55,6 +55,11 @@ class DeltaChunk:
     end: int
     text: str
     context: str | None
+    shown_start: int = -1
+    """Where the text the model is shown begins: the context's start, else ``start``.
+
+    The day a transcript's day mark puts in force there is the chunk's
+    REFERENCE DATE."""
 
 
 def context_before(text: str, end: int, chars: int) -> str | None:
@@ -93,16 +98,19 @@ def plan_delta_chunks(
     chunks: list[DeltaChunk] = []
     for start, end in paragraph_spans(delta, chunk_chars):
         if chunks:
-            prev = chunks[-1].text
-            context = context_before(prev, len(prev), context_chars)
+            prev = chunks[-1]
+            context = context_before(prev.text, len(prev.text), context_chars)
+            shown = prev.start + prev.text.rfind(context) if context else prefix_len + start
         else:
             context = context_before(text, prefix_len, context_chars)
+            shown = text.rfind(context, 0, prefix_len) if context else prefix_len + start
         chunks.append(
             DeltaChunk(
                 start=prefix_len + start,
                 end=prefix_len + end,
                 text=delta[start:end],
                 context=context,
+                shown_start=shown,
             )
         )
     return chunks

@@ -26,6 +26,7 @@ constructor still raises becomes :class:`YAMLExpansionError`, so every caller's
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import Any
 
 import yaml
@@ -109,6 +110,11 @@ class _BoundedSafeLoader(yaml.SafeLoader):
         self._streamed: yaml.SequenceNode | None = None
         # Anchored nodes composed since the last item was built.
         self._fresh_anchors: list[yaml.Node] = []
+        # Each ``!!set`` built by ``load_sequence``, by id, with the mapping
+        # it was built from: a ``<<`` merge of a released set folds in that
+        # mapping, as a whole-document load folds in the set's node. The set
+        # is held so its id cannot pass to another object.
+        self._set_mappings: dict[int, tuple[set[Any], dict[Any, Any]]] = {}
         if max_items is not None:
             self.constructed_objects = _InsertLog()
 
@@ -253,17 +259,12 @@ class _BoundedSafeLoader(yaml.SafeLoader):
         fresh = self._fresh_anchors
         self._fresh_anchors = []
         built = self.constructed_objects
-        if isinstance(built, _InsertLog):
-            anchored = {id(target) for target in fresh}
-            for key in built.added:
-                if id(key) not in anchored:
-                    del built[key]
-            built.added = []
-        else:
-            names = {id(target) for target in self.anchors.values()}
-            self.constructed_objects = {
-                key: value for key, value in built.items() if id(key) in names
-            }
+        assert isinstance(built, _InsertLog)  # load_sequence installs it
+        anchored = {id(target) for target in fresh}
+        for key in built.added:
+            if id(key) not in anchored:
+                del built[key]
+        built.added = []
         self.recursive_objects = {}
         self.deep_construct = False
         self._release_anchored(fresh)
@@ -298,9 +299,12 @@ class _BoundedSafeLoader(yaml.SafeLoader):
         Each placeholder is registered in ``constructed_objects`` as the
         object the mapping built for it, so a ``<<`` merge of an earlier
         item's anchor folds in the same keys and the same value objects a
-        whole-document load would.
+        whole-document load would. A ``!!set`` folds in the mapping it was
+        built from, values included, as its node would.
         """
         built = self.constructed_objects[node]
+        if isinstance(built, set):
+            built = self._set_mappings[id(built)][1]
         if not isinstance(built, dict):
             raise yaml.constructor.ConstructorError(
                 "while constructing a mapping",
@@ -328,6 +332,15 @@ class _BoundedSafeLoader(yaml.SafeLoader):
             self.constructed_objects[holder] = item
             sources.append(self._merge_pairs(holder))
         return sources
+
+    def construct_yaml_set(self, node: yaml.MappingNode) -> Iterator[set[Any]]:
+        """``SafeConstructor.construct_yaml_set``, keeping the mapping for a later merge."""
+        data: set[Any] = set()
+        yield data
+        value = self.construct_mapping(node)
+        data.update(value)
+        if self._max_items is not None:
+            self._set_mappings[id(data)] = (data, value)
 
     def flatten_mapping(self, node: yaml.MappingNode) -> None:
         """Fold a mapping's ``<<`` merge keys into it, in time linear in its entries.
@@ -384,6 +397,12 @@ class _BoundedSafeLoader(yaml.SafeLoader):
             node.value = merge + kept
         elif len(kept) != len(node.value):
             node.value = kept
+
+
+_BoundedSafeLoader.add_constructor(
+    "tag:yaml.org,2002:set",
+    _BoundedSafeLoader.construct_yaml_set,
+)
 
 
 # Nodes allowed per character of input, plus a fixed slack. Plain YAML writes

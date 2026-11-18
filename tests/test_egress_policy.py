@@ -243,6 +243,79 @@ class TestBackstop:
         with pytest.raises(egress.EgressRefused):
             socket.gethostbyname("www.wikidata.org")
 
+    @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="no AF_UNIX sockets")
+    def test_a_unix_socket_connect_reaches_the_os(self, backstop: None) -> None:
+        """A local-socket connect raises ``socket.connect`` too; the hook lets it through.
+
+        ``socketpair`` raises no connect event, so the test above never reaches
+        the family check. The path is short and absent: the connect fails in the
+        OS after the hook has passed it, and only a refusal from the hook fails.
+        """
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            try:
+                sock.connect("/nonexistent/particles-egress.sock")
+            except egress.EgressRefused:
+                pytest.fail("the backstop refused a local-socket connect")
+            except OSError:
+                pass
+
+    @pytest.mark.skipif(not hasattr(socket.socket, "sendmsg"), reason="no sendmsg")
+    def test_a_send_on_a_connected_socket_is_judged_at_its_connect(self, backstop: None) -> None:
+        """``sendmsg`` with no address raises its event with None; the connect was checked."""
+        socket.getaddrinfo("models.test", 8000)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("127.0.0.1", 8000))
+            try:
+                sock.sendmsg([b"x"])
+            except egress.EgressRefused:
+                pytest.fail("the backstop refused a send on a socket it let connect")
+            except OSError:
+                pass
+
+
+class TestAuditHookDirect:
+    """The hook's branches no real call can reach without resolving a name.
+
+    These call the hook the way CPython does. coverage.py cannot see the hook's
+    body when CPython runs it (an audit hook runs untraced unless it sets
+    ``__cantrace__``), so the end-to-end tests above leave it reported as
+    uncovered whatever they exercise; these pin the branches they cannot reach.
+    """
+
+    @pytest.fixture
+    def armed(self, monkeypatch: pytest.MonkeyPatch) -> egress.EgressPolicy:
+        policy = _policy("allowlist", ("10.0.0.0/8", None), ("models.test", 8000))
+        monkeypatch.setattr(egress, "_backstop_policy", policy)
+        return policy
+
+    def test_a_reverse_lookup_the_posture_admits_passes(self, armed: egress.EgressPolicy) -> None:
+        egress._audit_hook("socket.getnameinfo", (("10.1.2.3", 80), 0))
+        egress._audit_hook("socket.gethostbyaddr", ("models.test",))
+        with pytest.raises(egress.EgressRefused) as refused:
+            egress._audit_hook("socket.gethostbyaddr", ("192.0.2.1",))
+        assert refused.value.purpose == "reverse lookup"
+
+    @pytest.mark.parametrize(
+        ("event", "purpose"),
+        [("socket.connect", "connection"), ("socket.sendto", "datagram")],
+    )
+    def test_a_destination_named_past_the_wrappers_is_judged_by_name(
+        self, armed: egress.EgressPolicy, event: str, purpose: str
+    ) -> None:
+        """A connect or send that bypassed the ``socket.socket`` wrappers still meets the rule.
+
+        CPython has already resolved the name by then (Q44), so this is the
+        backstop behind the wrappers, not a substitute for them: a listed name
+        on its port passes, and any other name or port is refused.
+        """
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            egress._audit_hook(event, (sock, ("models.test", 8000)))
+            for address in (("models.test", 8001), ("unlisted.example", 443)):
+                with pytest.raises(egress.EgressRefused) as refused:
+                    egress._audit_hook(event, (sock, address))
+                assert refused.value.purpose == purpose
+                assert refused.value.host == address[0]
+
 
 @pytest.fixture
 def armed_none(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:

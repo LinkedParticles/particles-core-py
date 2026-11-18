@@ -12,6 +12,7 @@ from hypothesis import strategies as st
 from particles.core.observer_scope import (
     GLOBAL_SCOPE,
     LAPSED_SCOPE,
+    REFERENCE_SCOPE,
     UNATTRIBUTED_SCOPE,
     BeliefScope,
     EntryScope,
@@ -19,13 +20,16 @@ from particles.core.observer_scope import (
     classify_entry,
     describe_scope,
     join,
+    lookalike_reason,
     meet,
     pair_precondition,
     project_keys,
     project_tag,
     same_scope,
     scope_of_entries,
+    standing,
     visible,
+    with_reference_marker,
 )
 
 HARNESS = ("claude-code",)
@@ -288,3 +292,148 @@ class TestSameScope:
             "project b",
             "project a, b",
         ]
+
+
+class TestLookalikeReason:
+    """Which rule refuses a project key a reader could mistake for another."""
+
+    def test_a_non_ascii_mark_beside_ascii_is_refused(self) -> None:
+        # U+00B7 MIDDLE DOT is neither a dash nor a listed lookalike mark, so
+        # only the punctuation-beside-ASCII rule catches it.
+        reason = lookalike_reason("a\u00b7b")
+        assert reason is not None and "punctuation mark or symbol beside ASCII" in reason
+
+    def test_a_format_character_outside_the_ignorable_ranges_is_invisible(self) -> None:
+        # U+FFF9 INTERLINEAR ANNOTATION ANCHOR and U+0600 ARABIC NUMBER SIGN are
+        # category Cf but not default-ignorable.
+        for key in ("a\ufff9b", "a\u0600b"):
+            assert lookalike_reason(key) == "holds an invisible character", key
+
+    def test_a_cjk_ideograph_beside_latin_mixes_scripts(self) -> None:
+        assert lookalike_reason("a\u4e2d") == "mixes the CJK and LATIN scripts"
+
+    def test_the_ascii_digits_belong_to_no_script(self) -> None:
+        # 0 and 9 are the bounds of the ASCII digit range.
+        assert lookalike_reason("app09") is None
+
+
+class TestReferenceScope:
+    """Reference entries: global on question surfaces, not standing memory."""
+
+    REF = ["scope:reference"]
+
+    def test_a_marked_keyless_entry_is_reference(self) -> None:
+        assert classify_entry(self.REF, HARNESS) is EntryScope.REFERENCE
+        assert EntryScope.REFERENCE.everywhere and EntryScope.GLOBAL.everywhere
+        assert not EntryScope.KEYED.everywhere
+
+    def test_a_key_and_the_unattributed_class_outrank_the_marker(self) -> None:
+        assert classify_entry([*self.REF, "project:-a"], HARNESS) is EntryScope.KEYED
+        assert classify_entry([*self.REF, "claude-code"], HARNESS) is EntryScope.UNATTRIBUTED
+        assert classify_entry([*self.REF, "scope:unattributed"], HARNESS) is EntryScope.UNATTRIBUTED
+
+    def test_reference_reads_global_on_question_surfaces(self) -> None:
+        scope = scope_of_entries([self.REF], HARNESS)
+        assert scope == REFERENCE_SCOPE
+        assert scope.is_global and scope.everywhere
+        assert visible(scope, "-a") and visible(scope, None)
+        assert pair_precondition(keyed("-a"), scope) is PairPrecondition.REVIEW
+
+    def test_a_global_entry_beside_a_reference_one_makes_it_standing(self) -> None:
+        assert scope_of_entries([self.REF, []], HARNESS) == GLOBAL_SCOPE
+
+    def test_a_keyed_entry_beside_a_reference_one_keeps_its_key(self) -> None:
+        scope = scope_of_entries([self.REF, ["project:-a"]], HARNESS)
+        assert scope.reference and scope.keys == {"-a"}
+
+    def test_standing_withholds_reference_only_beliefs(self) -> None:
+        ref = REFERENCE_SCOPE
+        assert not standing(ref, "-a")
+        assert not standing(ref, None)
+        both = BeliefScope(is_global=True, reference=True, keys=frozenset({"-a"}))
+        assert standing(both, "-a") and not standing(both, "-b") and standing(both, None)
+
+    def test_standing_matches_visible_without_a_reference_reading(self) -> None:
+        for scope in (GLOBAL_SCOPE, keyed("-a"), UNATTRIBUTED_SCOPE, LAPSED_SCOPE):
+            for observer in ("-a", "-b"):
+                assert standing(scope, observer) == visible(scope, observer)
+            assert standing(scope, None)
+
+    def test_a_widening_admits_a_reference_belief(self) -> None:
+        widened = BeliefScope(is_global=True, reference=True, widened=True)
+        assert standing(widened, "-a") and standing(widened, None)
+
+    def test_meet_over_global_and_reference_premises_is_reference(self) -> None:
+        derived = meet([GLOBAL_SCOPE, REFERENCE_SCOPE])
+        assert derived.reference and derived.is_global
+        assert meet([GLOBAL_SCOPE, GLOBAL_SCOPE]) == GLOBAL_SCOPE
+
+    def test_meet_with_a_keyed_premise_treats_reference_as_global(self) -> None:
+        assert meet([REFERENCE_SCOPE, keyed("-a")]) == keyed("-a")
+
+    def test_join_with_a_global_member_is_global_and_otherwise_pools_keys(self) -> None:
+        assert join([REFERENCE_SCOPE, GLOBAL_SCOPE]) == GLOBAL_SCOPE
+        pooled = join([REFERENCE_SCOPE, keyed("-a")])
+        assert pooled.reference and pooled.keys == {"-a"}
+
+    def test_same_scope_tells_reference_from_global(self) -> None:
+        assert not same_scope(REFERENCE_SCOPE, GLOBAL_SCOPE)
+        assert same_scope(REFERENCE_SCOPE, REFERENCE_SCOPE)
+
+    def test_the_description_says_reference(self) -> None:
+        assert describe_scope(REFERENCE_SCOPE).startswith("reference")
+
+
+class TestWithReferenceMarker:
+    """The document routes' marking rule."""
+
+    def test_a_document_naming_no_project_is_marked(self) -> None:
+        assert with_reference_marker(["notes"], HARNESS, standing=False) == [
+            "notes",
+            "scope:reference",
+        ]
+
+    def test_standing_keeps_it_global_and_drops_a_passed_marker(self) -> None:
+        assert with_reference_marker(["scope:reference"], HARNESS, standing=True) == []
+
+    def test_keyed_harness_and_unattributed_deposits_are_left_alone(self) -> None:
+        for tags in (["project:-a"], ["claude-code"], ["scope:unattributed"]):
+            assert with_reference_marker(tags, HARNESS, standing=False) == tags
+
+    def test_marking_twice_is_a_no_op(self) -> None:
+        once = with_reference_marker([], HARNESS, standing=False)
+        assert with_reference_marker(once, HARNESS, standing=False) == once
+
+
+_ref_scopes = st.builds(
+    BeliefScope, is_global=st.booleans(), keys=_keys, reference=st.booleans()
+).map(lambda s: s if s.is_global or not s.reference else BeliefScope(keys=s.keys))
+
+
+@given(_ref_scopes, st.sampled_from(["-a", "-b", "-c", None]))
+def test_standing_never_admits_what_visible_does_not(
+    scope: BeliefScope, observer: str | None
+) -> None:
+    """The digest predicate only narrows the question surfaces' view."""
+    if standing(scope, observer):
+        assert visible(scope, observer)
+
+
+@given(st.lists(_ref_scopes, min_size=1, max_size=4), st.sampled_from(["-a", "-b", "-c"]))
+def test_a_derived_belief_is_standing_only_where_some_premise_is(
+    premises: list[BeliefScope], observer: str
+) -> None:
+    """Every premise is in view, and one admits it as standing memory.
+
+    A premise keyed to the observer admits a belief derived with a reference
+    premise: an inconsistency between a project's claim and an article stays
+    in that project's digest, because the project's own claim is contested.
+    """
+    if standing(meet(premises), observer):
+        assert all(visible(premise, observer) for premise in premises)
+        assert any(standing(premise, observer) for premise in premises)
+
+
+def test_a_reference_premise_alone_never_admits_a_derived_belief() -> None:
+    assert not standing(meet([REFERENCE_SCOPE, GLOBAL_SCOPE]), "-a")
+    assert standing(meet([REFERENCE_SCOPE, keyed("-a")]), "-a")

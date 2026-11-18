@@ -5,9 +5,13 @@
 """Centralised reads for secret environment variables.
 
 Secrets must never appear in ``config.yaml``: they are read from
-the process environment only. This module is the single seam through which
-application code touches ``os.environ`` for those values, so a future
-migration to a secrets manager (1Password, AWS Secrets Manager, sops, …)
+the process environment, except for the explicitly scoped scheduled
+consolidation Keychain fallback and the engine bearer's checked token file
+(``PARTICLES_ENGINE_TOKEN_FILE``). Every other secret is
+environment-only.
+This module is the single seam through which application code touches
+``os.environ`` for those values, so a future migration to a secrets manager
+(1Password, AWS Secrets Manager, sops, …)
 only has to edit one file.
 
 One function per secret. Each function reads ``os.environ.get(...)`` exactly
@@ -24,14 +28,104 @@ not consolidated here — it overrides operational config fields, not secrets.
 from __future__ import annotations
 
 import bisect
+import hashlib
+import json
 import os
 import re
-from collections.abc import Iterable
+import stat
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager, suppress
+from contextvars import ContextVar
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class ScheduledCredential:
+    """Non-secret credential locator, bound to one store/provider/endpoint."""
+
+    profile: str
+    store_id: str
+    provider: str
+    endpoint: str
+
+    @property
+    def service(self) -> str:
+        """A deterministic locator; a changed endpoint never inherits a key."""
+        identity = json.dumps([self.profile, self.store_id, self.provider, self.endpoint])
+        return "dev.particles.extract." + hashlib.sha256(identity.encode()).hexdigest()
+
+
+_scheduled_credential: ContextVar[ScheduledCredential | None] = ContextVar(
+    "particles_scheduled_credential", default=None
+)
+
+
+_scheduled_clients: ContextVar[dict[str, object] | None] = ContextVar(
+    "scheduled_clients", default=None
+)
+_scheduled_values: ContextVar[set[str] | None] = ContextVar("scheduled_values", default=None)
+
+
+def scheduled_client_cache(provider: str) -> dict[str, object] | None:
+    """A native transport cache confined to this explicit credential scope."""
+    binding = _scheduled_credential.get()
+    return (
+        _scheduled_clients.get() if binding is not None and binding.provider == provider else None
+    )
+
+
+@contextmanager
+def scheduled_credential_scope(binding: ScheduledCredential | None) -> Iterator[None]:
+    """Enable the OS fallback for this consolidation call only, resetting on exit."""
+    token = _scheduled_credential.set(binding)
+    clients: dict[str, object] | None = {} if binding is not None else None
+    values: set[str] | None = set() if binding is not None else None
+    client_token = _scheduled_clients.set(clients)
+    value_token = _scheduled_values.set(values)
+    try:
+        yield
+    finally:
+        if clients is not None:
+            for client in clients.values():
+                close = getattr(client, "close", None)
+                if callable(close):
+                    with suppress(Exception):
+                        close()  # cleanup must not replace a consolidation failure
+            clients.clear()
+        if values is not None:
+            values.clear()
+        _scheduled_values.reset(value_token)
+        _scheduled_clients.reset(client_token)
+        _scheduled_credential.reset(token)
+
+
+def _scheduled_key(provider: str, endpoint: str | None = None) -> str | None:
+    binding = _scheduled_credential.get()
+    if binding is None or binding.provider != provider:
+        return None
+    if endpoint is None:
+        if provider == "anthropic":
+            endpoint = get_anthropic_base_url_optional() or "https://api.anthropic.com"
+        else:
+            from particles.config import get_config
+
+            configured = get_config().llm.providers.get(provider)
+            endpoint = configured.base_url if configured is not None else None
+    if endpoint != binding.endpoint:
+        return None  # an old profile never silently supplies a different endpoint
+    from particles.keychain import read_generic_password
+
+    value = read_generic_password(binding.service, "extraction")
+    values = _scheduled_values.get()
+    if value and values is not None:
+        values.add(value)
+    return value
+
 
 _PARTICLES_API_KEY_DEFAULT = "dev-key"
 
 
-def get_anthropic_api_key() -> str:
+def get_anthropic_api_key(*, endpoint: str | None = None) -> str:
     """Return ``ANTHROPIC_API_KEY`` or raise ``ValueError`` if unset.
 
     Used by the shared Anthropic client (``particles.llm.get_client``). The
@@ -39,7 +133,7 @@ def get_anthropic_api_key() -> str:
     key — the Anthropic SDK's own "Could not resolve authentication method"
     message is too generic to act on.
     """
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = os.environ.get("ANTHROPIC_API_KEY") or _scheduled_key("anthropic", endpoint)
     if not api_key:
         raise ValueError(
             "ANTHROPIC_API_KEY environment variable is not set. "
@@ -56,7 +150,7 @@ def get_anthropic_api_key_optional() -> str | None:
     For callers that gracefully degrade when the key is absent (e.g.
     optional LLM-synthesis passes in the Obsidian / wiki exporters).
     """
-    return os.environ.get("ANTHROPIC_API_KEY") or None
+    return os.environ.get("ANTHROPIC_API_KEY") or _scheduled_key("anthropic")
 
 
 def get_anthropic_base_url_optional() -> str | None:
@@ -176,8 +270,138 @@ def get_metrics_goatcounter_token_optional() -> str | None:
     return os.environ.get("PARTICLES_METRICS_GOATCOUNTER_TOKEN") or None
 
 
+class EngineTokenFileError(ValueError):
+    """``PARTICLES_ENGINE_TOKEN_FILE`` names a file that fails a check.
+
+    The message names the path and the check, and never any byte of the file.
+    ``check`` is a short machine name (``missing``, ``mode``, ``owner`` …) that
+    the hook log records as ``token-file-refused``.
+    """
+
+    def __init__(self, path: str, check: str, detail: str) -> None:
+        self.path = path
+        self.check = check
+        super().__init__(f"PARTICLES_ENGINE_TOKEN_FILE {path}: refused ({check}): {detail}")
+
+
+#: The largest token file read; a per-client key is about sixty bytes.
+_TOKEN_FILE_MAX_BYTES = 4096
+
+#: Values read from token files in this process, by path (read
+#: once per process, so a rotation takes effect at the next process start).
+_token_file_values: dict[str, str] = {}
+
+
+def engine_token_file_path() -> str | None:
+    """The token file this process's engine bearer comes from, or ``None``.
+
+    ``None`` when ``PARTICLES_ENGINE_TOKEN`` supplies the token or neither
+    variable is set. Reads nothing but the environment and never raises.
+    """
+    if (os.environ.get("PARTICLES_ENGINE_TOKEN") or "").strip():
+        return None
+    path = (os.environ.get("PARTICLES_ENGINE_TOKEN_FILE") or "").strip()
+    return path or None
+
+
+def _read_token_file(path: str) -> str:
+    """Read and check one token file; raise ``EngineTokenFileError``."""
+    if os.name == "nt" or not hasattr(os, "O_NOFOLLOW"):
+        raise EngineTokenFileError(
+            path, "platform", "file modes cannot be checked here; set PARTICLES_ENGINE_TOKEN"
+        )
+    if not os.path.isabs(path):
+        # Used as given: `~` is never expanded, so a shell and a hook cannot disagree.
+        raise EngineTokenFileError(path, "relative-path", "the path must be absolute")
+    euid = os.geteuid()
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+    except FileNotFoundError:
+        raise EngineTokenFileError(path, "missing", "no such file") from None
+    except OSError as exc:
+        if os.path.islink(path):
+            raise EngineTokenFileError(path, "symlink", "the file is a symbolic link") from None
+        raise EngineTokenFileError(path, "unreadable", exc.strerror or "cannot open") from None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise EngineTokenFileError(path, "not-regular", "not a regular file")
+        if st.st_nlink != 1:
+            raise EngineTokenFileError(path, "hard-link", "the file has more than one link")
+        if st.st_uid != euid:
+            raise EngineTokenFileError(path, "owner", "the file belongs to another account")
+        if st.st_mode & 0o077:
+            raise EngineTokenFileError(
+                path, "mode", f"mode {stat.S_IMODE(st.st_mode):04o} allows group or other access"
+            )
+        parent = os.stat(os.path.dirname(path))
+        if parent.st_uid != euid:
+            raise EngineTokenFileError(
+                path, "parent-owner", "the directory holding it belongs to another account"
+            )
+        if parent.st_mode & 0o022:
+            raise EngineTokenFileError(
+                path, "parent-writable", "another account can write the directory holding it"
+            )
+        _check_token_file_ancestors(path, euid)
+        if st.st_size > _TOKEN_FILE_MAX_BYTES:
+            raise EngineTokenFileError(path, "too-large", "the file is over 4 KiB")
+        raw = os.read(fd, _TOKEN_FILE_MAX_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(raw) > _TOKEN_FILE_MAX_BYTES:
+        raise EngineTokenFileError(path, "too-large", "the file is over 4 KiB")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise EngineTokenFileError(path, "not-utf8", "the file is not UTF-8") from None
+    if text.endswith("\r\n"):
+        text = text[:-2]
+    elif text.endswith("\n"):
+        text = text[:-1]
+    if not text:
+        raise EngineTokenFileError(path, "empty", "the file holds no token")
+    if "\n" in text or "\r" in text:
+        raise EngineTokenFileError(path, "not-one-line", "the file holds more than one line")
+    if any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in text):
+        raise EngineTokenFileError(
+            path, "malformed", "the token holds whitespace or a control character"
+        )
+    return text
+
+
+def _check_token_file_ancestors(path: str, euid: int) -> None:
+    """Refuse a token file whose directory another account could replace.
+
+    Above the immediate parent, every directory up to the root must belong to
+    this user or to root, and be writable by no one else unless it carries the
+    sticky bit (``/tmp``), which stops another account renaming what is ours.
+    Otherwise that account could move the parent aside and put its own in place.
+    """
+    current = os.path.dirname(os.path.dirname(path))
+    while True:
+        try:
+            st = os.stat(current)
+        except OSError:
+            raise EngineTokenFileError(
+                path, "ancestor-unreadable", f"{current} cannot be examined"
+            ) from None
+        if st.st_uid not in (euid, 0):
+            raise EngineTokenFileError(
+                path, "ancestor-owner", f"{current} belongs to another account"
+            )
+        if st.st_mode & 0o022 and not st.st_mode & stat.S_ISVTX:
+            raise EngineTokenFileError(
+                path, "ancestor-writable", f"another account can write {current}"
+            )
+        parent = os.path.dirname(current)
+        if parent == current:
+            return
+        current = parent
+
+
 def get_engine_token_optional() -> str | None:
-    """Return ``PARTICLES_ENGINE_TOKEN`` or ``None`` if unset.
+    """Return the engine bearer, or ``None`` when none is configured.
 
     The bearer token the **thin client** presents to a remote engine when
     ``engine.base_url`` is configured (``HttpBackend``). It is deliberately
@@ -186,16 +410,58 @@ def get_engine_token_optional() -> str | None:
     reads the token it sends. For a single operator they may hold the same value,
     but they are separate roles, so they are separate secrets.
 
+    Two sources, never both: ``PARTICLES_ENGINE_TOKEN`` holds the
+    token itself; ``PARTICLES_ENGINE_TOKEN_FILE`` names a file it is read from,
+    checked on every read (absolute path, no symbolic link, one link, owned by
+    this user, no group or other bit, a private parent directory, one line of at
+    most 4 KiB). An empty variable counts as unset, which is how the installed
+    hook commands make the file their only source. Both set, or a file that
+    fails a check, raises :class:`EngineTokenFileError`: the getter never falls
+    back to sending no token. A file's value is read once per process and never
+    enters ``os.environ``.
+
     Optional: a loopback dev engine runs with the ``dev-key`` skip and needs no
     token, so ``HttpBackend`` omits the ``Authorization`` header when this is
     ``None``. A non-loopback engine will reject the unauthenticated request
     (401), which is the intended, legible failure.
     """
     token = os.environ.get("PARTICLES_ENGINE_TOKEN")
-    return token if token and token.strip() else None
+    path = (os.environ.get("PARTICLES_ENGINE_TOKEN_FILE") or "").strip()
+    if token and token.strip():
+        if path:
+            raise EngineTokenFileError(
+                path,
+                "both-set",
+                "PARTICLES_ENGINE_TOKEN is set as well; set one of the two, not both",
+            )
+        return token
+    if not path:
+        return None
+    if path not in _token_file_values:
+        _token_file_values[path] = _read_token_file(path)
+    return _token_file_values[path]
 
 
-def get_llm_api_key_optional(provider_name: str) -> str | None:
+def check_engine_token_file(path: str) -> str:
+    """Read ``path`` through the token-file checks, without caching (for the installer)."""
+    return _read_token_file(path)
+
+
+def _forget_engine_token_files() -> None:
+    """Drop the per-process token-file values (tests only)."""
+    _token_file_values.clear()
+
+
+def provider_key_names(provider_name: str) -> tuple[str, ...]:
+    """The central environment names, also used for read-only job diagnostics."""
+    if provider_name == "anthropic":
+        return ("ANTHROPIC_API_KEY",)
+    suffix = "".join(c if c.isalnum() else "_" for c in provider_name).upper()
+    primary = f"PARTICLES_LLM_API_KEY_{suffix}"
+    return (primary, "PARTICLES_LOCAL_LLM_API_KEY") if provider_name == "local" else (primary,)
+
+
+def get_llm_api_key_optional(provider_name: str, *, endpoint: str | None = None) -> str | None:
     """Return the API key for a named completion provider, or ``None``.
 
     Reads ``PARTICLES_LLM_API_KEY_<NAME>`` where ``<NAME>`` is the
@@ -208,14 +474,13 @@ def get_llm_api_key_optional(provider_name: str) -> str | None:
     A *secret*: never in ``config.yaml``, never a field on
     ``ParticlesConfig``.
     """
-    suffix = "".join(c if c.isalnum() else "_" for c in provider_name).upper()
-    key = os.environ.get(f"PARTICLES_LLM_API_KEY_{suffix}") or None
+    key = os.environ.get(provider_key_names(provider_name)[0]) or None
     if key is None and provider_name == "local":
-        return get_local_llm_api_key_optional()
-    return key
+        return get_local_llm_api_key_optional(endpoint=endpoint)
+    return key or _scheduled_key(provider_name, endpoint)
 
 
-def get_local_llm_api_key_optional() -> str | None:
+def get_local_llm_api_key_optional(*, endpoint: str | None = None) -> str | None:
     """Return ``PARTICLES_LOCAL_LLM_API_KEY`` or ``None`` if unset.
 
     The bearer token the ``local`` completion adapter
@@ -228,7 +493,7 @@ def get_local_llm_api_key_optional() -> str | None:
     here, mirroring the ``engine.base_url`` / ``PARTICLES_ENGINE_TOKEN``
     split.
     """
-    return os.environ.get("PARTICLES_LOCAL_LLM_API_KEY") or None
+    return os.environ.get("PARTICLES_LOCAL_LLM_API_KEY") or _scheduled_key("local", endpoint)
 
 
 def get_otel_exporter_headers_optional() -> str | None:
@@ -335,6 +600,8 @@ def known_secret_values() -> list[str]:
     """
     values: list[str | None] = [os.environ.get(name) for name in _SECRET_VARIABLES]
     values.extend(v for k, v in os.environ.items() if k.startswith(_LLM_API_KEY_PREFIX))
+    values.extend(_scheduled_values.get() or ())
+    values.extend(_token_file_values.values())
     # The Particles OTLP header secret, and the OpenTelemetry SDK's own header
     # variables in the same ``name=value,…`` form, which it sends on its own
     # (security review 2026-10-26-1, Q13).
@@ -378,7 +645,7 @@ def redact_known_secrets(text: str, extra: Iterable[str | None] = ()) -> str:
 #: backslash escape, quoted-printable ``=3D``, a JSON unicode escape), and the
 #: fixed ``ptk_<role>_<12 hex>_`` prefix is distinctive on its own (security
 #: review 2026-10-27-1, W31; security review 2026-10-28-1, O25).
-ENGINE_KEY_SHAPE = re.compile(r"ptk_(?:read|agent|op)_[0-9a-f]{12}_[A-Za-z0-9_-]{43,}")
+ENGINE_KEY_SHAPE = re.compile(r"ptk_(?:read|agent|op|codex)_[0-9a-f]{12}_[A-Za-z0-9_-]{43,}")
 
 #: What can sit inside a per-client key without changing what a reader copies
 #: out of it: a Unicode default-ignorable code point (a zero-width space, a

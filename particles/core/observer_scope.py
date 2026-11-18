@@ -42,6 +42,16 @@ PROJECT_TAG_PREFIX = "project:"
 #: agent write.
 UNATTRIBUTED_MARKER = "scope:unattributed"
 
+#: The compiled-in tag that makes a keyless entry *reference*:
+#: material the operator read, which answers questions from every project but
+#: is not standing memory. A reference entry reads as global on every surface
+#: that has a question, and in the write path; the unqueried recall surfaces
+#: (the session-start digest, the agent-memory region) withhold a belief whose
+#: only route into their view is a reference entry. A project key and the
+#: unattributed class both outrank it. Written by the document-deposit routes
+#: (:func:`with_reference_marker`) and by ``memory rescope --mark-reference``.
+REFERENCE_MARKER = "scope:reference"
+
 
 def project_tag(key: str) -> str:
     """The corpus-entry tag that records ``key``."""
@@ -298,6 +308,15 @@ class EntryScope(StrEnum):
     """Harness-harvested, or marked ``scope:unattributed``, but keyless. The
     fail-closed class: a stamping gap must not make a harness's or an agent's
     deposits visible everywhere by accident."""
+    REFERENCE = "reference"
+    """Keyless and marked ``scope:reference``: material the
+    operator read. Global on every question surface and in the write path;
+    withheld from the session-start digest and the agent-memory region."""
+
+    @property
+    def everywhere(self) -> bool:
+        """Whether a belief this entry attests is in view for every project observer."""
+        return self in (EntryScope.GLOBAL, EntryScope.REFERENCE)
 
 
 def classify_entry(tags: Iterable[str] | None, harness_tags: Collection[str]) -> EntryScope:
@@ -320,7 +339,30 @@ def classify_entry(tags: Iterable[str] | None, harness_tags: Collection[str]) ->
     # (security review 2026-10-28-1, E21).
     if any(tag.startswith(PROJECT_TAG_PREFIX) for tag in tag_list):
         return EntryScope.UNATTRIBUTED
+    if REFERENCE_MARKER in tag_list:
+        return EntryScope.REFERENCE
     return EntryScope.GLOBAL
+
+
+def with_reference_marker(
+    tags: Iterable[str] | None, harness_tags: Collection[str], *, standing: bool
+) -> list[str]:
+    """A document deposit's tags, marked reference if they leave it global.
+
+    The route decides, never the source type: every document-deposit route
+    calls this, and no statement route (an operator's assertion, the rule
+    files, vocabulary documents) does. Tags that already key the entry, mark
+    it unattributed or carry a harness tag are returned as they are, since
+    each outranks the marker. ``standing`` is the operator's ``--standing``: a
+    document every project should start from, which stays global, so a marker
+    the caller passed is dropped.
+    """
+    tag_list = list(dict.fromkeys(tags or ()))
+    if standing:
+        return [tag for tag in tag_list if tag != REFERENCE_MARKER]
+    if classify_entry(tag_list, harness_tags) is EntryScope.GLOBAL:
+        return [*tag_list, REFERENCE_MARKER]
+    return tag_list
 
 
 @dataclass(frozen=True)
@@ -344,6 +386,13 @@ class BeliefScope:
     gate see it alike; the other fields keep the belief's own
     reading. A widening belongs to one belief: it is not pooled by
     :func:`join` and not inherited by :func:`meet`."""
+    reference: bool = False
+    """Global only through reference entries: no attesting
+    entry is global, and one is ``scope:reference``. ``is_global`` is then
+    set too, so every question surface and the write path read the belief
+    exactly as a global one; only :func:`standing` reads this flag. ``keys``
+    still holds the keys of any keyed entry beside the reference ones, which
+    admit the belief to those projects' digests."""
 
     @property
     def everywhere(self) -> bool:
@@ -360,6 +409,7 @@ class BeliefScope:
 
 
 GLOBAL_SCOPE = BeliefScope(is_global=True)
+REFERENCE_SCOPE = BeliefScope(is_global=True, reference=True)
 UNATTRIBUTED_SCOPE = BeliefScope()
 LAPSED_SCOPE = BeliefScope(lapsed=True)
 
@@ -369,21 +419,28 @@ def scope_of_entries(
 ) -> BeliefScope:
     """Fold the entries attesting one belief into its scope.
 
-    Global as soon as one attesting entry is global; otherwise the union of
+    Global as soon as one attesting entry is global; otherwise reference when
+    one is a reference entry (global on question surfaces, with the keyed
+    entries' keys kept for :func:`standing`); otherwise the union of
     the keyed entries' keys. No attesting entries at all is unattributed —
     the caller decides what a sourceless belief means (a derived belief takes
     :func:`meet` over its premises instead).
     """
     keys: set[str] = set()
+    reference = False
     for tags in entries_tags:
         tag_list = list(tags or ())
         match classify_entry(tag_list, harness_tags):
             case EntryScope.GLOBAL:
                 return GLOBAL_SCOPE
+            case EntryScope.REFERENCE:
+                reference = True
             case EntryScope.KEYED:
                 keys |= project_keys(tag_list)
             case EntryScope.UNATTRIBUTED:
                 pass
+    if reference:
+        return BeliefScope(is_global=True, reference=True, keys=frozenset(keys))
     return BeliefScope(keys=frozenset(keys))
 
 
@@ -396,19 +453,31 @@ def meet(premises: Iterable[BeliefScope]) -> BeliefScope:
     projects' beliefs has an empty meet — it reaches the store-wide review and
     no project session. No premises at all is unattributed; an empty meet
     over a lapsed premise is lapsed.
+
+    A reference premise is global for the meet: a belief whose
+    every premise is global or reference is reference when one premise is,
+    since it rests on reading, and its keys are the meet of the reference
+    premises' keys (what admits it to a project's digest).
     """
     keys: frozenset[str] | None = None
+    reference_keys: frozenset[str] | None = None
     seen = False
     lapsed = False
     for premise in premises:
         seen = True
         if premise.is_global:
+            if premise.reference:
+                reference_keys = (
+                    premise.keys if reference_keys is None else reference_keys & premise.keys
+                )
             continue
         lapsed = lapsed or premise.lapsed
         keys = premise.keys if keys is None else keys & premise.keys
     if not seen:
         return UNATTRIBUTED_SCOPE
     if keys is None:
+        if reference_keys is not None:
+            return BeliefScope(is_global=True, reference=True, keys=reference_keys)
         return GLOBAL_SCOPE
     # An empty meet over a lapsed premise is itself lapsed, not a stamping gap.
     return BeliefScope(keys=keys, lapsed=lapsed and not keys)
@@ -423,14 +492,19 @@ def join(members: Iterable[BeliefScope]) -> BeliefScope:
     lapsed when some member was lapsed, which is a reading for display only,
     since the pooled entries decide between lapsed and unattributed. Applies to
     sourced beliefs: a derived belief keeps the meet of its premises.
+    A reference member makes the union reference unless another is global.
     """
     keys: set[str] = set()
     lapsed = False
+    reference = False
     for member in members:
-        if member.is_global:
+        if member.is_global and not member.reference:
             return GLOBAL_SCOPE
+        reference = reference or member.reference
         keys |= member.keys
         lapsed = lapsed or member.lapsed
+    if reference:
+        return BeliefScope(is_global=True, reference=True, keys=frozenset(keys))
     return BeliefScope(keys=frozenset(keys), lapsed=lapsed and not keys)
 
 
@@ -447,6 +521,25 @@ def visible(scope: BeliefScope, observer_project: str | None, *, widened: bool =
         return True
     # Keys compare canonical on both sides (security review 2026-10-28-2, AA25).
     return widened or scope.everywhere or canonical_project_key(observer_project) in scope.keys
+
+
+def standing(scope: BeliefScope, observer_project: str | None) -> bool:
+    """Whether a belief is admitted to an unqueried recall surface.
+
+    The session-start digest and the agent-memory region push context with
+    no question, so they admit standing memory only. For a project observer
+    that is a belief :func:`visible` admits by a global entry, a widening or
+    the observer's own key, never by a reference entry alone. With no
+    observer (the store-wide digest) every belief is admitted except one held
+    by reference entries alone. A scope with no reference reading is admitted
+    exactly as :func:`visible` admits it, so a store with no marked entry is
+    unchanged.
+    """
+    if not scope.reference or scope.widened:
+        return observer_project is None or visible(scope, observer_project)
+    if observer_project is None:
+        return bool(scope.keys)
+    return canonical_project_key(observer_project) in scope.keys
 
 
 def share_an_observer(a: BeliefScope, b: BeliefScope) -> bool:
@@ -475,7 +568,14 @@ def same_scope(a: BeliefScope, b: BeliefScope) -> bool:
     widening is not compared: an edge does not pool it.
     """
     if a.is_global or b.is_global:
-        return a.is_global and b.is_global
+        if not (a.is_global and b.is_global):
+            return False
+        # A link pooling a reference belief with a global one makes it
+        # global, and pools keys between two reference ones.
+        return (a.reference, a.keys if a.reference else frozenset()) == (
+            b.reference,
+            b.keys if b.reference else frozenset(),
+        )
     if a.keys or b.keys:
         return a.keys == b.keys
     return a.lapsed == b.lapsed
@@ -483,7 +583,9 @@ def same_scope(a: BeliefScope, b: BeliefScope) -> bool:
 
 def describe_scope(scope: BeliefScope) -> str:
     """A short operator-facing reading of a scope, for refusals and reports."""
-    if scope.is_global:
+    if scope.reference:
+        own = "reference (answers questions everywhere; not in digests)"
+    elif scope.is_global:
         own = "global"
     elif scope.keys:
         own = "project " + ", ".join(sorted(scope.keys))

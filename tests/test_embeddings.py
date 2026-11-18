@@ -28,6 +28,8 @@ from particles.embeddings import (
     cosine_similarities,
     cosine_similarity,
     get_embedding_profile,
+    row_norms,
+    stacked_cosine_similarities,
 )
 
 
@@ -211,6 +213,15 @@ class TestCosineSimilarities:
 
     def test_no_vectors(self) -> None:
         assert cosine_similarities(np.ones(4, dtype=np.float32), []) == []
+
+    def test_a_kept_matrix_scores_exactly_as_the_list_form(self) -> None:
+        # the subject suggestions keep the stacked matrix between calls.
+        rng = np.random.default_rng(3)
+        vectors = [rng.standard_normal(16).astype(np.float32) for _ in range(50)]
+        query = rng.standard_normal(16).astype(np.float32)
+        matrix = np.stack(vectors)
+        kept = stacked_cosine_similarities(query, matrix, row_norms(matrix))
+        assert kept.tolist() == cosine_similarities(query, vectors)
 
 
 class TestEmbeddingProfile:

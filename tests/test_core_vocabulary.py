@@ -227,6 +227,24 @@ class TestEffectiveKind:
         )
         assert effective_kind(doc.terms[0]) is SlotKind.ONE_AT_A_TIME
 
+    @pytest.mark.parametrize(
+        "cardinality",
+        [
+            {"owl_functional": True, "sh_max_count": 1},
+            {"sh_max_count": 1},
+            {"owl_functional": True},
+        ],
+        ids=["both", "sh-max-count", "owl-functional"],
+    )
+    def test_a_source_cardinality_states_the_kind_and_survives_the_codec(
+        self, cardinality: dict[str, object]
+    ) -> None:
+        doc = self._term_doc(match=MatchStrength.EXACT, confidence=0.7, **cardinality)
+        assert effective_kind(doc.terms[0]) is SlotKind.TIMELESS_SINGLE
+        again = loads(dumps(doc))
+        assert again == doc
+        assert effective_kind(again.terms[0]) is SlotKind.TIMELESS_SINGLE
+
     def test_a_term_with_no_profile_and_no_source_kind_has_none(self) -> None:
         doc = add_alias(
             _doc(), form="contain", subject_class=FILE, aliases=["includ"], ruling=RULING
@@ -438,6 +456,35 @@ class TestJsonLd:
         assert term["skos:closeMatch"] == ["schema:homeLocation"]
         assert "owl:equivalentProperty" not in term
 
+    def test_absent_match_confidence_decodes_to_one(self) -> None:
+        obj = to_jsonld(self._rich())
+        obj["ppx:terms"][1]["ppx:alignments"][0].pop("ppx:matchConfidence")
+        [term] = [t for t in loads(json.dumps(obj)).terms if t.alignments]
+        assert term.alignments[0].confidence == 1.0
+
+    def test_non_ascii_text_is_written_verbatim_and_round_trips(self) -> None:
+        doc = add_alias(
+            _doc(),
+            form="mov to",
+            subject_class=RECORD,
+            aliases=["relocat to"],
+            ruling=RULING,
+            label="déménagé",
+        )
+        text = dumps(doc)
+        assert '"rdfs:label": "déménagé"' in text
+        assert "\\u00e9" not in text
+        assert loads(text) == doc
+
+    def test_a_many_at_once_profile_says_so_in_its_shape(self) -> None:
+        doc = set_profile(
+            _doc(), form="contain", subject_class=FILE, kind=SlotKind.MANY_AT_ONCE, ruling=RULING
+        )
+        profile = to_jsonld(doc)["ppx:terms"][0]["ppx:profile"]
+        assert profile["ppx:manyAtOnce"] is True
+        assert "ppx:oneAtATime" not in profile
+        assert "sh:maxCount" not in profile
+
     def test_the_corpus_entry_id_never_serialises(self) -> None:
         doc = _doc().model_copy(update={"corpus_entry_id": "store-local"})
         assert "store-local" not in dumps(doc)
@@ -465,3 +512,6 @@ class TestJsonLd:
         assert is_vocabulary_document(to_jsonld(_doc()))
         assert not is_vocabulary_document({"@type": "skos:ConceptScheme"})
         assert not is_vocabulary_document([1, 2])
+
+    def test_a_single_string_type_is_read(self) -> None:
+        assert is_vocabulary_document({"@type": DOCUMENT_TYPE})

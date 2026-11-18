@@ -72,11 +72,13 @@ _ALLOWED: frozenset[tuple[Status | None, Status]] = frozenset(
     {
         (None, Status.ACTIVE),  # Extract: new particle
         (None, Status.INCONSISTENCY),  # Extract/Lint: new INCONSISTENCY particle
-        # The losing candidate of an INCONSISTENT verdict is persisted
-        # quarantined (§6.6, the born-PROVENANCE_STALE row).
-        # Permitted ONLY with status_reason = CONFLICT_PENDING — enforced at
-        # the persistence seam (store.insert_particle), since the transition
-        # table is keyed on status alone.
+        # A candidate the §6.6 ladder decided loses before anything is
+        # written is persisted already demoted (§6.6, the born-PROVENANCE_STALE
+        # row): the INCONSISTENT quarantine and the two supersession
+        # mirrors. Permitted ONLY with a reason in
+        # BORN_DEMOTED_REASONS, checked by validate_born_demoted() at the
+        # persistence seam (store.insert_particle), since the transition table
+        # is keyed on status alone.
         (None, Status.PROVENANCE_STALE),
         (Status.ACTIVE, Status.SUPERSEDED),
         (Status.ACTIVE, Status.RETRACTED),
@@ -109,6 +111,44 @@ _ALLOWED: frozenset[tuple[Status | None, Status]] = frozenset(
 # above to be legal (§6.6). Kept beside the table so the gate and
 # the edge are read together.
 REVERSIBLE_SUPERSESSION_REASON: StatusReason = StatusReason.DUPLICATE_MERGED
+
+#: The reasons a particle may be born ``PROVENANCE_STALE`` with (§6.6, the
+#: birth row). Each names a loser a §6.4 rung decided, from the
+#: pair alone and before the write, against a claim the store holds ACTIVE:
+#: the INCONSISTENT quarantine, rung 1.5's mirror and
+#: rung 2.5's mirror. A reason joins only by a later record that
+#: amends this rule.
+BORN_DEMOTED_REASONS: frozenset[StatusReason] = frozenset(
+    {
+        StatusReason.CONFLICT_PENDING,
+        StatusReason.DOCUMENT_SUPERSEDED,
+        StatusReason.SUPERSEDED_BY_UPDATE,
+    }
+)
+
+
+def validate_born_demoted(
+    reason: StatusReason | None, *, mirror_reason: StatusReason | None = None
+) -> None:
+    """Raise ValueError unless a ``PROVENANCE_STALE`` birth with ``reason`` is permitted.
+
+    ``CONFLICT_PENDING`` is the quarantine birth, open to every caller that
+    writes one. The two supersession reasons are admitted only when
+    ``mirror_reason`` is the same reason: the one the mirror verdict that
+    decided the birth writes. Any other caller offering either,
+    a restore of a bundle's retired unit among them, is refused, because the
+    reason there describes a belief once held.
+    """
+    if reason is StatusReason.CONFLICT_PENDING:
+        return
+    if reason in BORN_DEMOTED_REASONS and reason is mirror_reason:
+        return
+    raise ValueError(
+        "A particle may be born PROVENANCE_STALE only as a quarantined conflict"
+        " loser (status_reason = CONFLICT_PENDING) or as the loser of a"
+        " supersession mirror verdict, with that verdict's reason"
+        f" (§6.6); got status_reason = {reason!r}"
+    )
 
 
 def validate_transition(from_status: Status | None, to_status: Status) -> None:
